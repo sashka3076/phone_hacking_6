@@ -1,0 +1,139 @@
+#!/usr/bin/perl
+
+# MakeInfernoLogMonsterBundle
+# OSBurnin
+#
+# Created by Bruce Christensen on 5/13/09.
+# Copyright 2009 Apple, Inc. All rights reserved.
+#
+# This script runs on the device to collect relevant Inferno logs for
+# LogMonster. Resulting logs are placed in /var/logs/Inferno/LogMonster.
+
+use strict;
+use warnings;
+
+my $INFERNO_BASE = "/private/var/logs/Inferno";
+my $INFERNO_ARCHIVE_DIR = "$INFERNO_BASE/LogMonster";
+
+sub find_directory {
+    my $target_dir = "";
+    my $index = 0;
+    my @time = localtime();
+    my $base = sprintf("%s/%04d-%02d-%02d",
+        $INFERNO_ARCHIVE_DIR,
+        $time[5]+1900,
+        $time[4]+1,
+        $time[3],
+    );
+    do {
+        $target_dir = sprintf("%s.%d", $base, $index);
+        $index++;
+    } while (-e $target_dir);
+    return $target_dir;
+}
+
+sub copy_files {
+    my $target_dir = shift;
+    my @files = (
+        "$INFERNO_BASE/log.txt",
+        #"$INFERNO_BASE/syslog.txt",
+    );
+    print "Archiving to $target_dir\n";
+    if (!-d $INFERNO_ARCHIVE_DIR) {
+        mkdir $INFERNO_ARCHIVE_DIR or die("Couldn't create directory: $INFERNO_ARCHIVE_DIR");
+    }
+    if (!-d $target_dir) {
+        mkdir $target_dir or die("Couldn't create directory: $target_dir");
+    }
+    foreach my $file (@files) {
+        if (-f $file) {
+            system("cp \"$file\" \"$target_dir\"") == 0 or die("Couldn't copy log: $file");
+            print "  " . $file . "\n";
+        } else {
+            print "Warning: not found: $file";
+        }
+    }
+    open(my $syslog_in, '<', "$INFERNO_BASE/syslog.txt") or die $!;
+    open(my $syslog_out, '>', "$target_dir/syslog.txt") or die $!;
+    print "  " . "$INFERNO_BASE/syslog.txt\n";
+    while (my $line = <$syslog_in>) {
+        # Remove day of week, since Log Monster doesn't expect it.
+        $line =~ s/^\w{3} //;
+        print $syslog_out $line;
+    }
+    close($syslog_out);
+    close($syslog_in);
+}
+
+sub write_plist {
+    my $target_dir = shift;
+    open(my $fh, '>', "$target_dir/LogMonster_PREF.plist") or die $!;
+    print $fh <<DONE;
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CopyLogsPaths</key>
+	<dict>
+		<key>PanicLog</key>
+		<string>panic.log</string>
+		<key>PanicLogUnArchiveFormat</key>
+		<string>??????????????.panic.txt</string>
+		<key>PanicLogArchivePath</key>
+		<string>PanicLogs/Archive</string>
+		<key>PanicLogPath</key>
+		<string>PanicLogs</string>
+		<key>CrashLog</key>
+		<string>Inferno.crash.log</string>
+		<key>CrashLogUnArchiveFormat</key>
+		<string>Inferno_????-??-??\ ??\:??\:??\ +????.crash.txt</string>
+		<key>CrashLogArchivePath</key>
+		<string>CrashLogs/Archive</string>
+		<key>CrashLogPath</key>
+		<string>CrashLogs</string>
+		<key>DebugLog</key>
+		<string>debuglog.txt</string>
+		<key>DebugLogArchiveFormat</key>
+		<string>debuglog.txt.*.gz</string>
+		<key>DebugLogUnArchiveFormat</key>
+		<string>debuglog.txt.*</string>
+		<key>DebugLogArchivePath</key>
+		<string>DebugLogs/Archive</string>
+		<key>DebugLogPath</key>
+		<string>DebugLogs</string>
+		<key>ProcessLog</key>
+		<string>log.txt</string>
+		<key>ProcessLogPath</key>
+		<string>.</string>
+		<key>SystemLog</key>
+		<string>syslog.txt</string>
+		<key>SystemLogArchiveFormat</key>
+		<string>system.log.*.gz</string>
+		<key>SystemLogUnArchiveFormat</key>
+		<string>system.log.*</string>
+		<key>SystemLogPath</key>
+		<string>.</string>
+		<key>SystemLogArchivePath</key>
+		<string>SysLogArchives</string>
+	</dict>
+	<key>ShowTable</key>
+	<false/>
+	<key>ShowYield</key>
+	<false/>
+</dict>
+</plist>
+DONE
+    close($fh);
+}
+
+sub main {
+    my $target_dir = find_directory();
+    copy_files($target_dir);
+    write_plist($target_dir);
+    if (-e "$INFERNO_ARCHIVE_DIR/latest") {
+        system("rm \"$INFERNO_ARCHIVE_DIR/latest\"");
+    }
+    system("ln -s \"$target_dir\" \"$INFERNO_ARCHIVE_DIR/latest\"");
+}
+
+main();

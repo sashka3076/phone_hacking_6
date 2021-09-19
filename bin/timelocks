@@ -1,0 +1,133 @@
+#!/bin/sh
+# timelocks
+# PerformanceTools
+#
+# Measures time spent blocking on pthread locks, condvars, and rwlocks.
+#
+# Created by Ben Nham on 5/9/2012
+# Copyright 2012 Apple Inc. All rights reserved.
+#
+
+me=`basename $0`
+
+USAGE=<<DONE
+usage: $me [options]
+
+       Options: -p         Print out the dtrace script (doesn't execute)
+                -e <name>  Execname of process to trace
+                -m         Time blocks on main thread only
+                -t         Also time thread_get_state (used by ObjC method cache GC)
+                -v         Verbose output: log when thread moves from blocked to running state
+                -u <num>   Show userstacks <num> deep. (<num> is required)
+
+       Example: time amount of time spent blocking on pthread locks on the main thread of Maps
+                $me -e Maps -m
+
+DONE
+
+while getopts ":pe:mtvu:" opt; do
+	case $opt in
+		p) printprobe=1 ;;
+		e) execname="$OPTARG" ;;
+		m) mainthread=1 ;;
+		t) measurethreadgetstate=1 ;;
+		v) verbose=1 ;;
+		u) if [[ $OPTARG =~ ^[0-9]+$ ]]; then
+					ustacklog="ustack($OPTARG);"
+				else
+					echo "-u takes a numeric argument (number of stack frames to show)"
+					exit 1
+				fi
+		;;
+		\?) echo "Invalid option -$OPTARG" >&2 ; echo "$USAGE" >&2; exit 1 ;;
+		:)  echo "Option -$OPTARG requires an argument." >&2 ; echo "$USAGE" >&2; exit 1 ;;
+	esac
+done
+
+if [[ $mainthread && $execname ]]; then
+	beginmsg="now tracing main thread of $execname"
+	filter="/ execname == \"$execname\" && (curthread->options & TAGGED_MASK) == TAGGED_MAIN /"
+elif [[ $mainthread ]]; then
+	beginmsg="now tracing all main threads in system"
+	filter="/ (curthread->options & TAGGED_MASK) == TAGGED_MAIN /"
+elif [[ $execname ]]; then
+	beginmsg="now tracing all threads of $execname"
+	filter="/ execname == \"$execname\" /"
+else
+	beginmsg="now tracing all threads in system (timelocks -? for more options)"
+	filter=""
+fi
+
+if [[ $measurethreadgetstate ]]; then
+	thread_get_state_entry=", fbt::thread_get_state:entry"
+	thread_get_state_return=", fbt::thread_get_state:return"
+fi
+
+if [[ $verbose ]]; then
+	verboselog="printf(\"%s (%d:%d) blocked %d us on %s\n\", execname, pid, tid, this->ms, probefunc);"
+fi
+
+scriptpath="/var/run/$me.$$.s"
+
+cat >$scriptpath <<DONE
+#!/usr/sbin/dtrace -s
+
+#pragma D option quiet
+#pragma D option aggsortkey
+
+inline int TAGGED_MASK = 0xF000;
+inline int TAGGED_MAIN	= 0x1000;
+
+BEGIN
+{
+	printf("$beginmsg\n");
+}
+
+/* the psynch syscalls pass the user addr of the mutex in the first arg. aggregate by that. */
+syscall::psynch_mutexwait:entry,
+syscall::psynch_cvwait:entry,
+syscall::psynch_rw_rdlock:entry,
+syscall::psynch_rw_wrlock:entry
+$thread_get_state_entry
+$filter 
+{
+	self->t = timestamp;
+	self->addr = probefunc == "thread_get_state" ? 0 : arg0;
+}
+
+syscall::psynch_mutexwait:return,
+syscall::psynch_cvwait:return,
+syscall::psynch_rw_rdlock:return,
+syscall::psynch_rw_wrlock:return
+$thread_get_state_return
+/ self->t != 0 /
+{
+	this->ms = (timestamp - self->t) / 1000000;
+
+	$verboselog
+	$ustacklog
+	@t[execname, pid, probefunc, self->addr] = quantize(this->ms);
+
+	self->t = 0;
+	self->addr = 0;
+}
+
+END
+{
+	printf("Time spent in blocking functions (ms)\n");
+	printa("%s %d %s(0x%p) %@d\n", @t);
+}
+DONE
+
+if [ ! -e $scriptpath ]; then
+	echo "Couldn't write script to $scriptpath"
+	exit 1
+fi
+
+if [ $printprobe ]; then
+	cat $scriptpath;
+	exit 0;
+fi
+
+/bin/echo -n "Wrote DTrace script to $scriptpath..."
+dtrace -s $scriptpath

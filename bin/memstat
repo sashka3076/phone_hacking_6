@@ -1,0 +1,145 @@
+#!/bin/sh
+
+opt_once=0;
+opt_proc=0; pname=.
+opt_rate=1
+opt_realtime=0
+
+while getopts hop:r:t name
+do
+	case $name in
+	o)	opt_once=1 ;;
+	p)	opt_proc=1; pname=$OPTARG ;;
+	r)	opt_rate=$OPTARG ;;
+	t)	opt_realtime=1 ;;
+	h|?)	cat <<-END >&2
+		USAGE:  memstat [-o] [-p procname] [-r rate]
+		        memstat		# default output
+		                -o		# print one capture only and exit
+		                -p procname	# print min and max between next time procname is launched and terminates
+		                -r rate		# sample every rate s (defaults to once every 1s)
+		                -t		# print wall clock time
+
+		Because of kernel caching, the totals can have an error of up to 128 pages.
+
+		The following values are displayed:
+
+		    Active
+		        The number of pages in the active queue
+
+		    Inactive
+		        The number of pages in the inactive queue
+
+		    Speculative
+		        The number of pages in the speculative queue
+
+		    Purgeable
+		        The number of pages in the purgeable queue
+
+		    Free
+		        The number of pages in the free queue
+
+		    Available
+		        The total number of pages that can be stolen (i.e. the sum of
+		        Active, Inactive, Speculative, Purgeable, and Free)
+
+		    Throttled
+		        The number of pages in the throttled queue
+
+		    Wired
+		        The number of pages in the wired queue
+		END
+		exit 1
+	esac
+done
+
+/usr/sbin/dtrace -n '
+ inline int OPT_once	= '$opt_once';
+ inline int OPT_proc	= '$opt_proc';
+ inline int OPT_realtime	= '$opt_realtime';
+ inline string NAME	= "'$pname'";
+
+ #pragma D option quiet
+ #pragma D option strsize=16
+ #pragma D option bufsize=16k
+ #pragma D option dynvarsize=64k
+ #pragma D option aggsize=32k
+
+ dtrace:::BEGIN
+ /! OPT_proc && ! OPT_once/
+ {
+	printf("%12s %12s %12s %12s %12s %12s %12s %12s %12s\n","Active","Inactive","Speculative","Purgeable","Free","Available","Throttled","Wired","Mem status");
+	tracing = 1;
+ }
+
+ dtrace:::BEGIN
+ /OPT_once/
+ {
+	printf("%12s %12s %12s %12s %12s %12s %12s %12s %12s\n","Active","Inactive","Speculative","Purgeable","Free","Available","Throttled","Wired","Mem status");
+	this->active = mach_kernel`vm_page_active_count;
+	this->inactive = mach_kernel`vm_page_inactive_count;
+	this->speculative = mach_kernel`vm_page_speculative_count;
+	this->purgeable = mach_kernel`vm_page_purgeable_count;
+	this->free = mach_kernel`vm_page_free_count;
+	this->total_avail = this->active + this->inactive + this->speculative + this->purgeable + this->free;
+	this->throttled = mach_kernel`vm_page_throttled_count;
+	this->wired = mach_kernel`vm_page_wire_count;
+	printf("%12d %12d %12d %12d %12d %12d %12d %12d %12d",
+		this->active,
+		this->inactive,
+		this->speculative,
+		this->purgeable,
+		this->free,
+		this->total_avail,
+		this->throttled,
+		this->wired,
+		mach_kernel`memorystatus_level);
+	OPT_realtime ?
+	printf(" %Y\n", walltimestamp) :
+	printf("\n");
+	exit(0);
+ }
+
+ proc:::exec-success
+ /OPT_proc && execname == NAME/
+ {
+	tracing = 1;
+	tracepid = pid;
+ }
+
+ proc:::exit
+ /OPT_proc && pid == tracepid/
+ {
+	exit(0);
+ }
+
+ profile:::tick-'$opt_rate's
+ /tracing/
+ {
+	this->active = mach_kernel`vm_page_active_count;
+	this->inactive = mach_kernel`vm_page_inactive_count;
+	this->speculative = mach_kernel`vm_page_speculative_count;
+	this->purgeable = mach_kernel`vm_page_purgeable_count;
+	this->free = mach_kernel`vm_page_free_count;
+	this->total_avail = this->active + this->inactive + this->speculative + this->purgeable + this->free;
+	this->throttled = mach_kernel`vm_page_throttled_count;
+	this->wired = mach_kernel`vm_page_wire_count;
+	OPT_proc ?
+	1 :
+	printf("%12d %12d %12d %12d %12d %12d %12d %12d %12d",
+		this->active,
+		this->inactive,
+		this->speculative,
+		this->purgeable,
+		this->free,
+		this->total_avail,
+		this->throttled,
+		this->wired,
+		mach_kernel`memorystatus_level);
+	OPT_realtime ?
+	printf(" %Y\n", walltimestamp) :
+	printf("\n");
+	@min["MIN"] = min(this->total_avail);
+	@max["MAX"] = max(this->total_avail);
+ }
+'

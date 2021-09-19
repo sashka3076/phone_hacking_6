@@ -1,0 +1,120 @@
+#!/usr/bin/perl
+
+# Copyright 2009, Apple, Inc. All rights reserved.
+
+use strict;
+
+#
+# Clear / set plist keys that control multithreading entitlements
+#
+
+# paths to search for applications
+my @app_paths = ("/Applications", "/AppleInternal/Applications", "/var/mobile/Applications");
+my @app_dirs = ("/var/mobile/Applications");
+foreach my $dir (@app_dirs) {
+    opendir(DIR, $dir);
+    push(@app_paths, map($dir . "/" . $_, readdir(DIR)));
+}
+
+# command-line names for entitlements
+my %entitlements = ("audio"=>0, "location"=>0, "voip"=>0, "continuous"=>0) ;
+
+# map from command-line name for entitlement to plist name
+my %entitlement_key_name = ("audio"=>"audio", "location"=>"location", "voip"=>"voip", "continuous"=>"continuous");
+
+# name of plist key holding entitlements
+my $plist_key = "UIBackgroundModes";
+ 
+
+# Option parsing
+my $print_entitlements = 0;
+my $app_name = $ARGV[0] if ($#ARGV >= 0);
+usage() if !defined($app_name);
+if ($app_name eq "-p") {
+    $print_entitlements = 1;
+
+    shift @ARGV;
+    $app_name = $ARGV[0] if ($#ARGV >= 0);
+    usage() if !defined($app_name);
+}
+
+shift @ARGV;
+foreach my $arg (@ARGV) {
+    if (!exists $entitlements{$arg}) {
+        printf("Unexpected entitlement, \"%s\"\n", $arg);
+        usage();
+    }
+    $entitlements{$arg} = 1;
+} 
+
+# Find the application...
+my $app_path;
+foreach my $path (@app_paths) {
+    if ((-e "$path/${app_name}.app") && (-d "$path/${app_name}.app")) {
+        $app_path = $path . "/" . $app_name . ".app";
+        last;
+    }
+}
+
+if (!defined($app_path)) {
+    printf("Unable to find application \"%s\"\n", $app_name);
+    exit(1);
+}
+
+# Find the Info plist...
+my $app_info = $app_path . "/Info";
+if (!(-e "${app_info}.plist")) {
+    printf("Unable to find Info.plist for application \"%s\"\n", $app_name);
+    exit(1);
+}
+
+# If we are just printing the existing entitlements... do it and exit...
+if ($print_entitlements) {
+    system("defaults read \"$app_info\" \"$plist_key\"");
+    exit(0);
+}
+
+# Root is required for all except /var/mobile/Applications apps
+my $req_user = "root";
+$req_user = "mobile" if (index($app_path, "/var/mobile/Applications") == 0);
+if (($req_user eq "root") && ($req_user ne $ENV{USER})) {
+    printf("You must run as user \"$req_user\" to modify an application in \"%s\"\n", $app_path);
+    exit(1);
+}
+
+# Now set each requested plist key
+my $en_keys;
+foreach my $en (keys %entitlements) {
+    if ($entitlements{$en} != 0) {
+        die if (!exists $entitlement_key_name{$en});
+        $en_keys .= " " . $entitlement_key_name{$en};
+    }
+}
+
+if (!defined($en_keys)) {
+    system("defaults delete \"$app_info\" \"$plist_key\"");
+} else {
+    system("defaults write \"$app_info\" \"$plist_key\" -array $en_keys\n");
+}
+
+# Fix ownership and permissions...
+if ($req_user eq "root") {
+    system("chown root:admin \"${app_info}.plist\"");
+    system("chmod a+r \"${app_info}.plist\"");
+} else {
+    system("chown mobile:mobile \"${app_info}.plist\"");
+    system("chmod a+r \"${app_info}.plist\"");
+}
+
+# usage message
+sub usage()
+{
+    printf("Usage: %s [-p] <app name>", $0);
+    foreach my $key (keys(%entitlements)) {
+        printf(" [%s]", $key);
+    }
+
+    printf("\n\tPrint or set the %s plist key to support the specified modes\n", $plist_key);
+    printf("\t-p: print existing %s plist keys\n", $plist_key);
+    exit(1);
+}

@@ -1,0 +1,2019 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use constant PERL5LIB => ('/var/root/Packages', '/AppleInternal/Library/PerlModules');
+use constant DEFAULTPATH => '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/Developer/usr/bin';
+use constant MAX_ITERATIONS => 3;
+use constant CPAS_VERSION => 10;
+use constant CPAS_MINOR_VERSION => 1;
+use constant VERSION => 'deviceval-2.10.2';
+
+# failure codes
+use constant DATE_TIME_INCORRECT => 99;
+use constant CMDLINE_PARSING_ERRORS => 98;
+use constant PREVIEW_TO_2592x1936_MAP_FAIL => 97;
+use constant INCORRECT_HW_MODEL => 96;
+use constant FAILED_TO_READ_NVM => 95;
+use constant DIRECTORY_CREATE_FAILED => 94;
+use constant OPEN_FOR_WRITE_FAILED => 93;
+use constant LOG_FILE_RESET_FAILED => 92;
+use constant COPY_FILE_FAILED => 91;
+use constant OPEN_APPEND_FAILED => 90;
+use constant FORK_FAILED => 89;
+use constant EXCEEDED_MAX_ITERATIONS => 88;
+use constant FORKED_MEMDUMP_FAILED => 87;
+use constant PDCA_PLIST_OPEN_WRITE_FAILED => 86;
+use constant COMPASS_TESTER_FAILED => 85;
+use constant ACCEL_TESTER_FAILED => 84;
+use constant GYRO_TESTER_FAILED => 83;
+use constant CAL_RECORDS_OUTSIDE_RANGE => 82;
+use constant SENSOR_DELTA_FAILURE => 81;
+
+use constant SLOPE_SCALE => 255 * 100;
+use constant INTERCEPT_SCALE => 100;
+
+BEGIN {
+  if (exists $ENV{PERL5LIB} && defined $ENV{PERL5LIB}) {
+    for my $thing (&PERL5LIB) {
+      my @matches = grep { $thing eq $_ } split(/:/, $ENV{PERL5LIB});
+      unless (scalar(@matches) > 0) {
+	$ENV{PERL5LIB} .= ':' . $thing;
+	push(@INC, $thing);
+      }
+    }
+  } else {
+    $ENV{PERL5LIB} = join(':', &PERL5LIB);
+    push(@INC, &PERL5LIB);
+  }
+}
+
+use IPC::Open2;
+use Time::HiRes qw(usleep gettimeofday tv_interval);
+use POSIX;
+use Time::Local;
+use File::Copy qw(cp copy mv move);
+
+#use Errno qw(ESRCH EPERM EAGAIN);
+
+use ClArgs;
+use ClArgsCb qw(Scalar Aref Bool);
+use Execer qw(execer);
+use SpawnMon;
+use Utils qw(rnd crc16 lockdownGet);
+
+# N.B.  Camcom uses Statistics.pm, so don't forget that package
+use Camcom_1_30 qw(NCAMERACMDS PERIODS NCAMERACMDSP105 PERIODSP105 parseLog calcStats);
+
+use constant DONGWOON => 165;
+use constant ROHM => 136;
+use constant ADI => 164;
+use constant CAMERATEST => 'h4isp -n';
+use constant THERMHID => 'thermhid';
+use constant GET_NVM_CMDS => ('v off', 'on 0', 'getnvm 0', 'q');
+use constant TEST_TIME => 94;    # seconds
+use constant TEST_TIME_P105 => 171;
+use constant DELAYTIME => 3;
+use constant CAMERA_RETRY_SLEEP => 3;
+use constant P105CALRECORDS => 2;		# it's either 1 or 2
+use constant P105SINGLE => '640x480 30fps';
+use constant VCM_VENDOR => 'VCM Vendor';
+
+use constant AXES => qw(X Y Z);
+
+use constant TSRE => '(\S{3}\s+\S{3}\s+\d+\s+\d+\:\d+\:\d+\.\d+\s+\d{4})';
+use constant TIMESTAMPRE => '(\S{3})\s+(\S{3})\s+(\d+)\s+(\d+)\:(\d+)\:(\d+)\.(\d+)\s+(\d{4})';
+use constant MOMAP => qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+
+# Global declarations and command-line parsing.
+# Real code lies below subroutine definitions.
+# ---------------------------------------------
+my ($pPath, $program) = $0 =~ m<^(.*/|)(.*),?(.*)$>;
+my $msgp = __PACKAGE__ . "::$program:";
+
+my $clArgs = ClArgs->new(Verbose => 0);
+my ($debug, $verbose) = (0, 0);
+my $hardwaremodel = 'unknown';
+my $gFailedSensorDeltas = 0;
+
+#***************************************************************************
+#
+#   Subroutine : printUsage
+#       Author : Neil O'Sullivan
+#         Date : 14 Jul 2011
+#
+#  Description : Usage function.
+#
+#***************************************************************************
+
+sub printUsage {
+  my ($exitCode) = @_;
+
+  print <<ENDSHERE;
+
+$program <args> [-h | -help |-h] <file specs>
+
+where <args> are any combination of:
+
+	-debug
+	  This specifies debug mode, generating verbose output.
+
+	-h | -help
+	  Prints this 'help' output and exits.
+
+	-verbose | -noverbose
+	  turns on/off verbose mode.  Verbose mode is normally off.
+
+	-settle <value> | -settleTime <value>
+	  specifies a time, in seconds (and/or fraction thereof) after a state
+	  change during which to ignore compass reading values for purposes of
+	  statistical calculations.  This gives the sensor time to settle to its
+	  nominal reading after transients decay.
+
+	-cameraRetries <nRetries>
+	  specifies the number of attempts to connect to the camera in the face of
+	  conflicts with mediaserverd (or some other process holding the camera).
+	  There is a 5 second sleep with each iteration to give the offending app
+	  time to complete and release the camera resource.
+
+	-temp | -notemp
+	  specifies whether or not to log the back camera temperature periodically
+	  (once/sec.) with the compass log info.  This is OFF by default.
+
+	-loops <nloops>
+	  specifies the number of clean iterations to run (initial value is 1).
+
+	-[no]cal | -[no]calibrate
+	  indicates whether or not to calibrate.  Default is -cal (i.e., calibration is ON; to turn
+	  off calibration, use -nocal, in which case all that is done is data gathering.
+
+	-compassSigma <maximum bump stddev>
+	  specifies the maximum standard deviation in compass readings across all states
+	  before concluding the device has been bumped (initialized to 1.40).
+
+	-sigmax <sigma multiplier>
+	  specifies the sigma multiplier used to establish a range of valid delta values per axis.
+	  The range is centered at the population mean for the VCM vendor and extends plus and minus
+	  sigmax * sigma, where sigma is the standard deviation of the compass reading for the
+	  population.  The mean and sigma values are stored in a DATA section of the code as a csv.
+
+	-precision <digits>
+	  specifies the number of digits of precision to use to the right of the decimal point for
+	  statistical purposes and comparisons; default is 3.
+
+	-[no]limits
+	  specifies whether to apply limits checks to mean delta values and standard deviations.
+	  Default is -limits (on); use -nolimits to turn off limits checks.
+
+	-[no]dumplimits
+	  specifies whether to write limits to STDOUT; default is -nodumplimits (i.e., it's off), so use
+	  -dumplimits to turn it on.
+
+	-accelGyroSigma <maximum bump stddev>
+	  specifies the maximum standard deviation in gyro and accelerometer readings
+	  before concluding the device has been bumped (initialized to 1.0).
+
+	-maxSensorDelta <max time between sensor readings, in seconds>
+	  specifies the maximum time between sensor readings (accel, compass, gyro)
+	  before concluding the device has been bumped (retry loop), initialized to 0.1s.
+
+	-maxOffDelta <maxdelta>
+	  specifies the maximum delta (absolute value) between the compass readings on each axis between
+	  the Off/Pretest state (before testing) and the Off/Stopped state (after testing); default value
+	  for maxdelta is 5.0.
+
+	-relay | -norelay
+	  specifies whether or not to run a tcprelay instance in the background
+	  to map the telnet port.  This is ON by default.
+
+	-log </path/to> | -logRoot </path/to>
+	  specifies the rooted directory where the log file (camcomdevice.log) is written
+
+$program runs sensor tester applications logging in the background (accel, compass, gyro) while
+putting the rear camera through its various sensor and vcm states, then reads the log data from
+generated files and generates summary statistics.
+
+ENDSHERE
+  exit($exitCode);
+}
+
+#***************************************************************************
+#
+#   Subroutine : registerOpts
+#       Author : Neil O'Sullivan
+#         Date : 14 Jul 2011
+#
+#  Description : register command-line options with callbacks
+#
+#***************************************************************************
+
+use constant LOGROOT => '/var/logs/BurnIn';
+use constant PLISTDIR => '/var/logs/BurnIn/PDCA';		# rdar://12823130
+use constant PLISTNAME => "_pdca_%s.plist";
+
+sub registerOpts {
+  my $clargs = shift;
+
+  for(['usage',		undef,	[qw(-h -help)],		sub { printUsage(0); }	],
+      ['debug',		    0,	['-debug'],		sub {$debug = 1;}	],
+      ['verbose',	    0,	['-verbose'],		sub {$verbose = 1;}	],
+      ['version',    &VERSION,	['--version'],		sub { printf "%s\n", &VERSION;
+							      exit(0); }],
+      ['ED',		    0,	['--errorDescriptions'], sub { exit(0); }],
+      ['settleTime',	 0.25,	[qw(-settle
+				    -settleTime)],	\&Scalar	],
+      ['cameraRetries',	   25,	['-cameraRetries'],	\&Scalar	],
+      ['compassSigma',   1.40,	['-compassSigma'],	\&Scalar	],
+      ['accelGyroSigma',    1,	['-accelGyroSigma'],	\&Scalar	],
+      ['maxOffDelta',     5.0,	['-maxOffDelta'],	\&Scalar	],
+      ['maxSensorDelta',  0.1,	['-maxSensorDelta'],	\&Scalar	],
+      ['sigmax',            8,  ['-sigmax'],		\&Scalar	],
+      ['loops',		    1,  ['-loops'],		\&Scalar	],
+      ['bumpsd',	    1,  ['-bumpsd'],		\&Scalar	],
+      ['precision',	    3,	['-precision'],		\&Scalar	],
+      ['p105calrecords',    &P105CALRECORDS,
+				['-p105calrecords'],	\&Scalar	],
+      ['temp',		    0,  [qw(-temp -notemp)],	\&Bool		],
+      ['logRoot',    &LOGROOT,  [qw(-log -logRoot)],	\&Scalar	],
+      ['calibrate',         1,  [qw(-cal -calibrate
+				    -nocal -nocalibrate)],
+							\&Bool		],
+      ['limits',            1,  [qw(-limits
+				    -nolimits)], 	\&Bool		],
+      ['dumplimits',        0,  [qw(-dumplimits
+				    -nodumplimits)], 	\&Bool		],
+      ['tcprelay',	    1,  [qw(-relay -norelay)],  \&Bool		],	) {
+    $clargs->add(@{$_});
+  }
+  1;
+}
+
+#***************************************************************************
+#
+#   Subroutine : getTsMs
+#       Author : Neil O'Sullivan
+#         Date : 21 Apr 2011
+#
+#  Description : gets timestamp in seconds and microseconds from HiRes timer.
+#                It returns a standard timestamp with milliseconds tacked on
+#		 to the seconds field following the decimal.
+#
+#		 Note that if a hash ref is passed in with a populated Time
+#		 field, that is taken as the time where we should also output
+#		 the back camera temperature following the timestamp.
+#
+#                Returns:  timestamp string on success, empty string on failure.
+#
+#***************************************************************************
+
+sub getTsMs {
+  my ($thing) = (@_);
+  my ($s, $us) = gettimeofday();
+  my $ms = &rnd(1, $us / 1000);
+  if ($ms > 999) {
+
+    # since ms are rounded up from us, ms can be >= 1000
+
+    $s++;
+    $ms -= 1000;
+  }
+  my $t = scalar localtime($s);
+#  $t =~ s/\s+/ /g;
+  my @s = split(/\s+/, $t);
+  $s[3] .= sprintf ".%03d", $ms;		# append ms to seconds field
+  if (defined $thing &&
+      ref($thing) =~ m<hash>i &&
+      exists $thing->{Time} &&
+      defined $thing->{Time}) {
+    unless ($thing->{Time} < ($s + ($ms / 1000))) {
+      push(@s, &getBackCamTemp());		# append back camera temp.
+      $thing->{Time} += 1;
+    }
+  }
+  return join(' ', @s) . "\n";
+}
+
+#***************************************************************************
+#
+#   Subroutine : plistCanonicalTime
+#       Author : Neil O'Sullivan
+#         Date : 24 Jul 2011
+#
+#  Description : Takes in time value in seconds since the epoch and returns a
+#		 formatted string corresponding to the plist canonical time
+#		 format:  'YYYY-MM-DD HH:MM:SS'
+#
+#                Returns:  time formatted above as a string
+#
+#***************************************************************************
+
+sub plistCanonicalTime {
+  my ($s) = (@_);
+
+  my @t = localtime($s);
+
+  return sprintf "%04d-%02d-%02d %02d:%02d:%02d", 1900 + $t[5], 1 + $t[4], $t[3], (@t)[2, 1, 0];
+}
+
+#***************************************************************************
+#
+#   Subroutine : getBackCamTemp
+#       Author : Neil O'Sullivan
+#         Date : 24 Apr 2011
+#
+#  Description : gets back-cam-temp from thermhid.
+#
+#                Returns:  temperature reading upon success, 0 otherwise.
+#
+#***************************************************************************
+
+sub getBackCamTemp {
+  my $temp = [ 0 ];
+  &Execer::execer('thermhid',
+		  sub {
+		    my ($lineno, $lne, $temp) = @_;
+		    $temp->[0] = $1
+		      if $lne =~ m<^T\S+\s+back\-cam\-temp\s+(-?\d+\.?\d*)>;
+		    return 0;
+		  }, $temp);
+  return $temp->[0];
+}
+
+#***************************************************************************
+#
+#   Subroutine : int2hexBytes
+#       Author : Neil O'Sullivan
+#         Date : 24 Jul 2011
+#
+#  Description : Translates 16-bit quantity to hex digits, returned as an
+#		 array of hex bytes.
+#
+#		 Returns:  array of hex bytes or undef if value exceeds
+#		 16-bit representation.
+#
+#***************************************************************************
+
+sub int2hexBytes {
+  my ($v) = (@_);
+  my $mp = __PACKAGE__ . '::int2hexBytes: ';
+
+  return undef
+    if ($v < -32768 || $v > 32767);		# out of 16-bit range
+
+  my @h = split(/ */, sprintf "%04x", &rnd(1, $v));
+
+  # we refer to these using negative indices because the sprintf above will, for negative
+  # numbers, still be treated as a 32-bit value, so we just scrape up the last 4 nibbles
+  # and ignore any leading f's
+
+  my @ans = (join('', (@h)[-2, -1]), join('', (@h)[-4, -3]));	# byte swap
+  printf STDOUT "$mp %11.4lf => %s %s\n", $v, @ans;
+
+  return @ans;
+}
+
+#***************************************************************************
+#
+#   Subroutine : getCameraNVM
+#       Author : Neil O'Sullivan
+#         Date : 09 Aug 2011
+#
+#  Description : Gets camera NVM by invoking h4isp and interacting with it.
+#		 Designed to be invoked multiple times in a loop until success
+#		 or out of retries.
+#
+#		 Successful status is 1.
+#
+#		 Returns:  (status, driver, nvm array)
+#
+#
+#***************************************************************************
+
+sub getCameraNVM {
+  my ($hwmodel) = (@_);
+
+  my $mp = __PACKAGE__ . '::getCameraNVM: ';
+
+  my $pid = open2(\*R, \*W, CAMERATEST);
+
+  # When we quit the app, output is finally flushed and we can read it.
+
+  for my $cmd (GET_NVM_CMDS) {
+    print W "$cmd\n";		# send command-line to camera test app
+  }
+
+  # last command should be 'q', so it's safe to read output now
+
+  # states we transition through
+
+  my $state = 0;	      # 0:  looking for '-> getNVM:'
+  # 1:  looking for '  result: 0x00000000'
+  # 2:  looking for 'nvm-values:'
+  # 3:  looking for '    0x00:     82  C1  CD  06  1A  22  65  B4  B5  00  CA  2D...'
+  #                                 0   1   2   3   4   5   6   7   8   9   a   b...f
+
+  # string match criteria for state transitions
+
+  my %s = ( 0 => [qr/(?:\-\>\s+)?getNVM\:/],
+	    1 => [qr/\s+result:\s+(0x[0-9a-fA-F]+)/, '0x00000000'], # must match successful status
+	    2 => [qr/nvm\-values\:/],
+	    3 => [qr/\s+0x00*\:\s+([0-9a-fA-F\s]+)$/], # beginning of NVM output
+	  );
+
+  my $match;	       # first line of NVM:  parse later to get driver
+  my @nvm = ();	       # NVM contents
+  my @allOutput = ();
+
+  # Read/parse NVM output
+
+  my $status = 1;
+
+  while (1) {
+    my $thing = <R>;		# reading camera test app output
+    last unless defined $thing;	# undef when EOF reached
+    push(@allOutput, $thing); # save everything to write to STDOUT in case we fail to locate NVM
+
+    if (exists $s{$state} &&
+	defined $s{$state}) {
+
+      # still looking for state transtions:  does line match so we can proceed to next state?
+
+      if ($thing =~ $s{$state}->[0]) {
+	if (scalar(@{$s{$state}}) > 1) { # first array ref entry is compiled regex, 2nd is string to match gather
+	  if ($#- > 0) {	# does regex specify a gather?
+	    $match = $1;	# save the gathered thing
+	    if ("$match" eq $s{$state}->[-1]) {
+	      $state++;	# successful state transition on exact gather match
+	      push(@nvm, $thing)
+		if $state == 4;	# save NVM contents in state 4
+	    } else {
+	      printf STDERR "$mp ERROR, state $state, expected '%s', got '$match'\n", $s{$state}->[-1];
+	      $status = 0;
+	      last;
+	    }
+	  } else { # no gather in regex, but regex matched, so successful state transition
+	    $state++;
+	    push(@nvm, $thing)
+	      if $state == 4; # this can't happen here, but no harm done
+	  }
+	} else { # no gather for this regex, but regex matched, so move forward
+	  $match = $1
+	    if $#- > 0;	# this would likely be first line of NVM, if true:  gather but no req'd match
+	  $state++;
+	  push(@nvm, $thing)
+	    if $state == 4;
+	}
+      }
+    } else { # this should be end of state transitions, so output should be NVM contents
+      if ($state == 4 && $thing =~ m<^\s+0x[0-9a-fA-F]+\:>) {
+	push(@nvm, $thing);
+	next;
+      }
+      last;
+    }
+  }
+
+  close(W); # close Reader/Writer, then wait for spawned process, h4isp, to exit
+  close(R);
+  waitpid($pid, 0);
+
+  return (0, 0, 0)
+    unless $status == 1;
+
+  my ($driver, $driverh);
+
+  if ($state == scalar(keys %s) &&
+      defined $match) {
+    if ($hwmodel =~ m<^P10[5-7]> ||
+	$hwmodel =~ m<^J7[5-7]>) {
+      for my $iter (0..scalar(@nvm)-1) {
+	if ($nvm[$iter] =~ m<^\s*((?:0x|)0*20)\:(.*)$>) {
+	  my ($addy, $contents) = ($1, $2);
+	  $contents =~ s<^\s*><>;		# remove leading whitespace
+	  $contents =~ s<^\s*$><>;		# remove trailing whitespace
+	  $contents =~ s<\s+><,>g;		# replace strings of whitespace with a comma
+	  my @bytes = split(/,/, $contents);
+	  if (exists $bytes[6] && defined $bytes[6]) {
+	    $driver = (0xf0 & hex($bytes[6])) == 0x10 ? ADI : DONGWOON;
+	  } else {
+	    $driver = 0;
+	  }
+	}
+      }
+    } else {
+      $match =~ s<\s+><,>g; # this should be first line of NVM less the leading 0x00 address part
+      my @matches = split(/,/, $match);
+      printf STDOUT "nvm: %d  %s\n", scalar(@matches), join(',', @matches)
+	if $verbose;
+      my $dmasked = 0x3 & hex($matches[hex('b')]);
+      $driver = $dmasked == 1 ? DONGWOON : ROHM;
+      $driverh = $driver / 2;
+      printf STDOUT "0xb = %s (%d -> %d %s)\n", $matches[hex('b')], hex($matches[hex('b')]), $dmasked, $driver
+	if $verbose;
+    }
+  } else {
+    printf STDERR "$mp ERROR, failed to locate first line of NVM; state=%d, match=%s, output from camera app:\n",
+      $state, defined $match ? $match : 'undefined';
+    for (@allOutput) {
+      printf STDERR $_;
+    }
+    printf STDERR "$mp ERROR:  cannot determine camera driver from NVM output\n";
+    $status = 0;
+  }
+
+  return ($status, $driver, @nvm);
+}
+
+#***************************************************************************
+#
+#   Subroutine : linterp3
+#       Author : Neil O'Sullivan
+#         Date : 16 Jul 2011
+#
+#  Description : Linear interpolation of 3 points.  Based on the least squares
+#		 error calculations (see wikipedia), this function calculates
+#                the slope and intercept that generates the line with the
+#		 smallest amount of error based on minimumm least square error.
+#
+#		 Returns (slope, intercept) upon success, (undef, undef)
+#		 otherwise (if solution requires division by zero).
+#
+#***************************************************************************
+
+sub linterp3 {
+  my ($x, $y) = (@_);
+  my $mp = __PACKAGE__ . '::linterp3: ';
+
+  return (undef, undef)
+    unless (scalar(@{$x}) == 3 && scalar(@{$y}) == 3);
+
+  my ($a1, $a2, $a3) = @{$x};
+  my ($c1, $c2, $c3) = @{$y};
+
+  my $b2den = ((($a1 + $a2 + $a3) ** 2) - 3 * ($a1**2 + $a2**2 + $a3**2));
+  my $b1den = ($a1 + $a2 + $a3);
+
+  if ($b2den == 0 || $b1den == 0) {
+    printf STDERR "$mp ERROR, cannot solve minimum least squares linear interpolation due to division by zero\n";
+    return (undef, undef);
+  }
+  my $b2num = (($c1 + $c2 + $c3) * ($a1 + $a2 + $a3) - 3 * ($c1 * $a1 + $c2 * $a2 + $c3 * $a3));
+  my $b2 = $b2num / $b2den;		# slope
+
+  my $b1num = (($c1 * $a1 + $c2 * $a2 + $c3 * $a3) - ($b2 * ($a1**2 + $a2**2 + $a3**2)));
+  my $b1 = $b1num / $b1den;		# intercept
+
+  return ($b2, $b1);
+}
+
+sub getTestPlist {
+  my ($testname, $llim, $ulim, $value, $units, $result, $failureMessage) = (@_);
+
+  my $testfmt = <<"ENDSHERE";
+			<dict>
+				<key>priority</key>
+				<string>P3</string>
+				<key>testname</key>
+				<string>Camcom</string>
+				<key>subtestname</key>
+				<string>$testname</string>
+				<key>lowerlimit</key>
+				<string>$llim</string>
+				<key>upperlimit</key>
+				<string>$ulim</string>
+				<key>value</key>
+				<string>$value</string>
+				<key>units</key>
+				<string>$units</string>
+				<key>result</key>
+				<string>$result</string>
+ENDSHERE
+  $testfmt .= sprintf "\t\t\t\t<key>failure_message</key>\n\t\t\t\t<string>$failureMessage</string>\n"
+    if (defined $failureMessage);
+
+  $testfmt .= "\t\t\t</dict>\n";
+
+  return $testfmt;
+}
+
+######
+# main
+######
+
+my ($startTime, $endTime);
+
+&registerOpts($clArgs);		# register options
+
+my $errors = 0;
+
+unless($clArgs->process([@ARGV])) { # process command-line
+  print STDERR "$msgp WARNING, error processing command-line\n";
+  $errors++;
+}
+
+if (scalar(@{$clArgs->Unknown}) > 0) {
+  my @lengths = map { length($_) } @{$clArgs->Unknown};
+  if (&Statistics::max(@lengths) > 0) {
+    printf STDERR "$msgp ERROR, unrecognized tokens on command-line:  %s\n",
+      join(', ', map { sprintf "'%s'", $_ } @{$clArgs->Unknown});
+    $errors++;
+  }
+}
+
+exit(&CMDLINE_PARSING_ERRORS)
+  if $errors;
+
+# if we're launched by inferno, we don't have a path
+
+if (exists $ENV{PATH} &&
+    defined $ENV{PATH}) {
+  my %pparts = map { $_ => 1 } split(/:/, $ENV{PATH});
+  my $missing = 0;
+  for my $ppart (split(/:/, DEFAULTPATH)) {
+    $missing++
+      unless exists $pparts{$ppart} && defined $pparts{$ppart};
+  }
+  $ENV{PATH} = DEFAULTPATH
+    unless $missing == 0;
+} else {
+  $ENV{PATH} = DEFAULTPATH;
+}
+
+my $nvm2vcmCb;
+
+$hardwaremodel = &lockdownGet('HardwareModel');
+
+if (! defined $hardwaremodel) {
+  exit(&INCORRECT_HW_MODEL);
+} elsif ($hardwaremodel =~ m<^K9>) {
+  exec(sprintf "ccomk9 %s", join(' ', map { sprintf "'%s'", $_ } @ARGV));
+} elsif ($hardwaremodel =~ m<^J[1-3]>) {
+  exec(sprintf "camcomdevice_1_20 %s", join(' ', map { sprintf "'%s'", $_ } @ARGV));
+#} elsif ($hardwaremodel =~ m<^P105>) {
+#  exec(sprintf "camcomdevice_1_29 %s", join(' ', map { sprintf "'%s'", $_ } @ARGV));
+} elsif (!($hardwaremodel =~ m<J7[5-7]> ||
+	   $hardwaremodel =~ m<P10[1-35-7]>)) {
+
+  # NOTE:  we are NOT invoking camcomdevice_1_30.  This code is newer and has fixes/improvements
+  printf STDERR "$msgp ERROR, hardware model '%s' not supported by this software\n", $hardwaremodel;
+  exit(&INCORRECT_HW_MODEL);
+} else {
+  $nvm2vcmCb = $hardwaremodel =~ m<^P10[5-7]> || $hardwaremodel =~ m<J7[5-7]> ? \&getVCMfromNvmP105 : \&getVCMfromNvmJ1;
+}
+
+my $limitscsv = { };
+if ($hardwaremodel =~ m<^J[12]>) {
+  my $fh = *main::DATA{GLOB};
+  my $lineNo = 0;
+  my @headings;
+  while (<$fh>) {
+    my $line = $_;
+    last
+      unless defined $line;
+    chomp($line);
+    if ($lineNo++ == 0) {
+      @headings = split(',', $line);
+      for my $hd (@headings) {
+	$limitscsv->{Data}->{$hd} = [ ];
+      }
+    } else {
+      my @things = split(',', $line);
+      if (scalar(@headings) != scalar(@things)) {
+	printf STDERR "$msgp ERROR reading csv DATA:  %d headings, %d elements on row %d\n",
+	  scalar(@headings), scalar(@things), $lineNo;
+      } else {
+	for my $heading (@headings) {
+	  push(@{$limitscsv->{Data}->{$heading}}, shift(@things));
+	}
+      }
+    }
+  }
+  $limitscsv->{Readings} = $lineNo-1;
+} elsif ($hardwaremodel =~ m<P10[1-3]>) {
+  $limitscsv = $P101::limitscsv;
+  my $foobar = $P101::limitscsv;
+} elsif ($hardwaremodel =~ m<P10[5-7]> ||
+	 $hardwaremodel =~ m<J7[5-7]>) {
+  $limitscsv = $P105::limitscsv;
+  my $foobar = $P105::limitscsv;
+  my $calrecords = $clArgs->get('p105calrecords');
+  if ($calrecords < 1 || $calrecords > 2) {
+    printf stderr "$msgp ERROR, '-p105calrecords %d' out of valid range %d..%d\n", $calrecords, 1, 2;
+    exit(&CAL_RECORDS_OUTSIDE_RANGE);
+  }
+} else {
+  printf STDERR "$msgp ERROR, no known limits source for hardware model '%s'\n", $hardwaremodel;
+  exit(&INCORRECT_HW_MODEL);
+}
+      
+my %vcmvmap = ( );
+my %limitsh = ( );
+
+if (exists $limitscsv->{Data}->{&VCM_VENDOR} &&
+    defined $limitscsv->{Data}->{&VCM_VENDOR}) {
+  for my $r (0..$limitscsv->{Readings}-1) {
+    $vcmvmap{$limitscsv->{Data}->{&VCM_VENDOR}->[$r]} = $r;
+  }
+  my $precision = $clArgs->get('precision');
+  my $precMult = 1;
+  while ($precision--) {
+    $precMult *= 10;
+  }
+  my $sigmax = $clArgs->get('sigmax');
+  for my $colm (keys %{$limitscsv->{Data}}) {
+
+    # column format:  SensorState VCMState Axis Mean|Sigma|
+    # where 4th field missing stores an array ref of [lower limit, upper limit]
+
+    if ($colm =~ m<^\s*(\S+(?:\s+\d+fps|))\s+(Calibrated\S+)\s+(X|Y|Z)\s+Mean>) {
+      my ($ss, $vcms, $axis) = ($1, $2, $3);
+      if (($hardwaremodel =~ m<^J[12]> || $hardwaremodel =~ m<^P10[1-3]>) &&
+	  $ss =~ m<Preview>) {
+
+	# in Preview mode, we reference data values from 2592x1936
+	# because we don't actually store calibration data for Preview
+
+	$colm = sprintf "2592x1936 %s %s Mean", $vcms, $axis;
+	unless (exists $limitscsv->{Data}->{$colm} &&
+		defined $limitscsv->{Data}->{$colm}) {
+	  printf "$msgp ERROR, translating Preview -> 2592x1936 failed to locate column '%s'\n", $colm;
+	  exit(&PREVIEW_TO_2592x1936_MAP_FAIL);
+	}
+      }
+      my $cols = $colm;							# Sigma column
+      $cols =~ s<Mean$><Sigma>;
+      if (exists $limitscsv->{Data}->{$cols} &&
+	  defined $limitscsv->{Data}->{$cols}) {
+	my $col = sprintf "%s %s %s", $ss, $vcms, $axis;		# new column stores [llimit, ulimit]
+	for my $r (0..$limitscsv->{Readings}-1) {
+	  my ($mean, $sigma) = map { $limitscsv->{Data}->{$_}->[$r] } ($colm, $cols);
+	  my $sigmaxm = $sigmax * $sigma;
+	  $limitsh{$limitscsv->{Data}->{&VCM_VENDOR}->[$r]}->{$col} = [ &rnd($precMult, $mean - $sigmaxm, $mean + $sigmaxm) ];
+	  printf STDOUT "$msgp limits %s '%s' [ %s .. %s ]\n", $limitscsv->{Data}->{&VCM_VENDOR}->[$r], $col,
+	    @{$limitsh{$limitscsv->{Data}->{&VCM_VENDOR}->[$r]}->{$col}}
+	      if $debug || $clArgs->get('dumplimits');
+	}
+      } else {
+	printf STDERR "$msgp ERROR, found column '%s' but not column '%s' in limitscsv\n", $colm, $cols;
+      }
+    }
+  }
+}
+
+my $getCamTemp = $clArgs->get('temp');
+
+my $nLoops = $clArgs->get('loops') || 1;
+
+print "$nLoops loops will be run\n"
+  if $nLoops != 1 && $verbose;
+
+# Verify that the clock is functioning
+{
+  my $dt = timelocal(localtime);
+  if ($dt < 1_000_000_000) {
+    printf STDERR "$msgp ERROR, device's clock is not set, time is incorrect\n";
+    exit(&DATE_TIME_INCORRECT);
+  }
+  $startTime = $dt;
+}
+
+sub getVCMfromNvmJ1 {
+  my ($nvm) = (@_);
+
+  my $row0 = $nvm->{0};
+  chomp $row0;
+  $row0 =~ s<^\s*><>;		# delete leading whitespace
+  $row0 =~ s<\s*$><>;		# remove trailing whitespace
+  $row0 =~ s<\s+><,>g;		# whitespace replaced with comma
+  my @bytes = split(/,/, $row0);
+
+  return (0x3 & hex($bytes[hex('b')])) == 1 ? 'Dongwoon' : 'Rohm';
+}
+
+sub getVCMfromNvmP105 {
+  my ($nvm) = (@_);
+
+  my $row2 = $nvm->{hex('0x20')};
+  return 'None'
+    unless defined $row2;
+  chomp $row2;
+  $row2 =~ s<^\s*><>;		# delete leading whitespace
+  $row2 =~ s<\s*$><>;		# remove trailing whitespace
+  $row2 =~ s<\s+><,>g;		# whitespace replaced with comma
+  my @bytes = split(/,/, $row2);
+
+  return 'None'
+    unless exists $bytes[6] && defined $bytes[6];
+
+  return (0xf0 & hex($bytes[6])) == 0x10 ? 'ADI' : 'Dongwoon';		# Dongwoon == 0x20
+}
+
+# borrowed from Programming Perl
+
+local (*R, *W);    # R -> Reader, W -> Writer
+
+my ($status, $driver, @nvm);
+
+for my $iter (1..$clArgs->get('cameraRetries')) {
+  ($status, $driver, @nvm) = &getCameraNVM($hardwaremodel);
+  last
+    if $status;
+  printf STDERR "$msgp WARNING:  failed to connect to camera, retry %d\n", $iter;
+  sleep &CAMERA_RETRY_SLEEP;
+}
+
+my $driverh = $driver / 2;
+exit(&FAILED_TO_READ_NVM)
+  unless $status;
+
+my $serialno = &lockdownGet('SerialNumber');
+$serialno = 'unknown'
+  unless defined $serialno;
+
+print "Serial Number:  $serialno\n" if $verbose;
+
+# log file names for the various sensor tests running in the background
+
+my %logFiles = map { $_ => sprintf "/private/var/tmp/%s_%sTester.txt", $serialno, $_ } qw(accel compass gyro);
+
+# this is our log file combining compass_Tester output with timestamped camera states and NVM
+my $fname = sprintf "%s/%s/%s_compassReadings.txt", &LOGROOT, $program, $serialno;
+
+{
+  my $logd = sprintf "%s/%s", $clArgs->get('logRoot'), $program;
+  unless (-d $logd) {
+    my $status = &execer("mkdir -p $logd",
+			 sub {
+			   my ($lineNo, $line, @remains) = (@_);
+			   return 0;
+			 });
+    if ($status != 1) {
+      unless (-d $logd) {
+	printf STDERR "$msgp ERROR, failed to create log directory '%s'\n", $logd;
+	exit(&DIRECTORY_CREATE_FAILED);
+      }
+    }
+  }
+}
+
+my $logf = sprintf "%s/%s/%s.log", $clArgs->get('logRoot'), $program, $program;
+my $logh;
+unless (open($logh, ">$logf")) {
+  printf STDERR "$msgp ERROR, failed to open log file '%s' for write\n", $logf;
+  exit(&OPEN_FOR_WRITE_FAILED);
+}
+
+my $stats = { };
+my %months = map { (&MOMAP)[$_] => $_ } (0..11);
+
+my $tsre = TIMESTAMPRE;
+$tsre = qr<$tsre>;
+
+my $iteration = 0;
+my $loop = 1;
+my $success = 0;
+my $results;
+
+LOOP:
+while ($loop <= $nLoops) {
+  $iteration++;
+  $gFailedSensorDeltas = 0;
+  last if $iteration > MAX_ITERATIONS;
+  $success = 0;
+  $results = { };
+
+  my $kidpid;
+
+  # Parent talks to camera app
+  # Child launches and monitors compass/accel/gyro tester apps in background
+
+  if ($kidpid = fork) {
+    # parent here
+    print STDOUT "Parent here:  $$\n" # just for debugging so we know which PID is parent/child
+      if $debug;
+
+    { # reset the log file
+      my $cfh;
+      unless (open($cfh, ">$fname")) {
+	printf STDERR "ERROR, child failed to open $fname for write\n";
+	kill 9 => $kidpid;
+	waitpid($kidpid, 0);
+	exit(&LOG_FILE_RESET_FAILED);
+      }
+      close($cfh);
+    }
+
+    # parent talks to campera app
+
+    my $focusCycle = <<ENDSHERE;
+setfocuspos 0 0		; delay
+setfocuspos 0 127	; delay
+setfocuspos 0 255	; delay
+setaflimits 0 0 1023
+#setfocuspos 0 0		; delay
+#setfocuspos 0 $driverh	; delay
+setfocuspos 0 $driver	; delay
+ENDSHERE
+
+    my @cmds = <<ENDSHERE =~ m/(\S?.*\S)/g;
+v off
+on 0			; delay
+# 640x480 30fps:
+start 0 0 0
+$focusCycle
+stop 0
+
+# 352x288 30fps:
+start 0 2 0
+$focusCycle
+stop 0
+
+# 960x540 30fps:
+start 0 3 0
+$focusCycle
+stop 0
+
+# 1280x720 30fps:
+start 0 4 0
+$focusCycle
+stop 0
+
+# 1920x1080 30fps:
+start 0 5 0
+$focusCycle
+stop 0
+
+# 2592x1936 15fps:
+start 0 6 0
+$focusCycle
+stop 0
+
+# max 5MP  15fps:
+start 0 255 0
+$focusCycle
+stop 0
+
+q                       ; delay
+ENDSHERE
+
+    my $p105Capabilities = { Configs => { 0 => { Bin => '0/0',
+						 Fps => 24, },
+					  1 => { Bin => '0/0',
+						 Fps => 30, },
+					  2 => { Bin => '1/1',
+						 Fps => 30, },
+					  3 => { Bin => '1/1',
+						 Fps => 60, },
+					  4 => { Bin => '0/0',
+						 Fps => 30, },
+					},
+			     SensorModes => { 0 => { Mode => '640x480',
+						     Config => 2, },
+					      1 => { Mode => '320x240',
+						     Config => 2, },
+					      2 => { Mode => '352x288',
+						     Config => 2, },
+					      3 => { Mode => '960x540',
+						     Config => 1, },
+					      4 => { Mode => '1280x720',
+						     Config => 1, },
+					      5 => { Mode => '1920x1080',
+						     Config => 1, },
+					      6 => { Mode => '2592x1936',
+						     Config => 0, },
+					      10 => { Mode => '640x352',
+						      Config => 4, },
+					      12 => { Mode => '1280x720',
+						      Config => 3, },
+					      15 => { Mode => '2112x1188',
+						      Config => 1, },
+					      17 => { Mode => '1408x792',
+						      Config => 1, },
+					      18 => { Mode => '704x528',
+						      Config => 2, },
+					      20 => { Mode => '1600x1200',
+						      Config => 0, },
+					      21 => { Mode => '2048x1536',
+						      Config => 0, },
+					      22 => { Mode => '848x640',
+						      Config => 0, },
+					      26 => { Mode => '480x360',
+						      Config => 2, },
+					      38 => { Mode => '1024x768',
+						      Config => 0, },
+					      44 => { Mode => '1056x592',
+						      Config => 1, },
+					    },
+			     };
+
+    if ($hardwaremodel =~ m<P10[5-7]> ||
+	$hardwaremodel =~ m<J7[5-7]>) {
+      my @keys = sort { $a <=> $b } keys %{$p105Capabilities->{SensorModes}};
+      my @c = ('v off', 'on 0            ; delay');
+      my $vcmMap = { 0 => 'CalibratedInfinity',
+		     127 => 'CalibratedMidpt',
+		     255 => 'CalibratedMacro',
+		   };
+
+      for my $key (@keys) {
+	my ($config, $mode) = map { $p105Capabilities->{SensorModes}->{$key}->{$_} } qw(Config Mode);
+	$mode .= sprintf " %dfps", $p105Capabilities->{Configs}->{$config}->{Fps};
+	my $c = sprintf "start 0 %d 0", $key;
+	push(@c, $c);
+#	printf "%-60s  %3d %s\n", $c, $i++, $mode;
+	my @focusExtents = qw(0 127 255);
+
+	for my $fe (@focusExtents) {
+	  my $focus = sprintf "setfocuspos 0 %d", $fe;
+	  push(@c, sprintf "%s\t\t; delay", $focus);
+#	  $periods->{$mode}->{$vcmMap->{$fe}} = $i;
+#	  printf "%-60s  %3d   %s\n", $focus, $i++, $vcmMap->{$fe};
+	}
+	push(@c, 'stop 0');
+#	printf "%-60s  %3d    Streaming Stop\n", 'stop 0', $i++;
+      }
+#      printf "%-60s  %3d\n", 'q', $i;
+      push(@c, "q\t\t\t; delay");
+
+#      $periods->{Off}->{Stopped} = $i++;
+
+#      printf "\n\n";
+
+      @cmds = @c;
+#      for my $c (@c) {
+#	printf "%s\n", $c;
+#      }
+    }
+
+
+    my @cmdTss = ('', '--Camera Commands--');	# '' separates compass readings from camera cmds with blank line
+    {
+      # all this just to get a 2nd measure of compass readings *before* starting test
+      my $cts = &getTsMs();
+      chomp $cts;
+      my $string = sprintf "%s:  %s", $cts, 'sleep DELAYTIME';
+      printf STDOUT "%s\n", $string
+	if $verbose;
+      push(@cmdTss, $string);
+      sleep DELAYTIME;
+    }
+
+    # wait 0.25 seconds to give time for sensor tests to fire up and start recording
+    usleep(250_000);
+
+    my $procpid = open2(\*R, \*W, CAMERATEST);
+
+    print STDOUT "Sending camera commands\n"
+      unless $verbose;
+
+    for my $cmd (@cmds) {
+      next
+	if $cmd =~ m<^\s*$> || $cmd =~ m<^\s*\#>;	# ignore comments and blank lines
+      if ($cmd =~ m<^(.*?)(\;\s*delay.*|)$>) {
+	my ($c, $d) = ($1, $2);		# command and (optional) delay
+	print W "$c\n";
+	my $cmdTs = &getTsMs();	# get timestamp in ms
+	chomp $cmdTs;
+	my $string = sprintf "%s:  %s", $cmdTs, $c;
+	print STDOUT $verbose ? "$string\n" : '.';		# do we want to qualify this with 'if $verbose'?
+	$| = 1;
+	push(@cmdTss, $string);			# save for later appending to log file
+	# delays are implemented by us, not the camera app
+	sleep DELAYTIME
+	  if $d =~ m<delay>;
+      }
+    }
+    print STDOUT "\n"
+      unless $verbose;
+    my $nl = 0;
+    while (1) {				# read and echo STDOUT from app now that it (should have) exited
+      my $thing = <R>;
+      last unless defined $thing;
+      print STDOUT $thing
+	if $debug;
+      $nl = $thing =~ m<^.*$/$> ? 1 : 0;
+    }
+    close(W);
+    close(R);
+    unless ($nl) {
+      print STDOUT "\n"
+	if $debug;
+    }
+
+    print STDERR "Parent waiting on $procpid (h4isp)\n"
+      if $debug;
+    waitpid($procpid, 0);
+    print STDERR "Parent waiting on $kidpid (child launching sensor readers)\n"
+      if $debug;
+    waitpid($kidpid, 0);		# wait for child to exit so we can append the log
+
+    exit(&COPY_FILE_FAILED)
+      unless copy($logFiles{compass}, $fname);	# copy compassTester log, copy is added to with camera readings and NVM
+
+    my $fh;
+    unless (open($fh, ">>$fname")) {
+      printf STDERR "ERROR, parent failed to open $fname for append\n";
+      exit(&OPEN_APPEND_FAILED);
+    }
+    for (@cmdTss) {			# save timestamped commands sent to camera app
+      printf $fh "%s\n", $_;
+    }
+    printf $fh "--NVM--\n";
+#    if ($loop == 1) {
+      for (@nvm) {			# save NVM contents to log (only if this is first iteration)
+	printf $fh "%s", $_;
+      }
+#    }
+    close($fh);
+
+    # Now parse the results:  compass readings, timestamped camera cmds, NVM
+    # ----------------------------------------------------------------------
+
+    my $h = { };
+
+    if (open($fh, "<$fname")) {
+      $h->{$fname} = &Camcom_1_30::parseLog($fname, $fh, $nvm2vcmCb, $hardwaremodel);
+      close($fh);
+      if (exists $h->{$fname} && defined $h->{$fname}) {
+
+	# calculates and populates $h->{$fname}->{Stats}
+
+	if ($debug) {
+	  printf STDOUT "$msgp calculating statistics\n";
+	  $Camcom_1_30::debug = 1;
+	}
+	&Camcom_1_30::calcStats($h, $fname, $clArgs->get('settleTime'), 1, DELAYTIME, $hardwaremodel);  # <--- make 3rd arg 0 to turn off stats output
+	$stats->{$loop}->{compass} = $h->{$fname}->{Stats};
+	printf STDOUT "$msgp completed statistics\n",
+	  if $debug;
+      } else {
+	printf STDERR "$msgp ERROR, failed to parse '%s'\n", $fname;
+	printf $logh "ERROR, failed to parse '%s' on iteration %d\n", $fname, $iteration;
+	next;
+      }
+    } else {
+      printf STDERR "$msgp ERROR, failed to open file '%s' for read:  $!\n", $fname;
+      next;
+    }
+
+    # Failure reasons:
+    #  1.  parsing failure of compass/camera/NVM log (above)
+    #  2.  did not see minimum number of sensor (accel/compass/gyro) readings (must be at least 1500 per sensor)
+    #      we cannot necessarily proceed with stats in these cases, so we punt on this cycle
+    #
+    #  3.  delta time between sensor readings 0 <= delta < 0.100 (maxSensorDelta) [bumped?]
+    #  4.  compass reading sigmas:  0 <= sigma <= 1.33 (compassSigma) [bumped?]
+    #  5.  gyro/accel sigmas:  0 <= sigma <= 1.0 (accelGyroSigma)
+    #  6.  0 <= <compass Off Pretest/Stopped Axis Sigma> <= compassSigma [bumped? noise?]
+    #  7.  0 <= abs(<compass Off Pretest Axis Mean> - <compass Off Stopped Axis Mean>) <= 5 (maxOffDelta)
+    #  8.  foreach <sensorState(Not Off) vcmState(Calibrated*) Axis> Mean/Sigma/Delta:
+    #      a.  Mean is a PASS
+    #      b.  0 <= Sigma <= 1.33 (compassSigma) [bumped? noise?]
+    #      c.  limitsh[vcmVendor][Low] <= Delta <= limitsh[vcmVendor][High] (from limits csv)
+
+    # check gyro/accel readings for bump detection (and excessive time gaps)
+
+    my @failedReason = ();
+
+    my @sensorStates = qw(Off 640x480 352x388 960x540 720p 1920x1080 2592x1936 Preview);
+    my @vcmStates = qw(CalibratedInfinity CalibratedMidpt CalibratedMacro Uncalibrated_80mA);
+    my $periods = &Camcom_1_30::PERIODS;
+    if ($hardwaremodel =~ m<P10[5-7]> ||
+	$hardwaremodel =~ m<J7[5-8]>) {
+      @sensorStates = keys %{&PERIODSP105};
+      $periods = &Camcom_1_30::PERIODSP105;
+      @vcmStates = qw(CalibratedInfinity CalibratedMidpt CalibratedMacro);
+    }
+
+    $results->{Driver} = exists $h->{$fname} && exists $h->{$fname}->{Driver} && defined $h->{$fname}->{Driver} ? $h->{$fname}->{Driver} : '<NoVCM>';
+
+    my %sensorTimes = ( );
+    my $grossFailure = 0;
+    my $nsensorDeltaFailures = 0;
+    for my $sensor qw(accel compass gyro) {
+      my $file = $logFiles{$sensor};
+      unless (open(FH, "<$file")) {
+	printf STDERR "$msgp ERROR, failed to open file %s for read:  $!\n", $file;
+	$grossFailure++;
+	next;
+      }
+      my @a;
+      my $nreadings = 0;
+      my $prevts;
+      while (<FH>) {
+	my $line = $_;
+	last unless defined $line;
+	if ($line =~ m<(?:Time|Interval)\:\s+(\d+\.?\d*).*?x\:\s*([\-\+]?\d+\.?\d*).*?y\:\s*([\-\+]?\d+\.?\d*).*?z\:\s*([\-\+]?\d+\.?\d*).*(\S{3}\s+\S{3}\s+\d+\s+\d+\:\d+\:\d+\.\d+\s+\d{4})>) {
+	  my ($interval, $x, $y, $z, $ts) = ($1, $2, $3, $4, $5);
+	  $interval = 0 if $nreadings++ == 0;
+	  if ($ts =~ $tsre) {
+	    my ($day, $month, $date, $hh, $mm, $ss, $ms, $year) = ($1, $2, $3, $4, $5, $6, $7, $8);
+	    my $epochTime = timelocal($ss, $mm, $hh, $date, $months{$month}, $year - 1900) + ($ms / 1000);
+	    $prevts = defined $prevts ? $prevts + $interval : $epochTime;
+	    push(@a, {X => $x, Y => $y, Z => $z, Interval => $interval,
+		      TimeStamp => ($hardwaremodel =~ m<P10[5-7]>) ? $epochTime : $prevts});
+	  }
+	}
+      }
+      $stats->{$loop}->{$sensor}->{Readings} = $.;	# number of lines of sensor readings
+      close(FH);
+      if ($stats->{$loop}->{$sensor}->{Readings} < 1500) {
+	printf STDERR "$msgp ERROR, expected ~3500 or more %s readings, only read %d\n",
+	  $sensor, $stats->{$loop}->{$sensor}->{Readings};
+	push(@failedReason, sprintf "%s:  expected > 3500 readings; only read %d", $sensor,
+	     $stats->{$loop}->{$sensor}->{Readings});
+	$grossFailure++;
+	next;     # this just goes to next sensor
+      }
+
+      # calculate delta time between readings
+      # -------------------------------------
+
+      my @tdeltas = ();
+      if ($hardwaremodel =~ m<P10[5-7]>) {
+	my $timeDelta = abs($a[-1]->{TimeStamp} - $prevts);
+	if ($timeDelta < 0.1) {
+	  printf STDERR "$msgp %s:  computing deltas based on Interval because end timestamps differ by %.3s < 0.1\n",
+	    $sensor, $timeDelta;
+	  @tdeltas = map { $a[$_]->{Interval} } (1..scalar(@a)-1);
+	} else {
+	  printf STDERR "$msgp %s:  computing deltas based on TimeStamp for %s because end timestamps differ by %.3lfs > 0.1\n",
+	    $sensor, $hardwaremodel, $timeDelta;
+	  @tdeltas = map { $a[$_]->{TimeStamp} - $a[$_-1]->{TimeStamp} } (1..scalar(@a)-1);
+	}
+      } else {
+	printf STDERR "$msgp computing deltas based on Interval for %s\n", $hardwaremodel;
+	@tdeltas = map { $a[$_]->{Interval} } (1..scalar(@a)-1);
+      }
+
+#      printf STDERR "$msgp %s TimeStamps:  %s\n\n", $sensor, join(',', map { $_->{TimeStamp} } @a);
+#      printf STDERR "$msgp %s:  %s\n\n", $sensor, join(',', @tdeltas);
+
+      if (0) {
+	for my $index (0..scalar(@tdeltas)-1) {
+
+	  # the purpose here is to identify any negative time deltas:
+	  # this was seen once but never repeated, but it seems worth looking into
+
+	  my $td = $tdeltas[$index];
+	  if ($td < 0) {
+	    printf "$msgp ERROR, negative time transition for %s at index %d-%d:  %.3lf -> %.3lf (%.3lf)\n", $sensor,
+	      $index, $index+1, $a[$index], $a[$index+1], $td;
+	  }
+	}
+      }
+
+      my $root = $stats->{$loop}->{$sensor};
+
+      {
+	my $precision = $clArgs->get('precision');
+	my $precMult = 1;
+	while ($precision--) {
+	  $precMult *= 10;
+	}
+	($root->{Time}->{Mean},
+	 $root->{Time}->{Min},
+	 $root->{Time}->{Max}) =
+	   &rnd($precMult, &Statistics::meanMinMax(@tdeltas));
+	$root->{Time}->{Sigma} = &rnd($precMult, &Statistics::stddev($root->{Time}->{Mean}, @tdeltas));
+      }
+
+      # We'll say we were bumped if sensor readings had a gap of over 100ms (due to lack of coverage during that time)
+
+      my $maxSensordelta = $clArgs->get('maxSensorDelta');
+
+      my $testname = sprintf "Max %s Inter-sample Delta", ucfirst($sensor);
+      push(@{$results->{Tests}}, $testname);
+      $results->{Test}->{$testname}->{LLIM} = 0;
+      $results->{Test}->{$testname}->{ULIM} = $clArgs->get('maxSensorDelta');
+      $results->{Test}->{$testname}->{Value} = $root->{Time}->{Max};
+      $results->{Test}->{$testname}->{Units} = 'seconds';
+      if ($root->{Time}->{Max} > $maxSensordelta) {
+	my $errmsg = sprintf "%s Max Reading Delta %s > %s", ucfirst($sensor),
+	  $root->{Time}->{Max}, $maxSensordelta;
+	$gFailedSensorDeltas = 1 if $nsensorDeltaFailures == 3;
+	push(@failedReason, $results->{Test}->{$testname}->{Result}->{FAIL} = $errmsg);
+      } else {
+	$results->{Test}->{$testname}->{Result} = 'PASS';
+      }
+
+      # We process compass separately from accel and gyro:
+      #  compass statistics have already been computed by call to Camcom::calcStats
+      #  accel/gyro stats need to be computed separately
+      #  compass sigma max is different from accel/gyro sigma max
+      #  accel/gyro stats are not associated with any camera state
+      #  below we check compass sigmas only during the camera ON states (NOT Off/Pretest or Off/Stopped)
+      #  the compass sigmas associated with Off camera states are done later when we also do the
+      #    delta calculation between Off/Pretest and Off/Stopped per axis
+
+      if ($sensor =~ m<compass>) {
+	$sensorTimes{compass} = sprintf "%s:  Time:  %5.3lfμ %5.3lfσ min %5.3lf max %5.3lf  %d readings\n", $sensor,
+	   (map { $root->{Time}->{$_} } qw(Mean Sigma Min Max)), $root->{Readings};
+
+	my $sigmamax = $clArgs->get('compassSigma');
+	my @csigmas = ();
+
+	for my $sensorState (@sensorStates) {
+	  next
+	    if $sensorState =~ m<Off>i;
+	  my $sigmas;
+	  for my $vcmState (@vcmStates) {
+	    push(@csigmas, $sigmas = [map { $root->{$sensorState}->{$vcmState}->{$_}->{Sigma} } qw(X Y Z)]);
+
+	    # check failure reason:  compass axis reading sigma exceeds threshold for compass
+	    # we flag this error later while doing limits checks:  no need to flag it here
+	  }
+	}
+	my @xyz = ();
+	for my $i (0..2) {
+	  push(@xyz, sprintf "%s %5.2lf max σ", (qw(X Y Z))[$i],
+	       &rnd(100, &Statistics::max( map { $csigmas[$_]->[$i] } (0..scalar(@csigmas)-1))));
+	}
+	printf "%s:  %s  %s  %s for all sensor/vcmstate combinations\n", $sensor, @xyz;
+      } else {
+
+	# determine std dev of gyro/accel readings during test period
+	# any std dev over threshold suggests a bump
+	# compute:  mean, min, max, sigma, swing of accel/gyro
+
+	my $precision = $clArgs->get('precision');
+	my $precMult = 1;
+	while ($precision--) {
+	  $precMult *= 10;
+	}
+
+	for my $axis qw(X Y Z) {
+	  $root->{$axis}->{Values} = [map { $_->{$axis} } (@a)];
+	  ($root->{$axis}->{Mean},
+	   $root->{$axis}->{Min},
+	   $root->{$axis}->{Max}) =
+	     &rnd($precMult, &Statistics::meanMinMax(@{$root->{$axis}->{Values}}));
+	  $root->{$axis}->{Sigma} = &rnd($precMult, &Statistics::stddev($root->{$axis}->{Mean},
+									@{$root->{$axis}->{Values}}));
+	  $root->{$axis}->{Swing} = &rnd($precMult, $root->{$axis}->{Max} - $root->{$axis}->{Min});
+	}
+	printf STDOUT "%7s:  X %7.2lfμ (%7.2lf..%7.2lf: %7.2lf) %5.2lfσ,  Y %7.2lfμ (%7.2lf..%7.2lf: %7.2lf) %5.2lfσ,  Z %7.2lfμ (%7.2lf..%7.2lf: %7.2lf) %5.2lfσ\n", $sensor,
+	  (map { $root->{$_}->{Mean}, $root->{$_}->{Min}, $root->{$_}->{Max}, $root->{$_}->{Swing},
+		   $root->{$_}->{Sigma} } qw(X Y Z));
+
+	$sensorTimes{$sensor} = sprintf "%7s:  Time:  %5.3lfμ %5.3lfσ min %5.3lf max %5.3lf  %d readings\n", $sensor,
+		     (map { $root->{Time}->{$_} } qw(Mean Sigma Min Max)), $root->{Readings};
+
+	# check for failure:  accel/gyro axis reading sigma exceeds threshold for those sensors (single value for both)
+
+	my $sigmamax = $clArgs->get('accelGyroSigma');
+
+	for my $axis qw(X Y Z) {
+	  my $testname = sprintf "%s %s Sigma", ucfirst($sensor), $axis;
+	  push(@{$results->{Tests}}, $testname);
+	  $results->{Test}->{$testname}->{LLIM} = 0;
+	  $results->{Test}->{$testname}->{ULIM} = $sigmamax;
+	  $results->{Test}->{$testname}->{Value} = $root->{$axis}->{Sigma};
+	  if ($root->{$axis}->{Sigma} > $sigmamax) {
+	    my $errmsg = sprintf "%s %s Sigma %s > %s", ucfirst($sensor), $axis, $root->{$axis}->{Sigma}, $sigmamax;
+	    push(@failedReason, $results->{Test}->{$testname}->{Result}->{FAIL} = $errmsg);
+	  } else {
+	    $results->{Test}->{$testname}->{Result} = 'PASS';
+	  }
+	}
+      }
+    }
+
+    # gross failures are:  insufficient sensor readings, unable to open/read a sensor log
+
+    next
+      if $grossFailure;
+
+    printf "%s%s%s", map { $sensorTimes{$_} } qw(accel compass gyro);
+
+    # check deltas against range limits:  limitscsv->{Data} must be populated for this to work!
+
+    if (exists $limitscsv->{Data} &&
+	defined $limitscsv->{Data}) {
+      my $precision = $clArgs->get('precision');
+      my $precMult = 1;
+      while ($precision--) {
+	$precMult *= 10;
+      }
+
+      my $sigmamax = $clArgs->get('compassSigma');
+      my $maxOffDelta = $clArgs->get('maxOffDelta');
+
+      # round to precision
+      for my $sensorState (@sensorStates) {
+	for my $vcmState (keys %{$periods->{$sensorState}}) {
+	  for my $axis (&AXES) {
+#	    printf STDOUT "Rounding '%s %s %s Mean/Sigma/Delta'\n", $sensorState, $vcmState, $axis;
+	    for my $thing qw(Mean Sigma Delta) {
+	      $stats->{$loop}->{compass}->{$sensorState}->{$vcmState}->{$axis}->{$thing} =
+		&rnd($precMult, $stats->{$loop}->{compass}->{$sensorState}->{$vcmState}->{$axis}->{$thing})
+		  if (exists $stats->{$loop}->{compass}->{$sensorState}->{$vcmState}->{$axis}->{$thing} &&
+		      defined $stats->{$loop}->{compass}->{$sensorState}->{$vcmState}->{$axis}->{$thing});
+	    }
+	  }
+	}
+      }
+
+      # sigma check for Off states
+
+      for my $axis (&AXES) {
+	my $testname;
+	for my $vcmState qw(Pretest Stopped) {
+	  $testname = sprintf "Off %s %s Sigma", $vcmState, $axis;
+	  push(@{$results->{Tests}}, $testname);
+	  $results->{Test}->{$testname}->{LLIM} = 0;
+	  $results->{Test}->{$testname}->{ULIM} = $sigmamax;
+	  my $value = $results->{Test}->{$testname}->{Value} = $stats->{$loop}->{compass}->{Off}->{$vcmState}->{$axis}->{Sigma};
+	  if ($value > $sigmamax) {
+	    my $errmsg = sprintf "%s %s > %s (max sigma)", $testname, $value, $sigmamax;
+	    push(@failedReason, $results->{Test}->{$testname}->{Result}->{FAIL} = $errmsg);
+	  } else {
+	    $results->{Test}->{$testname}->{Result} = 'PASS';
+	  }
+	}
+	$testname = sprintf "Off Pretest Stopped %s Delta", $axis;
+	push(@{$results->{Tests}}, $testname);
+	$results->{Test}->{$testname}->{LLIM} = 0;
+	$results->{Test}->{$testname}->{ULIM} = $maxOffDelta;
+	
+	# check Off/Pretest vs. Off/Stopped
+
+	my $delta =
+	  $results->{Test}->{$testname}->{Value} = &rnd($precMult,
+							abs($stats->{$loop}->{compass}->{Off}->{Pretest}->{$axis}->{Mean} -
+							    $stats->{$loop}->{compass}->{Off}->{Stopped}->{$axis}->{Mean}));
+#	printf STDOUT "%s = abs(Off Pretest $axis Mean %s  -  Off Stopped $axis Mean %s)\n", $delta,
+#	  map { $stats->{$loop}->{compass}->{Off}->{$_}->{$axis}->{Mean} } qw(Pretest Stopped);
+
+	if ($delta > $maxOffDelta) {
+	  my $errmsg = sprintf "%s %s > %s (max sigma)", $testname, $delta, $maxOffDelta;
+	  push(@failedReason, $results->{Test}->{$testname}->{Result}->{FAIL} = $errmsg);
+	} else {
+	  $results->{Test}->{$testname}->{Result} = 'PASS';
+	}
+      }
+
+      # apply range checks to camera-active compass readings
+
+      $sigmamax = $clArgs->get('compassSigma');
+
+      my $doLimits = $clArgs->get('limits');
+
+      if ($doLimits) {
+	for my $sensorState (@sensorStates) {
+	  next # there is no delta from Off, that is the reference point
+	    if $sensorState =~ m<Off>i;
+
+	  # we only do range checks for Calibrated VCM states
+
+	  for my $vcmState (sort { $a cmp $b } grep { /Calibrate/ } keys %{$periods->{$sensorState}}) {
+
+	    for my $axis (&AXES) {
+	      my $limitscol = sprintf "%s %s %s", $sensorState, $vcmState, $axis;
+	      my $vcmv = $h->{$fname}->{Driver};
+
+	      if (exists $vcmvmap{$vcmv} &&
+		  defined $vcmvmap{$vcmv}) {
+		my $row = $vcmvmap{$vcmv};
+		if (exists $limitsh{$vcmv}->{$limitscol} &&
+		    defined $limitsh{$vcmv}->{$limitscol} &&
+		    ref($limitsh{$vcmv}->{$limitscol}) =~ m<ARRAY>) {
+		  printf STDOUT "$msgp range check:  '%s' %s  [ %s .. %s ]\n", $limitscol,
+		    $stats->{$loop}->{compass}->{$sensorState}->{$vcmState}->{$axis}->{Delta},
+		      @{$limitsh{$vcmv}->{$limitscol}}
+			if $doLimits && $debug;
+
+		  my @tests = map { join(' ', $limitscol, $_) } qw(Mean Sigma Delta);
+
+		  # save the Value
+		  for my $thing qw(Mean Sigma Delta) {
+		    my $test = join(' ', $limitscol, $thing);
+		    $results->{Test}->{$test}->{Value} = $stats->{$loop}->{compass}->{$sensorState}->{$vcmState}->{$axis}->{$thing};
+		  }
+		  # Mean reading is always a 'PASS'
+		  push(@{$results->{Tests}}, @tests);
+		  $results->{Test}->{$tests[0]}->{Result} = 'PASS';
+
+		  # Sigma reading has a maximum threshold it must not exceed
+
+		  $results->{Test}->{$tests[1]}->{LLIM} = 0;
+		  $results->{Test}->{$tests[1]}->{ULIM} = $sigmamax;
+		  if ($stats->{$loop}->{compass}->{$sensorState}->{$vcmState}->{$axis}->{Sigma} > $sigmamax) {
+		    my $errmsg = sprintf "%s Sigma %s > %s maximum threshold", $limitscol,
+		      $stats->{$loop}->{compass}->{$sensorState}->{$vcmState}->{$axis}->{Sigma}, $sigmamax;
+		    push(@failedReason, $results->{Test}->{$tests[1]}->{Result}->{FAIL} = $errmsg);
+
+		  } else {
+		    $results->{Test}->{$tests[1]}->{Result} = 'PASS';
+		  }
+
+		  if ($doLimits) {
+		    $results->{Test}->{$tests[2]}->{LLIM} = $limitsh{$vcmv}->{$limitscol}->[0];
+		    $results->{Test}->{$tests[2]}->{ULIM} = $limitsh{$vcmv}->{$limitscol}->[1];
+
+		    if ($stats->{$loop}->{compass}->{$sensorState}->{$vcmState}->{$axis}->{Delta}
+			< $limitsh{$vcmv}->{$limitscol}->[0] ||
+			$stats->{$loop}->{compass}->{$sensorState}->{$vcmState}->{$axis}->{Delta}
+			> $limitsh{$vcmv}->{$limitscol}->[1]) {
+
+		      my $errmsg = sprintf "%s %s %s:  delta value %.3lf outside range [ %s .. %s ]",
+			$sensorState, $vcmState, $axis, $stats->{$loop}->{compass}->{$sensorState}->{$vcmState}->{$axis}->{Delta},
+			  @{$limitsh{$vcmv}->{$limitscol}};
+
+		      push(@failedReason, $results->{Test}->{$tests[2]}->{Result}->{FAIL} = $errmsg);
+		    } else {
+		      $results->{Test}->{$tests[2]}->{Result}= 'PASS';
+		    }
+		  } else {
+		    $results->{Test}->{$tests[2]}->{Result}= 'PASS';
+		  }
+		} else {
+		  printf STDERR "$msgp ERROR, missing limits for %s '%s'\n", $vcmv, $limitscol
+		    if $doLimits;
+		}
+	      } else {
+		printf STDERR "$msgp ERROR, failed to locate VCM vendor '%s' in driver list (%s)\n",
+		  $vcmv, join(',', keys %vcmvmap)
+		    if $doLimits;
+	      }
+	    }
+	  }
+	}
+      } else {
+	# populate results hash with readings and N/A for LLIM/ULIM
+
+	for my $sensorState (@sensorStates) {
+	  next
+	    if $sensorState =~ m<Off>i;
+
+	  # range checks for calibrated VCM states
+	  for my $vcmState (sort { $a cmp $b } grep { /Calibrate/ } keys %{$periods->{$sensorState}}) {
+
+	    for my $axis (&AXES) {
+	      my $limitscol = sprintf "%s %s %s", $sensorState, $vcmState, $axis;
+	      my @tests = map { join(' ', $limitscol, $_) } qw(Mean Sigma Delta);
+
+	      # save the Value
+	      for my $thing qw(Mean Sigma Delta) {
+		my $test = join(' ', $limitscol, $thing);
+		$results->{Test}->{$test}->{Value} = $stats->{$loop}->{compass}->{$sensorState}->{$vcmState}->{$axis}->{$thing};
+	      }
+	      # Mean reading is always a 'PASS' with no limits
+	      push(@{$results->{Tests}}, @tests);
+	      $results->{Test}->{$tests[0]}->{Result} = 'PASS';
+
+	      # Sigma reading has a maximum threshold it must not exceed
+
+	      $results->{Test}->{$tests[1]}->{LLIM} = 0;
+	      $results->{Test}->{$tests[1]}->{ULIM} = $sigmamax;
+	      if ($stats->{$loop}->{compass}->{$sensorState}->{$vcmState}->{$axis}->{Sigma} > $sigmamax) {
+		my $errmsg = sprintf "%s Sigma %s > %s maximum threshold", $limitscol,
+		  $stats->{$loop}->{compass}->{$sensorState}->{$vcmState}->{$axis}->{Sigma}, $sigmamax;
+		push(@failedReason, $results->{Test}->{$tests[1]}->{Result}->{FAIL} = $errmsg);
+	      } else {
+		$results->{Test}->{$tests[1]}->{Result} = 'PASS';
+	      }
+	      $results->{Test}->{$tests[2]}->{LLIM} = 'N/A';
+	      $results->{Test}->{$tests[2]}->{ULIM} = 'N/A';
+	      $results->{Test}->{$tests[2]}->{Result}= 'PASS';
+	    }
+	  }
+	}
+      }
+    }
+    my $failures = scalar(@failedReason);
+
+    if ($failures) {
+      printf "Iteration %d failed, reason%s:\n\t%s\n", $loop, $failures > 1 ? 's' : '', join("\n\t", @failedReason);
+    } else {
+
+      $loop++;
+      $success = 1;
+    }
+
+    last LOOP
+      if (($clArgs->get('loops') < $loop) && $success);
+
+    next;   # while LOOP
+
+  } elsif (defined $kidpid) {
+    # child spawns compassTester, gyroTester, accelTester for fixed duration
+    print STDOUT "Child here:  $$\n"
+      if $debug;
+
+    my $isP105 = $hardwaremodel =~ m<P10[5-7]> || $hardwaremodel =~ m<J7[5-7]> ? 1 : 0;
+
+    my %intervals = ( accel => $isP105 ? 0.010 : 0.005,
+		      compass => $isP105 ? 0.020 : 0.010,			# rdar://11657260
+		      gyro => $isP105 ? 0.010 : 0.005,		# rdar://10896051
+		    );
+    my @sms = ();
+    for my $sensor qw(compass gyro accel) {
+      my $smo = SpawnMon->new(Command => sprintf("%sTester", $sensor),
+			      CommandOptions => ['-interval', $intervals{$sensor}],
+			      Duration => $isP105 ? &TEST_TIME_P105 : &TEST_TIME,
+			      LogFile => $logFiles{$sensor},
+			      Annotator => \&getTsMs,
+			      Debug => 0);
+      if (defined $smo) {
+	push(@sms, $smo);
+      } else {
+	printf STDERR "$msgp ERROR, failed to spawn command '%s'\n", sprintf("%sTester", $sensor);
+
+	my %failures = ( accel => &ACCEL_TESTER_FAILED,
+			 gyro => &GYRO_TESTER_FAILED,
+			 compass => &COMPASS_TESTER_FAILED,
+		       );
+
+	# clean-up and exit
+	# -----------------
+
+	for my $thing (@sms) {
+	  kill 9 => $thing->{PID};
+	  waitpid($thing->{PID}, 0);
+	}
+	exit($failures{$sensor});
+      }
+    }
+
+    for my $thing1 (@sms) {
+      printf "Child waiting on pid %d (%s)\n", $thing1->{PID}, $thing1->{Command}
+	if $debug;
+      waitpid($thing1->{PID}, 0);
+    }
+
+    exit(0);
+  }
+
+  # if neither 'if' nor 'elsif' clauses executed above, that's a fork error, so we'll just exit with bad status
+
+  print STDERR "ERROR, fork failed:  $!\n";
+  exit(&FORK_FAILED);
+}
+
+# summary data by iteration
+# -------------------------
+
+my (@cpasValues, @unscaled);
+if ($hardwaremodel !~ m<P10[5-7]> &&
+    $hardwaremodel !~ m<J7[5-7]>) {
+  @cpasValues = (&CPAS_VERSION + (&CPAS_MINOR_VERSION << 8));		# 16-bit version to start things off
+  @unscaled = (&CPAS_VERSION);
+} else {
+  @cpasValues = ((&CPAS_VERSION + 1) + ($clArgs->get('p105calrecords') << 8));
+  @unscaled = &CPAS_VERSION + 1;
+}
+
+my $memdumpcmd = 'memdump -w -a syscfg -k CPAS -v "0x';
+my @results = ();				# holds results of scaled slopes and intercepts
+
+# decrement number of good runs if last iteration was not successful
+$loop--
+  if ((! $success) || $loop > $nLoops);
+
+if ($loop > 0) {
+  my $results = { };
+  my $periods = &PERIODS;
+
+  my @sensorStates = qw(Off 640x480 352x388 960x540 720p 1920x1080 2592x1936 Preview);
+  my @vcmStates = qw(CalibratedInfinity CalibratedMidpt CalibratedMacro Uncalibrated_80mA);
+
+  if ($hardwaremodel =~ m<P10[5-7]> ||
+      $hardwaremodel =~ m<J7[5-7]>) {
+    $periods = &PERIODSP105;
+    @sensorStates = keys %{&PERIODSP105};
+    @vcmStates = qw(CalibratedInfinity CalibratedMidpt CalibratedMacro);
+  }
+
+  my @loops = (1..$loop);
+
+  for my $sensorState (@sensorStates) {
+    next
+      if $sensorState =~ m<off>i;
+    for my $vcmState (@vcmStates) {
+      for my $axis qw(X Y Z) {
+	my @arr = map { $stats->{$_}->{compass}->{$sensorState}->{$vcmState}->{$axis}->{Delta} } @loops;
+
+	# error checking below, just in case
+
+	my $err = 0;
+	for my $val (@arr) {
+	  $err++
+	    unless defined $val;
+	}
+	printf STDERR "$msgp ERROR, %d elements of %d are undefined in array of values for stats:  %s %s\n",
+	  $err, scalar(@arr), $sensorState, $vcmState
+	    if $err;
+
+	($results->{$sensorState}->{$vcmState}->{$axis}->{DeltaMean},
+	 $results->{$sensorState}->{$vcmState}->{$axis}->{DeltaMin},
+	 $results->{$sensorState}->{$vcmState}->{$axis}->{DeltaMax}) = &Statistics::meanMinMax(@arr);
+	$results->{$sensorState}->{$vcmState}->{$axis}->{DeltaSigma} =
+	  &Statistics::stddev($results->{$sensorState}->{$vcmState}->{$axis}->{DeltaMean}, @arr);
+      }
+      printf STDOUT "%-9s %-18s  %s  %s  %s\n", $sensorState, $vcmState,
+	map { sprintf "$_ %7.3lf .. %7.3lf  %8.3lfμ %6.3lfσ",
+		$results->{$sensorState}->{$vcmState}->{$_}->{DeltaMin},
+		$results->{$sensorState}->{$vcmState}->{$_}->{DeltaMax},
+		$results->{$sensorState}->{$vcmState}->{$_}->{DeltaMean},
+		$results->{$sensorState}->{$vcmState}->{$_}->{DeltaSigma}
+	      } &AXES;
+    }
+    for my $axis (&AXES) {
+      for my $l (@loops) {
+	my @x = (0, 127, 255);
+	my @y = map { $stats->{$l}->{compass}->{$sensorState}->{$_}->{$axis}->{Delta}
+						 } qw(CalibratedInfinity CalibratedMidpt CalibratedMacro);
+
+	my ($slope, $intercept) = &linterp3([@x], [@y]);
+	if (defined $slope && defined $intercept) {
+	  push(@{$results->{$sensorState}->{$axis}->{Slopes}}, $slope);
+	  push(@{$results->{$sensorState}->{$axis}->{Intercepts}}, $intercept);
+	  my $residual = 0;
+	  for my $xindex (0..2) {
+	    my $answer = $stats->{$l}->{compass}->{$sensorState}->{$vcmStates[$xindex]}->{$axis}->{Delta};
+	    my $yinterp = $slope * $x[$xindex] + $intercept;
+	    my $error = $answer - $yinterp;
+	    $residual += $error * $error;
+	    printf STDOUT "\t%2d %s:  x = %3d, y = %6.3lf (%6.3lf) Error %5.3lf%s\n",
+	      $l, $axis, $x[$xindex], $yinterp, $answer, $error,
+		$xindex == 0 ? sprintf(", slope %6.3lf, intercept %6.3lf", $slope, $intercept) : '';
+	  }
+	} else {
+	  printf STDERR "$msgp ERROR, %s iteration compass, %d axis %s linear interpolation failed:  %s\n",
+	    $sensorState, $axis, $l, join(', ', map { sprintf "(%d, %.3lf)", $x[$_], $y[$_] } (0..2));
+	}
+      }
+      if (scalar(@loops) > 1) {
+	my $means = &Statistics::mean(@{$results->{$sensorState}->{$axis}->{Slopes}});
+	my $meani = &Statistics::mean(@{$results->{$sensorState}->{$axis}->{Intercepts}});
+	my $sigmas = &Statistics::stddev($means, @{$results->{$sensorState}->{$axis}->{Slopes}});
+	my $sigmai = &Statistics::stddev($meani, @{$results->{$sensorState}->{$axis}->{Intercepts}});
+	printf STDOUT "\t   %s:  slope %6.3lfμ %5.3lfσ, intercept %6.3lfμ %5.3lfσ\n",
+	  $axis, $means, $sigmas, $meani, $sigmai;
+	$results->{$sensorState}->{$axis}->{Slope} = $means;
+	$results->{$sensorState}->{$axis}->{Intercept} = $meani;
+      } else {
+	$results->{$sensorState}->{$axis}->{Slope} = $results->{$sensorState}->{$axis}->{Slopes}->[0];
+	$results->{$sensorState}->{$axis}->{Intercept} = $results->{$sensorState}->{$axis}->{Intercepts}->[0];
+      }
+    }
+    if (!($sensorState =~ m<Off>i || $sensorState =~ m<Preview>)) {
+      if ($hardwaremodel !~ m<P10[5-7]> && $hardwaremodel !~ m<J7[5-7]>) {
+	push(@unscaled, (map { $results->{$sensorState}->{$_}->{Slope} } qw(X Y Z)),
+	     (map { $results->{$sensorState}->{$_}->{Intercept} } qw(X Y Z)));
+	push(@results, (map { $results->{$sensorState}->{$_}->{Slope} * &SLOPE_SCALE } qw(X Y Z)),
+	     (map { $results->{$sensorState}->{$_}->{Intercept} * &INTERCEPT_SCALE } qw(X Y Z)));
+	printf STDOUT "%-20s slopes:  %.3lf, %.3lf, %.3lf -> %d  %d  %d\n", $sensorState,
+	  (map { $results->{$sensorState}->{$_}->{Slope} } qw(X Y Z)), (@results)[-6, -5, -4];
+	printf STDOUT "%-20s intcpt:  %.3lf, %.3lf, %.3lf -> %d  %d  %d\n", $sensorState,
+	  (map { $results->{$sensorState}->{$_}->{Intercept} } qw(X Y Z)), (@results)[-3, -2, -1];
+      }
+    }
+  }
+  if ($hardwaremodel =~ m<P10[5-7]> ||
+      $hardwaremodel =~ m<J7[5-7]>) {
+    my $single = &P105SINGLE;
+    my $singlere = qr<$single>;
+    my @ss = grep { $_ !~ m<Off> } @sensorStates;
+    if ($clArgs->get('p105calrecords') == 2) {
+      @ss = grep { $_ !~ $singlere } @ss;
+      if (exists $results->{$single} &&
+	  defined $results->{$single}) {
+	push(@results, (map { $results->{$single}->{$_}->{Slope} * &SLOPE_SCALE } qw(X Y Z)),
+	     (map { $results->{$single}->{$_}->{Intercept} * &INTERCEPT_SCALE } qw(X Y Z)));
+	printf STDOUT "%-20s slopes:  %.3lf, %.3lf, %.3lf -> %d  %d  %d\n", $single,
+	  (map { $results->{$single}->{$_}->{Slope} } qw(X Y Z)), (@results)[-6, -5, -4];
+	printf STDOUT "%-20s intcpt:  %.3lf, %.3lf, %.3lf -> %d  %d  %d\n", $single,
+	  (map { $results->{$single}->{$_}->{Intercept} } qw(X Y Z)), (@results)[-3, -2, -1];
+      } else {
+	printf STDERR "$msgp ERROR, failed to locate sensor mode '%s' in results\n", $single;
+	# need to percolate this failure up somehow
+      }
+    }
+    my (@sslopes, @sintercepts, @uslopes, @uintercepts);
+    for my $axis (&AXES) {
+      push(@uslopes, &Statistics::mean(map { $results->{$_}->{$axis}->{Slope}} @ss));
+      push(@sslopes, &Statistics::mean(map { $results->{$_}->{$axis}->{Slope}} @ss) * &SLOPE_SCALE);
+      push(@uintercepts, &Statistics::mean(map { $results->{$_}->{$axis}->{Intercept}} @ss));
+      push(@sintercepts, &Statistics::mean(map { $results->{$_}->{$axis}->{Intercept}} @ss) * &INTERCEPT_SCALE);
+    }
+    printf STDOUT "%-20s slopes:  %.3lf, %.3lf, %.3lf -> %d  %d  %d\n", 'ALL States',
+      (@uslopes)[-3, -2, -1], (@sslopes)[-3, -2, -1];
+    printf STDOUT "%-20s intcpt:  %.3lf, %.3lf, %.3lf -> %d  %d  %d\n", 'ALL States',
+      (@uintercepts)[-3, -2, -1], (@sintercepts)[-3, -2, -1];
+    push(@results, @sslopes, @sintercepts);
+    # X -> (-6,-3)  Y -> (-5, -2)  X -> (-4, -1)
+    my %aiMap = (X => -3,
+		 Y => -2,
+		 Z => -1,
+		);
+    my @errors = (0, 0, 0);
+    for my $sensorState (@ss) {
+      my @x = (0, 127, 255);
+      my %xvm = (0 => 'CalibratedInfinity',
+		 127 => 'CalibratedMidpt',
+		 255 => 'CalibratedMacro',
+		);
+      for my $xindex (0..2) {
+	my $vcmState = $xvm{$x[$xindex]};
+	printf STDOUT "%-15s %-18s  %s  %s  %s\n", $sensorState, $vcmState,
+	  map { sprintf "$_ %7.3lf .. %7.3lf  %8.3lfμ %6.3lfσ",
+		  $results->{$sensorState}->{$vcmState}->{$_}->{DeltaMin},
+		    $results->{$sensorState}->{$vcmState}->{$_}->{DeltaMax},
+		      $results->{$sensorState}->{$vcmState}->{$_}->{DeltaMean},
+			$results->{$sensorState}->{$vcmState}->{$_}->{DeltaSigma}
+		      } &AXES;
+	printf STDOUT "%-15s %-18s", ' ', ' ';  # $sensorState, $vcmState;
+	for my $axis (&AXES) {
+	  my $y = $stats->{(@loops)[0]}->{compass}->{$sensorState}->{$vcmState}->{$axis}->{Delta};
+	  printf "\n$msgp ERROR: \$y undefined for scalar(loops)=%d, sensorState=%s, vcmState=%s, axis=%s\n", scalar(@loops),
+	    $sensorState, $vcmState, $axis
+	      unless defined $y;
+	  my $idx = $aiMap{$axis};
+	  my $yi = $x[$xindex] * $uslopes[$idx] + $uintercepts[$idx];
+	  printf "\n$msgp ERROR: \$yi undefined for scalar(loops)=%d, sensorState=%s, vcmState=%s, axis=%s\n", scalar(@loops),
+	    $sensorState, $vcmState, $axis
+	      unless defined $yi;
+	  next
+	    unless defined $y && defined $yi;
+	  my $error = $y - $yi;
+	  $errors[$xindex] = &Statistics::max($errors[$xindex], $error);
+	  $errors[$xindex] = $error
+	    if abs($error) > abs($errors[$xindex]);
+	  printf STDOUT "  %s %7s    %7s  %8.3lf  %6.3lfe", $axis, ' ', ' ', &Utils::rnd(1000, $yi, $error);
+	}
+	printf STDOUT "\n";
+      }
+    }
+    printf STDOUT "%-15s %-18s", 'Max Error:', '';
+    printf STDOUT "  %s  %s  %s\n",
+      map { sprintf "%s %7s    %7s  %8s  %6.3lfe", (&AXES)[$_], ' ', ' ', ' ', $errors[$_] } (0..2);
+  }
+}
+
+my $exitval = 0;
+my $failureMessage = '';
+
+if ($iteration > MAX_ITERATIONS) {
+  printf $logh "FAIL\nIteration=%d exceeds maximum number of iterations %d\n", $iteration, MAX_ITERATIONS;
+  $exitval = $gFailedSensorDeltas ? &SENSOR_DELTA_FAIL : &EXCEEDED_MAX_ITERATIONS;
+  printf STDOUT "FAIL\n";
+  $failureMessage = sprintf "Exceeded maximum number of iterations %d", MAX_ITERATIONS;
+} elsif ($loop < 1) {
+  printf $logh "FAIL\nNo successful iterations completed\n";
+  $exitval = &EXCEEDED_MAX_ITERATIONS;
+  $failureMessage = sprintf "%d iterations attempted, none successful", $iteration;
+} else {
+  printf $logh "PASS\n";
+  printf STDOUT "PASS\n";
+  if ($clArgs->get('calibrate')) {
+    push(@cpasValues, @results);
+    my @cpasHex = map { &int2hexBytes($_) } @cpasValues;
+    my $crc = sprintf "%04x", &crc16([@cpasHex]);
+    printf "crc16:  %s\n", $crc;
+    {
+      my @b = split(/ */, $crc);
+      push(@cpasHex, join('', (@b)[-2, -1]), join('', (@b)[-4, -3]));
+    }
+
+    printf STDOUT "$msgp CPAS has %d bytes:  %s\n", scalar(@cpasHex), join(' ', map { sprintf "%02x", hex($_) } @cpasHex);
+
+    my $cmd = sprintf "%s%s\"", $memdumpcmd, join(' ', map { sprintf "%s", $_ } @cpasHex);
+    printf STDOUT "%s\n", $cmd;
+
+    my $status = &execer($cmd,
+			 sub {
+			   my ($lineNo, $line, @remains) = (@_);
+			   print $line;
+			   return 0;
+			 });
+    unless ($status == 1) {
+      $exitval = &FORKED_MEMDUMP_FAILED;
+      $failureMessage = 'memdumpcmd returned bad status';
+    }
+  } else {
+    printf STDOUT "$msgp -nocalibration specified\n";
+  }
+}
+
+close($logh);
+
+my $result = $exitval ? 'FAIL' : 'PASS';
+$startTime = &plistCanonicalTime($startTime);
+$endTime = &plistCanonicalTime(timelocal(localtime));
+my $version = &VERSION;
+my $vcmv = $results->{Driver};
+
+my $plistStart = <<"ENDSHERE";
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>0</key>
+	<dict>
+		<key>Attributes</key>
+		<dict>
+			<key>serialnumber</key>
+			<string>$serialno</string>
+			<key>softwarename</key>
+			<string>CameraCompassCalibration</string>
+			<key>softwareversion</key>
+			<string>$version</string>
+			<key>VCM Vendor</key>
+			<string>$vcmv</string>
+		</dict>
+		<key>Tests</key>
+		<array>
+ENDSHERE
+
+my @tests = @{$results->{Tests}};
+my @teststr = ( );
+
+for my $test (@tests) {
+  my $llim = exists $results->{Test}->{$test}->{LLIM} &&
+    defined $results->{Test}->{$test}->{LLIM} ?  $results->{Test}->{$test}->{LLIM} : 'NA';
+  my $ulim = exists $results->{Test}->{$test}->{ULIM} &&
+    defined $results->{Test}->{$test}->{ULIM} ?  $results->{Test}->{$test}->{ULIM} : 'NA';
+  my $value = $results->{Test}->{$test}->{Value};
+  my ($result, $reason);
+  if (exists $results->{Test}->{$test}->{Result} &&
+      defined $results->{Test}->{$test}->{Result} &&
+      ref($results->{Test}->{$test}->{Result}) eq 'HASH') {
+    $result = (keys %{$results->{Test}->{$test}->{Result}})[0];
+    $reason = $results->{Test}->{$test}->{Result}->{$result};
+  } else {
+    $result = $results->{Test}->{$test}->{Result};
+  }
+  my $units = exists $results->{Test}->{$test}->{Units} &&
+    defined $results->{Test}->{$test}->{Units} ? $results->{Test}->{$test}->{Units} : 'NA';
+  my $teststr = &getTestPlist($test, $llim, $ulim, $value, $units, $result, $reason);
+  if (defined $llim &&
+      defined $ulim &&
+      defined $value) {
+    if ($llim =~ m<^\s*\-?\d+\.?\d*> &&
+	$ulim =~ m<^\s*\-?\d+\.?\d*> &&
+	$value =~ m<^\s*\-?\d+\.?\d*>) {
+      if ($llim <= $value && $value <= $ulim) {
+	printf "%s:  %s <= %s <= %s\n", $test, $llim, $value, $ulim
+	  if $debug;
+      } else {
+	printf "%s:  ! %s <= %s <= %s\n", $test, $llim, $value, $ulim;
+      }
+    } elsif ($llim =~ m<NA> &&
+	     $ulim =~ m<NA> &&
+	     $value =~ m<^\s*\-?\d+\.?\d*>) {
+      printf "%s:  %s <= %s <= %s\n", $test, $llim, $value, $ulim
+	if $debug;
+    } else {
+      printf "%s:  %s,  %s,  %s\n", $test, $llim, $value, $ulim
+	if $debug;
+    }
+  }
+  push(@teststr, $teststr);
+}
+
+my $plistEnd =  <<"ENDSHERE";
+		</array>
+		<key>overallresult</key>
+		<string>$result</string>
+		<key>startTime</key>
+		<string>$startTime</string>
+		<key>stopTime</key>
+		<string>$endTime</string>
+	</dict>
+</dict>
+</plist>
+ENDSHERE
+
+if (scalar(@tests) > 0) {
+  my $plistf = join('/', &PLISTDIR, sprintf(&PLISTNAME, $program));
+  unless (-d &PLISTDIR) {
+    my $sts = execer(sprintf("mkdir -p %s", &PLISTDIR),
+		     sub {
+		       my ($lineNo, $line) = (@_);
+		       printf $line;
+		       return 0;
+		     });
+    unless (-d &PLISTDIR) {
+      printf STDERR "$msgp ERROR, failed to create directory '%s':  $!\n", &PLISTDIR;
+    }
+  }
+  if (open(FH, ">$plistf")) {
+    print FH $plistStart;
+    printf FH "%s", join('', @teststr);
+    print FH $plistEnd;
+    close(FH);
+  } else {
+    printf STDERR "$msgp ERROR, failed to open file '%s' for write:  $!\n", $plistf;
+    exit(&PDCA_PLIST_OPEN_WRITE_FAILED);
+  }
+}
+
+exit($exitval);
+
+__DATA__
+VCM Vendor,640x480 CalibratedInfinity X Mean,640x480 CalibratedInfinity X Sigma,640x480 CalibratedInfinity Y Mean,640x480 CalibratedInfinity Y Sigma,640x480 CalibratedInfinity Z Mean,640x480 CalibratedInfinity Z Sigma,640x480 CalibratedMidpt X Mean,640x480 CalibratedMidpt X Sigma,640x480 CalibratedMidpt Y Mean,640x480 CalibratedMidpt Y Sigma,640x480 CalibratedMidpt Z Mean,640x480 CalibratedMidpt Z Sigma,640x480 CalibratedMacro X Mean,640x480 CalibratedMacro X Sigma,640x480 CalibratedMacro Y Mean,640x480 CalibratedMacro Y Sigma,640x480 CalibratedMacro Z Mean,640x480 CalibratedMacro Z Sigma,352x388 CalibratedInfinity X Mean,352x388 CalibratedInfinity X Sigma,352x388 CalibratedInfinity Y Mean,352x388 CalibratedInfinity Y Sigma,352x388 CalibratedInfinity Z Mean,352x388 CalibratedInfinity Z Sigma,352x388 CalibratedMidpt X Mean,352x388 CalibratedMidpt X Sigma,352x388 CalibratedMidpt Y Mean,352x388 CalibratedMidpt Y Sigma,352x388 CalibratedMidpt Z Mean,352x388 CalibratedMidpt Z Sigma,352x388 CalibratedMacro X Mean,352x388 CalibratedMacro X Sigma,352x388 CalibratedMacro Y Mean,352x388 CalibratedMacro Y Sigma,352x388 CalibratedMacro Z Mean,352x388 CalibratedMacro Z Sigma,960x540 CalibratedInfinity X Mean,960x540 CalibratedInfinity X Sigma,960x540 CalibratedInfinity Y Mean,960x540 CalibratedInfinity Y Sigma,960x540 CalibratedInfinity Z Mean,960x540 CalibratedInfinity Z Sigma,960x540 CalibratedMidpt X Mean,960x540 CalibratedMidpt X Sigma,960x540 CalibratedMidpt Y Mean,960x540 CalibratedMidpt Y Sigma,960x540 CalibratedMidpt Z Mean,960x540 CalibratedMidpt Z Sigma,960x540 CalibratedMacro X Mean,960x540 CalibratedMacro X Sigma,960x540 CalibratedMacro Y Mean,960x540 CalibratedMacro Y Sigma,960x540 CalibratedMacro Z Mean,960x540 CalibratedMacro Z Sigma,720p CalibratedInfinity X Mean,720p CalibratedInfinity X Sigma,720p CalibratedInfinity Y Mean,720p CalibratedInfinity Y Sigma,720p CalibratedInfinity Z Mean,720p CalibratedInfinity Z Sigma,720p CalibratedMidpt X Mean,720p CalibratedMidpt X Sigma,720p CalibratedMidpt Y Mean,720p CalibratedMidpt Y Sigma,720p CalibratedMidpt Z Mean,720p CalibratedMidpt Z Sigma,720p CalibratedMacro X Mean,720p CalibratedMacro X Sigma,720p CalibratedMacro Y Mean,720p CalibratedMacro Y Sigma,720p CalibratedMacro Z Mean,720p CalibratedMacro Z Sigma,1920x1080 CalibratedInfinity X Mean,1920x1080 CalibratedInfinity X Sigma,1920x1080 CalibratedInfinity Y Mean,1920x1080 CalibratedInfinity Y Sigma,1920x1080 CalibratedInfinity Z Mean,1920x1080 CalibratedInfinity Z Sigma,1920x1080 CalibratedMidpt X Mean,1920x1080 CalibratedMidpt X Sigma,1920x1080 CalibratedMidpt Y Mean,1920x1080 CalibratedMidpt Y Sigma,1920x1080 CalibratedMidpt Z Mean,1920x1080 CalibratedMidpt Z Sigma,1920x1080 CalibratedMacro X Mean,1920x1080 CalibratedMacro X Sigma,1920x1080 CalibratedMacro Y Mean,1920x1080 CalibratedMacro Y Sigma,1920x1080 CalibratedMacro Z Mean,1920x1080 CalibratedMacro Z Sigma,2592x1936 CalibratedInfinity X Mean,2592x1936 CalibratedInfinity X Sigma,2592x1936 CalibratedInfinity Y Mean,2592x1936 CalibratedInfinity Y Sigma,2592x1936 CalibratedInfinity Z Mean,2592x1936 CalibratedInfinity Z Sigma,2592x1936 CalibratedMidpt X Mean,2592x1936 CalibratedMidpt X Sigma,2592x1936 CalibratedMidpt Y Mean,2592x1936 CalibratedMidpt Y Sigma,2592x1936 CalibratedMidpt Z Mean,2592x1936 CalibratedMidpt Z Sigma,2592x1936 CalibratedMacro X Mean,2592x1936 CalibratedMacro X Sigma,2592x1936 CalibratedMacro Y Mean,2592x1936 CalibratedMacro Y Sigma,2592x1936 CalibratedMacro Z Mean,2592x1936 CalibratedMacro Z Sigma,Preview CalibratedInfinity X Mean,Preview CalibratedInfinity X Sigma,Preview CalibratedInfinity Y Mean,Preview CalibratedInfinity Y Sigma,Preview CalibratedInfinity Z Mean,Preview CalibratedInfinity Z Sigma,Preview CalibratedMidpt X Mean,Preview CalibratedMidpt X Sigma,Preview CalibratedMidpt Y Mean,Preview CalibratedMidpt Y Sigma,Preview CalibratedMidpt Z Mean,Preview CalibratedMidpt Z Sigma,Preview CalibratedMacro X Mean,Preview CalibratedMacro X Sigma,Preview CalibratedMacro Y Mean,Preview CalibratedMacro Y Sigma,Preview CalibratedMacro Z Mean,Preview CalibratedMacro Z Sigma
+Dongwoon,-0.0240590367418657,0.929871676826235,-1.03026526042858,0.860825269003857,0.883768257897897,0.786283102147787,-0.222643514679018,0.932938669920795,-1.59040573484025,1.00194130300816,1.18847436886088,0.61058179753876,-0.139901853512495,0.930015900366164,-1.3445680264191,0.990829979498531,1.05594439544465,0.617889480617548,-0.0768346206282839,0.919994878030605,-1.03991492296064,1.0377895275445,0.750669189274647,0.588221172906752,-0.495299520783408,1.00959877665528,-2.27236880988302,1.12088915438892,1.45545968665048,0.626156282836087,-0.28130672548225,0.935500019054668,-1.63499607924201,1.07887497472315,1.10092192022979,0.586239016403839,-0.161786467139622,0.986042491467324,-1.12221359565585,0.917355134038793,0.760782921557961,0.754914555368578,-0.577631168081004,0.774454679020582,-2.32054964873906,0.976263153215404,1.47796888819825,0.873035752194369,-0.344549928146944,0.938707219605195,-1.69928206757833,0.603222522391279,1.12485661686869,0.590926120962332,-0.221116706425459,1.12908266852122,-1.08910616237576,1.33110551059193,0.662006378668753,0.975363845158574,-0.62076203609794,1.16448709409889,-2.32253787746898,1.45012555172778,1.40069673648577,1.03584269219494,-0.399689339849602,1.2548962127681,-1.69156831386295,1.41963502132245,1.02415716542385,1.0120187766178,-0.273166181266148,1.00817672325318,-1.08950709205588,1.33393755562873,0.591777761364766,1.10225341825235,-0.643599873272427,0.340181284720163,-2.34666016372294,0.573226410024755,1.34478147972242,0.457197206468242,-0.449136275648369,0.521226624004654,-1.69414618460026,0.72210151660452,0.964586761830625,0.619752303457778,-0.307888802133953,0.309754149623079,-1.23193263548874,0.5524984410342,0.640827867090468,0.458676184025949,-0.664860058837452,0.297867639840426,-2.3491513112183,0.535662621203966,1.31858977077971,0.397092629591826,-0.460888978604003,0.308370807450234,-1.71899078498309,0.547838011334008,0.937366719622989,0.438544474389755,-0.319367453483148,0.239112613984988,-1.21116994496301,0.420863099444688,0.58533757565672,0.297448674700377,-0.678240982287347,0.286573171215237,-2.34530454984815,0.500512530041792,1.28348709981853,0.312345045456932,-0.470541589177742,0.265441130770389,-1.70860491976533,0.423006471624457,0.898913598682589,0.280241574920093
+Rohm,0.264175460149251,0.422784188235574,-0.994333303437339,0.443479234866916,1.1100011015875,0.546972875084886,-0.124699485496139,0.44004696007147,-1.68281408608526,0.478258612062311,1.80823051927125,0.570557547784735,0.0352460023905334,0.45814849077734,-1.4113677416112,0.459984332315081,1.54842295511813,0.557168652962463,0.0840922938445723,0.376241141545866,-0.996312361885777,0.415656847805041,1.00624704396429,0.505082874129362,-0.575760912811504,0.46641383267238,-2.45825554796535,0.494391323463842,2.45883687903985,0.529373139523774,-0.234648814618251,0.445548020006707,-1.74076964178462,0.453581342344241,1.76986660683142,0.517229908540467,-0.0636181003344144,0.429835128743618,-1.10420944857366,0.390365950603154,1.06549451845939,0.496644522655272,-0.703615611197973,0.485388902200976,-2.53142024817739,0.515787194372261,2.50564341222422,0.544594220640464,-0.378524167823729,0.373656270324084,-1.8416504733117,0.42347651628294,1.81903521880195,0.519162214107326,-0.16316498146263,0.460089731020889,-1.11086720230652,0.448159340958631,0.954755500723801,0.469173596880704,-0.790958776296878,0.505302118720695,-2.55374836860116,0.582409967234589,2.41154331631722,0.611155465862088,-0.465619547093913,0.475796676879397,-1.85354579284731,0.460929571060037,1.71317033736041,0.486864255084232,-0.24388459283971,0.536188185818804,-1.1495705070359,0.662781229404364,0.89705773600629,0.570004614841107,-0.841783700658928,0.495394994905152,-2.5361047551354,0.51056025866829,2.32625243514505,0.515716878162821,-0.527632879972133,0.502097446003697,-1.85178549977321,0.522294885414147,1.63810468116812,0.558024736425517,-0.336080936119484,0.346437320207095,-1.27196682165384,0.399797989828428,0.96994996832684,0.485490047550813,-0.884988798182337,0.385828138693743,-2.55378182627407,0.443327081961391,2.2861466186221,0.663356058273669,-0.581154657509314,0.356386536302433,-1.87419380619124,0.363505113476052,1.60014005328289,0.615692024207586,-0.376413560109044,0.346850539075135,-1.2567551944095,0.381191189608687,0.91036618868254,0.649853727218006,-0.915826808664122,0.344191032301527,-2.54745716587781,0.3889727414844,2.23305186870162,0.632774053737412,-0.616466955734157,0.340574852051221,-1.87254224579246,0.353653471420049,1.55343698474632,0.627745249254358

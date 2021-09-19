@@ -1,0 +1,44 @@
+#!/bin/sh
+
+# FILE: entrace
+# AUTH: Soren Spies (sspies)
+# DATE: (Copyright Apple Inc.)
+# DESC: 6 February 2015
+
+CODESFILE=/usr/local/share/tracecodes/energytrace.codes
+
+usage() {
+    echo "Usage: entrace <prog> [<args...>]" >&2 
+    echo "       entrace        # collect until key press" >&2 
+    echo "       # Note: tracing not limited to <prog> (19673101)">&2
+    exit $1
+}
+
+[ "$1" = "-h" ] && usage 0
+
+die() {
+    echo `basename $0`: "$@" >&2
+    exit 1
+}
+
+# TODO: get fancy so interrupting works
+
+# no sudo on iOS
+unset sudo
+type -p sudo >/dev/null 2>&1 && sudo=sudo
+
+# initialize and enable DBG_ENERGYTRACE (45) tracing 
+$sudo trace -i && $sudo trace -e -c 45
+[ $? -eq 0 ] || die "setup failed"
+if [ "$#" -eq 0 ]; then
+    printf "Collecting EnergyTracing data...\n"
+    printf "(press return when done)" >&2
+    read k
+else
+    # Once 19524910 is fixed, we can use trace -E
+    "$@"        # run provided command line
+fi
+# ____
+unset codesf
+[ -e $CODESFILE ] && codesf=$CODESFILE
+$sudo trace -d; $sudo trace -t $codesf && $sudo trace -r

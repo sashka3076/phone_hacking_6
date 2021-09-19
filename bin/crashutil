@@ -1,0 +1,22 @@
+#! /usr/bin/perl                                                                
+
+use strict;
+use warnings;
+
+my $plist = shift;
+
+die "Must specify a plist to output as a crash log. '$plist' is not.\n"
+    unless ($plist =~ /.plist$/ && -r $plist);
+
+$/ = undef;
+open(FH, "<$plist") || die "could not open '$plist': $!\n";
+
+my @xml = <FH>;
+
+# extract just the <description> tag
+if ($xml[0] =~ m#<key>description</key>\s*<string>([^<]*)</string>#s) {
+    print $1;
+}
+else {
+    die "Could not handle this plist.  Please attach it to a Radar.";
+}

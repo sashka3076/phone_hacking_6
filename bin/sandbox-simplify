@@ -1,0 +1,245 @@
+#!/usr/bin/perl
+# 
+# Copyright (c) 2006-2010 Apple Inc. All rights reserved.
+# 
+# @APPLE_LICENSE_HEADER_START@
+# 
+# This file contains Original Code and/or Modifications of Original Code
+# as defined in and that are subject to the Apple Public Source License
+# Version 2.0 (the 'License'). You may not use this file except in
+# compliance with the License. Please obtain a copy of the License at
+# http://www.opensource.apple.com/apsl/ and read it before using this
+# file.
+# 
+# The Original Code and all software distributed under the License are
+# distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+# EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+# INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
+# Please see the License for the specific language governing rights and
+# limitations under the License.
+# 
+# @APPLE_LICENSE_HEADER_END@
+# 
+
+# sandbox-simplify -- simplify a sandbox profile created by a trace directive
+
+use warnings;
+use strict;
+
+use Getopt::Long;
+
+# List of regexes and subpaths that will be allowed if any paths matching them
+# are allowed.
+my @fold_regex = ();
+my @fold_subpath = (
+	'/System',
+	'/private/var/db/dyld',
+	'/usr/lib',
+	'/usr/share',
+);
+
+# Dictionary of operations that will be folded into more general operations.
+my %fold_op = (
+	'file-read-data' => 'file-read*',
+	'file-write-create' => 'file-write*',
+	'network-bind' => 'network-inbound',
+);
+
+# Parse command line options.
+GetOptions(
+	'regex=s' => \@fold_regex,
+	'subpath=s' => \@fold_subpath,
+	'help' => sub {
+		print "Usage: sandbox-simplify options file ...\n";
+		print "  --regex regex      Allow regex if any matching path would be allowed\n";
+		print "  --subpath subpath  Allow subpath if any matching path would be allowed\n";
+		exit;
+	}
+);
+
+# Remove string quoting from trace profile.
+# a\x22b\x5cc -> a"b\c
+sub trace_unquote {
+	my ($in, $out) = (shift, '');
+	$out .= $1 . chr(hex $2) while $in =~ s/(.*?)\\x(..)//;
+	$out .= $in;
+	return $out;
+}
+
+# Quote a string for Scheme.
+# a"b\c -> a\"b\\c
+sub scheme_quote {
+	my $str = shift;
+	$str =~ s/([\\"])/\\$1/g;
+	return $str;
+}
+
+# Quote a string for embedding into a regular expression.
+# a"b\c -> a"b\\c
+sub regex_quote {
+	my $str = shift;
+	# quote all non-word characters
+	$str = "\Q$str\E";
+	# unquote some safe non-word characters
+	$str =~ s{\\([`~!@#%&\-={};:'",<>/])}{$1}g; #'
+	return $str;
+}
+
+# Create a Scheme string literal using sharp quotes or regular quotes.
+# a"b\c -> "a\"b\\c"
+sub scheme_str {
+	my $str = shift;
+	if ($str =~ /"/ || $str !~ /\\/) {
+		return '"' . &scheme_quote($str) . '"';
+	} else {
+		return "#\"$str\"";
+	}
+}
+
+# Table of processed operations, and the set of operations that are being
+# allowed without filters.
+my (%ops, %unfiltered);
+
+# Record a processed operation.  $op (required) is the operation; $filter
+# (optional) is the rule's filter.
+sub memo {
+	my ($op, $filter) = @_;
+	if (defined $filter) {
+		# Iterate through existing rules.
+		foreach my $otherop (keys %ops) {
+			# Return if this rule is implied by the existing rule.
+			my $otherop_children = "^\Q$otherop\E\$";
+			return if $otherop_children =~ s/\\\*\$/-/ && $op =~ $otherop_children && (exists $unfiltered{$otherop} || exists $ops{$otherop}->{$filter});
+
+			# Forget the existing rule if it's implied by this one.
+			my $op_children = "^\Q$op\E\$";
+			if ($op_children =~ s/\\\*\$/-/ && $otherop =~ $op_children && exists $ops{$otherop}->{$filter}) {
+				delete $ops{$otherop}->{$filter};
+				delete $ops{$otherop} unless keys %{$ops{$otherop}};
+			}
+		}
+
+		# Allow this operation with a filter.
+		$ops{$op} = {} unless exists $ops{$op};
+		$ops{$op}->{$filter} = 1 unless exists $unfiltered{$op};
+	} else {
+		# Allow this operation without filters.
+		$ops{$op} = {};
+		$unfiltered{$op} = 1;
+	}
+}
+
+# These are tables of subroutines that handle traced events.  handle_type
+# contains catch-all handlers based on the filter type.  handle_path handles
+# file operations on paths matching a regex.
+my (%handle_type, @handle_path);
+
+# Process literal filters, applying any handle_path handlers.
+$handle_type{'literal'} = sub {
+	my ($op, $type, $path) = @_;
+	$path = &trace_unquote($path);
+	foreach my $handler (@handle_path) {
+		return &{$handler->[1]}($op, $path) if $path =~ /$handler->[0]/s;
+	}
+	$path = &scheme_str($path);
+	&memo($op, "(literal $path)");
+};
+
+# Process network filters, treating addresses according to the protocol.
+$handle_type{'local'} =
+$handle_type{'remote'} = sub {
+	my ($op, $type, $addr, $proto) = @_;
+	$addr = &scheme_str(&trace_unquote($addr));
+	$proto =~ s/[46]$//;
+	&memo($op, "($type $proto $addr)");
+};
+
+# Generalize paths in /private/var/folders.
+unshift @handle_path, ['^/private/var/folders/[^/]+/[^/]+/(.*)', sub {
+	my $regex = &scheme_str('^/private/var/folders/[^/]+/[^/]+/' . &regex_quote($1) . '$');
+	&memo(shift, "(regex $regex)");
+}];
+
+# Generalize temporary preference files.
+my %plist_skip;
+unshift @handle_path, ['(.*/Library/Preferences/[^/]+\.plist)\.[^/]+$', sub {
+	my ($op, $plist) = (shift, $1);
+	return if $unfiltered{$op};
+
+	# Record a rule that matches the temporary plist and the real plist.
+	my $regex = &scheme_str('^' . &regex_quote($plist) . '(\\.[^/]+)?$');
+	&memo($op, "(regex $regex)");
+
+	# Remove any rules that match just the real plist.
+	my $literal = &scheme_str($plist);
+	delete $ops{$op}->{"(literal $literal)"};
+	delete $ops{$op} unless keys %{$ops{$op}};
+
+	# Don't record any more rules that match just the real plist.
+	unless (exists $plist_skip{$plist}) {
+		$plist_skip{$plist} = {};
+		unshift @handle_path, ["^\Q$plist\E\$", sub {
+			my $inop = shift;
+			&memo($inop, "(literal $literal)") unless exists $plist_skip{$plist}->{$inop};
+		}];
+	}
+	$plist_skip{$plist}->{$op} = 1;
+}];
+
+# Fold paths that match specified regexes.
+foreach my $regex (@fold_regex) {
+	my $str = &scheme_str($regex);
+	unshift @handle_path, [$regex, sub {
+		&memo(shift, "(regex $str)");
+	}];
+}
+
+# Fold paths that match specified subpaths.
+foreach my $subpath (@fold_subpath) {
+	my $str = &scheme_str($subpath);
+	unshift @handle_path, ["^\Q$subpath\E(?:\$|/)", sub {
+		&memo(shift, "(subpath $str)");
+	}];
+}
+
+# Pass an event to the appropriate handler subroutine.
+sub process_event {
+	my ($o, $t, $f, $x) = @_;
+	$o = $fold_op{$o} if exists $fold_op{$o};
+	if (!defined($t)) {
+		&memo($o);
+	} elsif (exists $handle_type{$t}) {
+		&{$handle_type{$t}}($o, $t, $f, $x);
+	} else {
+		$f = &scheme_str(&trace_unquote($f));
+		&memo($o, "($t $f)");
+	}
+}
+
+# Process the trace profile.
+while (my $l = <>) {
+	next if $l =~ /^\(version 1\)/;
+	if ($l =~ /^\(allow (\S+)\)$/) {
+		&process_event($1);
+	} elsif ($l =~ /^\(allow (\S+) \((\S+) (?:(\w+) )?"(.*)/) {
+		my ($o, $t, $x, $f) = ($1, $2, $3, $4);
+		until ($f =~ s/"\)\)$//g) {
+			$l = <>;
+			die "malformed trace profile\n" unless defined $l;
+			chomp $l;
+			$f .= "\n$l";
+		}
+		&process_event($o, $t, $f, $x);
+	} else {
+		die "malformed trace profile\n";
+	}
+}
+
+# Pretty-print a profile allowing the traced events.
+print "(version 1)\n\n(deny default)\n";
+foreach my $op (sort keys %ops) {
+	print "\n(allow $op";
+	print "\n       $_" foreach sort keys %{$ops{$op}};
+	print ")\n";
+}

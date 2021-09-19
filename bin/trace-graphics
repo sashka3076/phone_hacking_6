@@ -1,0 +1,382 @@
+#!/bin/bash
+# trace-graphics
+# PerformanceTools
+#
+# Trace CoreGraphics and UIKit calls made directly by an app that occur
+# within drawing and event tracking routines.
+#
+# Created by Jon McCarty, October 2011
+# Copyright 2011 Apple Inc. All rights reserved.
+#
+
+me=$(basename "$0")
+
+function usage() {
+	echo "
+Trace and show parameters for interesting CoreGraphics and UIKit functions called
+directly by the application."
+
+	if [ "$1" == "extended" ]; then echo "
+
+By default, this only traces calls that happen inside the following methods.  These have
+been 'prime real estate' for performance intensive hotspots.
+
+        -[UIView(CALayerDelegate) drawLayer:inContext:]
+        -[UIWindow _sendTouchesForEvent:]
+
+FIND MODE:
+
+Additionally, there's the '-f' switch which engages 'find mode'.  This inverts the logic of the 'wrapper functions'
+above and prints the stack trace of several common allocation and drawing calls OUTSIDE of the wrappers.
+Use this either when you're just getting started with an app, or when you're hunting for graphics routines
+outside of the wrappers you've already identified.
+
+NOTES:
+
+These options are designed to work together to quickly find and isolate drawing routines in 3rd party apps.
+For example, say we're looking at 'Toy Story' and we've already identified that a lot of drawing takes
+place in [PaintingImageView GlobalTouchesMoved] and [PaintingImageView GlobalTouchesEnded], in addition
+to the contentional drawLayer:inContext: and touch event handler methods.  In particular, we're interested
+in how the offscreen buffers are allocated, because we care about how big they are.
+
+We might do something like this:
+
+1. Launch 'Toy Story'
+
+2. Run $me with '-a' to determine the end of the app's code base
+
+    # $me -a 'Toy Story'
+    Toy Story's __TEXT segment ends at 0x000b8000
+
+3. Kill 'Toy Story' and run $me in 'dtrace-wait' mode.  This way we'll see init code from the very start of the app.
+   We want to avoid printing stuff we already know about (since we're trying to discover new code paths we don't know about)
+   so we'll combine the '-w' and '-f' options.
+
+    # killall 'Toy Story'
+    # $me -z 0x000b8000 -w '*PaintingImageView*GlobalTouches*' -f 'Toy Story'
+    (Now we launch Toy Story from SpringBoard by simply tapping on its icon)
+
+4. Holy Stack Spew!  Tons of calls are coming out of our animation driver.  Let's filter those out with another '-w' and try again
+
+    # killall 'Toy Story'
+    # $me -z 0x000b8000 -w '*MPVideoOverlay*_tickNotification*' -w '*PaintingImageView*GlobalTouches*' -f 'Toy Story'
+    (Now launch Toy Story again)
+
+5. Okay, what we've got now isn't bad.  There's another animation player that might be nice to filter out but once
+   we're in the app we get a pretty good idea of what the app's doing.  We can focus in some additional entry points
+   and switch over to regular mode (no '-f' option) to get timing info and really decrypt what this app is doing.
+
+These 'find mode' techniques work without using -z to invoke dtrace-wait too.
+
+Please route any questions and comments to jmccarty@apple.com, or to the pep-perf team."
+fi
+
+echo "
+USAGE:
+    $me [options] app
+
+OPTIONS INCLUDE:
+    -h            : extended help
+    -n <number>   : Limit to only <number> passes through the 'wrapper' calls
+    -1            : Limit to just 1 pass
+    -v            : verbose
+    -w <probe>    : add another 'wrapper' func (e.g., one from inside the app).  E.g., -w '*PaintingImageView*GlobalTouches*'
+    -a            : Just print the max address of the running app's code segment.  This can be used with -z.
+    -z <address>  : use 'dtrace-wait'.  You must provide the max address of the app's TEXT segment (see '-a')
+    -f            : engage find mode (see above)
+"
+}
+
+num_cycles=999999999
+quiet='-q'
+dtrace_wait=0
+ucaller_addr=""
+dump_address=0
+wrapper[0]='*UIView*CALayerDelegate*drawLayer*inContext*'
+wrapper[1]='*UIWindow*_sendTouchesForEvent*'
+find_mode=0
+
+while getopts "fn:1vw:z:ah?" opt; do
+  case $opt in
+    f) find_mode=1
+       wrapper[${#wrapper[*]}]="??UIView?init*"
+       ;;
+    n) num_cycles="$OPTARG" ;;
+    1) num_cycles=1 ;; 
+    v) quiet='' ;;
+    w) wrapper[${#wrapper[*]}]="$OPTARG" ;;
+    z) dtrace_wait=1; ucaller_addr="$OPTARG" ;;
+    a) dump_address=1 ;;
+    h | ?) usage extended; exit 0 ;;
+  esac
+done
+shift $((OPTIND - 1))
+app="$1"
+if [[ "$app" == "" ]] ; then
+	usage
+fi
+if [[ "$ucaller_addr" == "" ]] ; then
+	if map=$(vmmap "$app") ; then
+		ucaller_addr=$(sed -n '/^__TEXT/ { s/^__TEXT *[^-]*-\([0-9a-f]*\).*/0x\1/p; q; }' <<< "$map")
+	else
+		exit -1
+	fi
+fi
+if (( dump_address )) ; then
+	echo "$app's __TEXT segment ends at $ucaller_addr"
+	exit 0
+fi
+
+filter="/self->tracing > 0 && ucaller < $ucaller_addr /"
+
+# generate the wrapper entry and return probes
+entry_points=$(printf "\npid\$target::%s:entry," "${wrapper[@]}")
+return_points=$(printf "\npid\$target::%s:return," "${wrapper[@]}")
+
+# remove the extra commas from the end
+entry_points="${entry_points%,}"
+return_points="${return_points%,}"
+
+dtrace='
+
+#pragma D option bufpolicy=switch
+#pragma D option bufresize=manual
+#pragma D option bufsize=200k
+
+BEGIN
+{
+	printf("Now tracing...\n");
+	cycle = 0;
+	self->tracing = 0;
+	self->start_time = timestamp;
+	self->call_time = timestamp;
+	self->end_time = timestamp;
+	self->trace_context_return = 0;
+}
+
+'$entry_points'
+{
+	self->start_time = timestamp;
+	this->dur = (self->start_time - self->end_time) / 1000000;
+	self->tracing = self->tracing + 1;
+	printf("\n%d ENTER(%d) %s (%d ms since last cycle)", cpu, self->tracing, probefunc, this->dur);
+	self->call_time = timestamp;
+}
+
+pid$target::*UIView*CALayerDelegate*drawLayer*inContext*:entry
+/self->tracing > 0/
+{
+	printf("     CALayer: %#x  context: %#x", arg2, arg3);
+}
+
+'$return_points'
+/self->tracing > 0/
+{
+	self->end_time = timestamp;
+	this->dur = (timestamp - self->start_time) / 1000000;
+	cycle = cycle + 1;
+	printf("\n%d EXIT(%d) %s (%d ms, %d ms total)\n", cpu, self->tracing, probefunc, (self->end_time - self->call_time) / 1000000, this->dur);
+	self->tracing = self->tracing - 1;
+}
+
+'$return_points'
+/cycle >= '$num_cycles'/
+{
+	exit(0);
+}
+
+pid$target:CoreGraphics:CG*:entry,
+pid$target:UIKit::entry
+'$filter'
+{
+	printf("\n%d    %15s %50s (%d ms)  %A", cpu, probemod, probefunc, (timestamp - self->call_time)/1000000, ucaller);
+	self->call_time = timestamp;
+}
+
+pid$target::CGLayerCreateWithContext:entry
+'$filter'
+{
+	printf(" fromContext:%#x size:[%.1f, %.1f]", arg0, (float)arg1, (float)arg2);
+}
+
+pid$target::CGLayerGetContext:entry
+'$filter'
+{
+	printf(" CGLayerRef:%#x", arg0);
+}
+
+pid$target:CoreGraphics:CGBitmapContextCreateImage:entry,
+pid$target:CoreGraphics:CGContextBeginPath:entry,
+pid$target:CoreGraphics:CGContextClip:entry,
+pid$target:CoreGraphics:CGContextSaveGState:entry,
+pid$target:CoreGraphics:CGContextRestoreGState:entry,
+pid$target:UIKit:UIGraphicsPushContext:entry
+'$filter'
+{
+	printf(" context:%#x", arg0);
+}
+
+pid$target:CoreGraphics:CGContextDrawPath:entry,
+pid$target:CoreGraphics:CGContextSetInterpolationQuality:entry,
+pid$target:CoreGraphics:CGContextSetLineJoin:entry,
+pid$target:CoreGraphics:CGContextSetLineCap:entry,
+pid$target:CoreGraphics:CGContextSetBlendMode:entry,
+pid$target:CoreGraphics:CGContextSetAllowsAntialiasing:entry,
+pid$target:CoreGraphics:CGContextSetShouldAntialias:entry
+'$filter'
+{
+	printf(" context:%#x mode:%d", arg0, arg1);
+}
+
+pid$target:CoreGraphics:CGBitmapContextCreate:entry,
+pid$target:CoreGraphics:CGBitmapContextCreateWithData:entry
+'$filter'
+{
+	printf(" data:%#x size:[%d, %d] bitsPerComponent:%d bytesPerRow:%d bitmapInfo:%#x", arg0, arg1, arg2, arg3, arg4, arg6);
+	self->trace_context_return = 1;
+}
+
+pid$target:CoreGraphics:CGBitmapContextCreateWithData:return
+/ self->trace_context_return /
+{
+	printf(" RETURN context:%#x", arg1);
+	self->trace_context_return = 0;
+}
+
+pid$target::CGContextClipToRect:entry,
+pid$target::CGContextDrawImage:entry
+'$filter'
+{
+	printf(" context:%#x origin:[%.1f, %.1f] size:[%.1f,%.1f]", arg0, (float) arg1, (float) arg2, (float) arg3, (float)arg4);
+}
+
+pid$target:CoreGraphics:CGContextSetShadowWithColor:entry
+'$filter'
+{
+	printf(" offset:[%.1f, %.1f] blur:%.1f", (float) arg1, (float) arg2, (float) arg3);
+}
+
+pid$target:CoreGraphics:CGContextDrawLinearGradient:entry
+'$filter'
+{
+	printf(" context:%#x start:[%.1f, %.1f] end:[%.1f, %.1f] options:%d", arg0, (float)arg2, (float)arg3, (float)arg4, (float)arg5, arg6);
+}
+
+pid$target:CoreGraphics:CGContextStrokeLineSegments:entry
+'$filter'
+{
+	printf(" context:%#x segments:%d", arg0, arg2/2);
+}
+
+pid$target:CoreGraphics:CGPath*ToPoint:entry
+'$filter'
+{
+	printf(" context/path:%#x point:[%.1f, %.1f]", arg0, (float)arg2, (float)arg3);
+}
+
+pid$target:CoreGraphics:CGContext*ToPoint:entry
+'$filter'
+{
+	printf(" context/path:%#x point:[%.1f, %.1f]", arg0, (float)arg1, (float)arg2);
+}
+
+pid$target:CoreGraphics:CGContextDrawLayerInRect:entry
+'$filter'
+{
+	printf(" context:%#x origin:[%.1f, %.1f] size:[%.1f, %.1f] layer:%#x", arg0, (float)arg1, (float)arg2, (float)arg3, (float)arg4, arg5);
+}
+
+pid$target:CoreGraphics:CGContextSetLineWidth:entry
+'$filter'
+{
+	printf(" context:%#x arg:%.1f", arg0, (float)arg1);
+}
+
+pid$target:CoreGraphics:CGImageCreateWithImageInRect:entry
+'$filter'
+{
+	printf(" %.1f %.1f %.1f %.1f", (float)arg1, (float)arg2, (float)arg3, (float)arg4);
+}
+
+pid$target::UIGraphicsBeginImageContext:entry
+'$filter'
+{
+	printf(" size:[%.1f, %.1f]", (float)arg0, (float)arg1);
+	self->trace_context_return = 1;
+}
+
+pid$target:UIKit:UIGraphicsBeginImageContextWithOptions:entry
+'$filter'
+{
+	printf(" size:[%.1f,%.1f] opaque:%d scale:[%.1f]", (float)arg0, (float)arg1, arg2, (float)arg3);
+	self->trace_context_return = 1;
+}
+
+pid$target:UIKit:??UIView*setNeedsDisplayInRect*:entry,
+pid$target:UIKit:??UIImage?drawInRect*:entry
+'$filter'
+{
+	printf(" origin:[%.1f, %.1f] size:[%.1f,%.1f]", (float) arg2, (float) arg3, (float) arg4, (float)arg5);
+}
+
+pid$target:UIKit:UIRect*:entry
+'$filter'
+{
+	printf(" origin:[%.1f, %.1f] size:[%.1f,%.1f]", (float) arg0, (float) arg1, (float) arg2, (float)arg3);
+}
+
+END
+{
+	printf("\n\nTotal cycles: %d\n", cycle);
+}
+'
+
+if ((find_mode)) ; then
+echo "Engaging 'find mode'.  Get ready for stack spew!"
+quiet=''
+dtrace='
+
+BEGIN
+{
+	self->not_tracing = 0;
+}
+
+'$entry_points'
+/!self->not_tracing/
+{
+	self->not_tracing = self->not_tracing + 1;
+}
+
+'$return_points'
+/self->not_tracing/
+{
+	self->not_tracing = self->not_tracing - 1;
+}
+
+pid$target:UIKit:*setNeedsDisplayInRect??:entry,
+pid$target:UIKit:*setNeedsDisplay??:entry,
+pid$target:UIKit:UIGraphicsBeginImageContext*:entry,
+pid$target:UIKit:UIRect*:entry,
+pid$target:UIKit:??UIImage?draw*:entry,
+pid$target:CoreGraphics:CGBitmapContextCreate*:entry,
+pid$target:CoreGraphics:CGContextDraw*:entry,
+pid$target:CoreGraphics:CGContextFill*:entry,
+pid$target:CoreGraphics:CGContextStroke*:entry,
+pid$target:CoreGraphics:CGContextClear*:entry,
+pid$target:CoreGraphics:CGContextSetStroke*:entry,
+pid$target:CoreGraphics:CGContextSetFill*:entry,
+pid$target:CoreGraphics:CGContextSetLine*:entry
+/! self->not_tracing/
+{
+	ustack();
+}
+'
+fi
+
+echo "Launching dtrace...  "
+if ((dtrace_wait)) ; then
+	dtrace-wait "$app" $quiet -n "$dtrace"
+else
+	dtrace $quiet -n "$dtrace" -p $(pidof "$app")
+fi
+

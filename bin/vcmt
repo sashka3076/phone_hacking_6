@@ -1,0 +1,1084 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use constant PERL5LIB => ('/var/root/Packages', '/AppleInternal/Library/PerlModules');
+use constant DEFAULTPATH => '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/Developer/usr/bin';
+use constant MAX_ITERATIONS => 3;
+use constant CPAS_VERSION => 10;
+use constant VERSION => 'deviceval-2.10.2';
+
+use constant NOCAMERADATA => 106;
+use constant MISSING_DATA_STRUCTURES => 105;
+use constant DATE_TIME_INCORRECT => 99;
+use constant UNRECOGNIZED_HARDWAREMODEL => 98;
+use constant INCORRECT_HW_MODEL => 96;
+
+BEGIN {
+  if (exists $ENV{PERL5LIB} && defined $ENV{PERL5LIB}) {
+    for my $thing (&PERL5LIB) {
+      my @matches = grep { $thing eq $_ } split(/:/, $ENV{PERL5LIB});
+      unless (scalar(@matches) > 0) {
+	$ENV{PERL5LIB} .= ':' . $thing;
+	push(@INC, $thing);
+      }
+    }
+  } else {
+    $ENV{PERL5LIB} = join(':', &PERL5LIB);
+    push(@INC, &PERL5LIB);
+  }
+}
+
+use IPC::Open2;
+use Time::HiRes qw(usleep ualarm gettimeofday tv_interval);
+use POSIX;
+use Time::Local;
+use File::Copy qw(cp copy mv move);
+
+#use Errno qw(ESRCH EPERM EAGAIN);
+
+use ClArgs;
+use ClArgsCb qw(Scalar Aref Bool);
+use Execer qw(execer);
+use Utils qw(rnd crc16 lockdownGet);
+use Statistics;
+use CameraInfo;
+
+use constant DONGWOON => 165;
+use constant ROHM => 136;
+use constant ADI => 164;
+
+use constant CAMERATEST => 'h4isp -n';
+use constant GETFOCUSPOS_ITERATIONS => 1000;
+
+use constant GET_NVM_CMDS => ('v off', 'on 0', 'getnvm 0', 'q');
+
+use constant CAMERA_RETRY_SLEEP => 3;
+use constant VCM_VENDOR => 'VCM Vendor';
+
+use constant AXES => qw(X Y Z);
+
+use constant TSRE => '(\S{3}\s+\S{3}\s+\d+\s+\d+\:\d+\:\d+\.\d+\s+\d{4})';
+use constant TIMESTAMPRE => '(\S{3})\s+(\S{3})\s+(\d+)\s+(\d+)\:(\d+)\:(\d+)\.(\d+)\s+(\d{4})';
+use constant MOMAP => qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+
+# Global declarations and command-line parsing.
+# Real code lies below subroutine definitions.
+# ---------------------------------------------
+my ($pPath, $program) = $0 =~ m<^(.*/|)(.*),?(.*)$>;
+my $msgp = __PACKAGE__ . "::$program:";
+
+my $clArgs = ClArgs->new(Verbose => 0);
+my ($debug, $verbose) = (0, 0);
+
+#***************************************************************************
+#
+#   Subroutine : printUsage
+#       Author : Neil O'Sullivan
+#         Date : 14 Jul 2011
+#
+#  Description : Usage function.
+#
+#***************************************************************************
+
+sub printUsage {
+  my ($exitCode) = @_;
+
+  print <<ENDSHERE;
+
+$program <args> [-h | -help |-h] <file specs>
+
+where <args> are any combination of:
+
+	-debug
+	  This specifies debug mode, generating verbose output.
+
+	-h | -help
+	  Prints this 'help' output and exits.
+
+	-verbose | -noverbose
+	  turns on/off verbose mode.  Verbose mode is normally off.
+
+	-cameraRetries <nRetries>
+	  specifies the number of attempts (default is 25) to connect to the camera in the
+	  face of conflicts with mediaserverd (or some other process holding the camera).
+	  There is a 5 second sleep with each iteration to give the offending app time to
+	  complete and release the camera resource.
+
+	-sensorState <value>
+	  selects the sensor state (resolution, fps) to be used while exercising the
+	  VCM from calibrated infinity to calibrated macro and back.  Uses '0' by default.
+
+	-focusCycles <value> | -cycles <value> | -fc <value>
+	  specifies the number of focus cycles to spin through per invocation.  Default is 1.
+
+	-precision <digits>
+	  specifies the number of digits of precision to use to the right of the decimal point for
+	  statistical purposes and comparisons; default is 3.
+
+	-[no]newplist
+	  indicates whether to create a new plist or append to an existing one (if any).
+	  Default is -nonewplist.
+
+	-log </path/to> | -logRoot </path/to>
+	  specifies the rooted directory where the log file ($program.log) is written
+
+$program runs a camera test application interactively, selecting a sensor mode and then cycling the VCM
+through calibrated infinity to calibrated macro and back for the specified number of cycles,
+then exits.
+
+Records requested number of cycles, elapsed test time, number of full VCM cycles, number of passed
+and failed measurements at 0, 127, 255.
+
+ENDSHERE
+  exit($exitCode);
+}
+
+#***************************************************************************
+#
+#   Subroutine : registerOpts
+#       Author : Neil O'Sullivan
+#         Date : 14 Jul 2011
+#
+#  Description : register command-line options with callbacks
+#
+#***************************************************************************
+
+use constant LOGROOT => '/var/logs/BurnIn';
+use constant PLISTDIR => '/var/logs/Inferno';
+use constant PLISTNAME => '_pdca_vcmt.plist';
+
+sub registerOpts {
+  my $clargs = shift;
+
+  for(['usage',		undef,	[qw(-h -help)],		sub { printUsage(0); }	],
+      ['debug',		    0,	['-debug'],		sub {$debug = 1;}	],
+      ['verbose',	    0,	['-verbose'],		sub {$verbose = 1;}	],
+      ['version',    &VERSION,	['--version'],		sub { printf "%s\n", &VERSION;
+							      exit(0); }],
+      ['ED',		    0,	['--errorDescriptions'], sub { exit(0); }],
+      ['sensorState',	    0,	['-sensorState'],	\&Scalar	],
+      ['cameraRetries',	   25,	['-cameraRetries'],	\&Scalar	],
+      ['cycles',            1,  [qw(-focusCycles
+				    -cycles -fc)],	\&Scalar	],
+      ['newplist',          0,  [qw(-newplist
+				    -nonewplist)],	\&Bool		],
+      ['precision',	    3,	['-precision'],		\&Scalar	],
+      ['logRoot',    &LOGROOT,  [qw(-log -logRoot)],	\&Scalar	],
+     ) {
+    $clargs->add(@{$_});
+  }
+  1;
+}
+
+#***************************************************************************
+#
+#   Subroutine : getTsMs
+#       Author : Neil O'Sullivan
+#         Date : 21 Apr 2011
+#
+#  Description : gets timestamp in seconds and microseconds from HiRes timer.
+#                It returns a standard timestamp with milliseconds tacked on
+#		 to the seconds field following the decimal.
+#
+#		 Note that if a hash ref is passed in with a populated Time
+#		 field, that is taken as the time where we should also output
+#		 the back camera temperature following the timestamp.
+#
+#                Returns:  timestamp string on success, empty string on failure.
+#
+#***************************************************************************
+
+sub getTsMs {
+  my ($thing) = (@_);
+  my ($s, $us) = gettimeofday();
+  my $ms = &rnd(1, $us / 1000);
+  $ms = 999 if $ms > 999;
+  my $t = scalar localtime($s);
+  $t =~ s/\s+/ /g;
+  my @s = split(/\s/, $t);
+  $s[3] .= sprintf ".%03d", $ms;		# append ms to seconds field
+  if (defined $thing &&
+      ref($thing) =~ m<hash>i &&
+      exists $thing->{Time} &&
+      defined $thing->{Time}) {
+    unless ($thing->{Time} < ($s + ($ms / 1000))) {
+      push(@s, &getBackCamTemp());		# append back camera temp.
+      $thing->{Time} += 1;
+    }
+  }
+  return ((join(' ', @s) . "\n"), ($s + ($ms / 1000)));
+}
+
+#***************************************************************************
+#
+#   Subroutine : plistCanonicalTime
+#       Author : Neil O'Sullivan
+#         Date : 24 Jul 2011
+#
+#  Description : Takes in time value in seconds since the epoch and returns a
+#		 formatted string corresponding to the plist canonical time
+#		 format:  'YYYY-MM-DD HH:MM:SS'
+#
+#                Returns:  time formatted above as a string
+#
+#***************************************************************************
+
+sub plistCanonicalTime {
+  my ($s) = (@_);
+
+  my @t = localtime($s);
+
+  return sprintf "%04d-%02d-%02d %02d:%02d:%02d", 1900 + $t[5], 1 + $t[4], $t[3], (@t)[2, 1, 0];
+}
+
+#***************************************************************************
+#
+#   Subroutine : waitForPrompt
+#       Author : Neil O'Sullivan
+#         Date : 24 Sep 2011
+#
+#  Description : Reads from 'R' filehandle waiting for match of prompt regex.
+#		 Returns array ref of all output received (possibly empty)
+#		 and status:  1 for success, 0 otherwise (timed out).
+#
+#***************************************************************************
+
+sub waitForPrompt {
+  my ($h) = (@_);
+
+  $SIG{ALRM} = sub { die "timeout" };
+
+  my $mp = __PACKAGE__ . '::waitForPrompt: ';
+
+  my $i = 1;
+
+  my $returns = [ ];
+  my $matches = 0;
+  my $kvp = { };
+
+  # wait for prompt
+  for my $loops (1..200) {     # 200 iteration x 50ms/cycle ~= 10s per command response
+    eval {
+      while (1) {
+	ualarm(50_000);        # wait 50ms per read cycle
+	$| = 1;
+	my $thing = <R>;
+	ualarm(0);
+	# if $thing undefined, filehandle is likely closed, so we should not continue
+	return (0, $kvp, $returns)
+	  unless defined $thing;
+	printf STDOUT "%d::> %s", $i++, $thing
+	  if $verbose;
+	push(@{$returns}, $thing);
+	if ($thing =~ $h->{Regex}) {
+	  printf "Matched ::%s::%s::", $thing, $h->{Regex}
+	    if $debug;
+	  if (defined $1 && defined $2) {
+	    my ($k, $v) = ($1, $2);
+	    $kvp->{$k} = $v;
+	    printf "Pair:  '%s'  <--->  '%s'\n", $k, $v
+	      if $debug;
+	  }
+	  last
+	    if ++$matches >= $h->{Matches};
+	}
+      }
+    };
+    if ($@ && $@ =~ m<timeout>) {
+      print "Timed out\n"
+	if $verbose || $debug;
+      return (0, $kvp, $returns)
+	if $loops == 200;
+#      print W "\n";
+    }
+    printf STDERR "$mp expected %d matches, got %d\n", $h->{Matches}, $matches
+      if $verbose || $debug;
+    last
+      if $matches >= $h->{Matches};
+  }
+  return(1, $kvp, $returns);
+}
+
+#***************************************************************************
+#
+#   Subroutine : logResult
+#       Author : Neil O'Sullivan
+#         Date : 28 Sep 2011
+#
+#  Description : Logs result passed in to <logRoot>/$program/$program.log.
+#		 Makes logRoot/$program if it doesn't exist.
+#
+#		 Any failures encountered result in calling exit(1).
+#
+#		 Returns:  status:  1 for success, 0 otherwise
+#
+#
+#***************************************************************************
+
+sub logResult {
+  my ($result) = (@_);
+
+  # verify that our logRoot exists (or create it)
+
+  my $logd = sprintf "%s/%s", $clArgs->get('logRoot'), $program;
+  unless (-d $logd) {
+    my $status = &execer("mkdir -p $logd",
+			 sub {
+			   my ($lineNo, $line, @remains) = (@_);
+			   return 0;
+			 });
+    if ($status != 1) {
+      unless (-d $logd) {
+	printf STDERR "$msgp ERROR, failed to create log directory '%s'\n", $logd;
+	exit(1);
+      }
+    }
+  }
+
+  # write the log file in the logRoot
+
+  my $logf = sprintf "%s/%s/%s.log", $clArgs->get('logRoot'), $program, $program;
+  my $logh;
+  unless (open($logh, ">$logf")) {
+    printf STDERR "$msgp ERROR, failed to open log file '%s' for write\n", $logf;
+    exit(1);
+  }
+  printf $logh "%s\n", $result;
+  close($logh);
+  return 1;
+}
+
+#***************************************************************************
+#
+#   Subroutine : getTestPlist
+#       Author : Neil O'Sullivan
+#         Date : 20 Sep 2011
+#
+#  Description : Returns an XML string including the inputs passed in.
+#
+#		 Returns:  string.
+#
+#***************************************************************************
+
+sub getTestPlist {
+  my ($testname, $llim, $ulim, $value, $units, $result, $failureMessage) = (@_);
+
+  my $testfmt = <<"ENDSHERE";
+			<dict>
+				<key>priority</key>
+				<string>P3</string>
+				<key>testname</key>
+				<string>VCM Test</string>
+				<key>subtestname</key>
+				<string>$testname</string>
+				<key>lowerlimit</key>
+				<string>$llim</string>
+				<key>upperlimit</key>
+				<string>$ulim</string>
+				<key>value</key>
+				<string>$value</string>
+				<key>units</key>
+				<string>$units</string>
+				<key>result</key>
+				<string>$result</string>
+ENDSHERE
+  $testfmt .= sprintf "\t\t\t\t<key>failure_message</key>\n\t\t\t\t<string>$failureMessage</string>\n"
+    if (defined $failureMessage);
+
+  $testfmt .= "\t\t\t</dict>\n";
+
+  return $testfmt;
+}
+
+#***************************************************************************
+#
+#   Subroutine : parsePdcaPlist
+#       Author : Neil O'Sullivan
+#         Date : 28 Sep 2011
+#
+#  Description : Opens/parses into sections/closes passed in plist file.
+#
+#		 Returns:  sections hash ref.
+#
+#***************************************************************************
+
+sub parsePdcaPlist {
+  my ($fname) = (@_);
+
+  my %sections = ( Header => [ ],
+		   Tests => [ ],
+		   Trailer => [ ],
+		   Iterations => [ ],
+		 );
+
+  my @iterations = ( );
+  if (open(FH, "<$fname")) {
+
+    # 0:  have not encountered:  \t<key>\d+</key>
+    # 1:  have encountered above, haven't seen:  \t</dict>
+    # 2:  have seen close dict above
+    #     expecting either transition to 1 above if we see the new key, or to 3
+    # 3:  transition from 2 above did not go to 0
+
+    my $state = 0;
+    while (<FH>) {
+      my $line = $_;
+      last
+	unless defined $_;
+      if ($state == 0) {
+	if ($line =~ m|^\t<key>(\d+)</key>\s*$|) {
+	  push(@iterations, $1);
+	  push(@{$sections{Iterations}}, $1);
+	  push(@{$sections{Tests}}, $line);
+	  $state = 1;
+	  printf "state 0 -> 1:  %s", $line if $debug;
+	} else {
+	  push(@{$sections{Header}}, $line);
+	}
+      } elsif ($state == 1) {
+	push(@{$sections{Tests}}, $line);
+	if ($line =~ m|^\t</dict>\s*$|) {
+	  $state = 2;
+	  printf "state 1 -> 2:  %s", $line if $debug;
+	}
+      } elsif ($state == 2) {
+	if ($line =~ m|^\t<key>(\d+)</key>\s*$|) {
+	  push(@iterations, $1);
+	  push(@{$sections{Iterations}}, $1);
+	  push(@{$sections{Tests}}, $line);
+	  $state = 1;
+	  printf "state 2 -> 1:  %s", $line if $debug;
+	} else {
+	  $state = 3;
+	  push(@{$sections{Trailer}}, $line);
+	  printf "state 2 -> 3:  %s", $line if $debug;
+	}
+      } else {
+	# state == 3
+	push(@{$sections{Trailer}}, $line);
+      }
+    }
+  }
+  return \%sections;
+}
+
+#***************************************************************************
+#
+#   Subroutine : getTestStrings
+#       Author : Neil O'Sullivan
+#         Date : 28 Sep 2011
+#
+#  Description : Iterates through focus positions and assembles plist strings
+#                into an array.
+#
+#		 Returns:  array:  (failures, @teststrings).
+#
+#***************************************************************************
+
+sub getTestStrings {
+  my ($h) = (@_);
+
+  my @teststr = (&getTestPlist('Iterations', 'NA', 'NA', $clArgs->get('cycles'), 'NA', 'PASS'));
+  my $failures = 0;
+
+  for my $fv (0, 127, 255) {
+    my $test = sprintf "Focus%d", $fv;
+    $failures += scalar(@{$h->{$test}->{Failures}});
+    for my $thing (qw(Min Max Mean Sigma)) {
+      my ($result, $reason);
+      if ($thing eq 'Max' && (my $failcount = scalar(@{$h->{$test}->{Failures}}))) {
+	$result = 'FAIL';
+	$reason = sprintf "Failed to achieve focus '%d' %d times out of %d\n", $fv, $failcount, $clArgs->get('cycles');
+      } else {
+	$result = 'PASS';
+      }
+      if ($thing eq 'Sigma') {
+	push(@teststr, &getTestPlist(join(' ', $h->{$test}->{Name}, $thing), 'NA', 'NA',
+				     $h->{$test}->{$thing}, 'NA', $result, $reason));
+      } else {
+	push(@teststr, &getTestPlist(join(' ', $h->{$test}->{Name}, $thing), $h->{$test}->{LLIM}, $h->{$test}->{ULIM},
+				     $h->{$test}->{$thing}, $h->{$test}->{Units}, $result, $reason));
+      }
+    }
+  }
+  return ($failures, @teststr);
+}
+
+######
+# main
+######
+
+my ($startTime, $endTime);
+
+my $hardwaremodel =  &lockdownGet('HardwareModel') || 'unknown';
+$hardwaremodel =~ s<DEV$><>;
+$hardwaremodel =~ s<AP$><>;
+{
+  if ($hardwaremodel =~ m<unknown>) {
+    printf STDERR "$msgp ERROR, failed to parse hardware model from output of '%s'\n", 'gestalt_query get HWModelStr 2>&1';
+    exit(&UNRECOGNIZED_HARDWAREMODEL);
+  } elsif ($hardwaremodel =~ m<^J[1-3]> ||
+	   $hardwaremodel =~ m<^K9>) {
+    exec(sprintf "vcmt_1_20 %s", join(' ', map { sprintf "'%s'", $_ } @ARGV));
+  } elsif ($hardwaremodel =~ m<P105>) {
+    exec(sprintf "vcmt_1_29 %s", join(' ', map { sprintf "'%s'", $_ } @ARGV));
+  } elsif ($hardwaremodel =~ m<P10[1-36-7]>) {
+    exec(sprintf "vcmt_1_30 %s", join(' ', map { sprintf "'%s'", $_ } @ARGV));
+  } else {
+#    printf STDERR "$msgp ERROR, hardware model '%s' not supported by this software\n", $hardwaremodel;
+#    exit(1);
+  }
+}
+
+&registerOpts($clArgs);		# register options
+
+my $errors = 0;
+
+unless($clArgs->process([@ARGV])) { # process command-line
+  print STDERR "$msgp WARNING, error processing command-line\n";
+  $errors++;
+}
+
+if (scalar(@{$clArgs->Unknown}) > 0) {
+  my @lengths = map { length($_) } @{$clArgs->Unknown};
+  if (&Statistics::max(@lengths) > 0) {
+    printf STDERR "$msgp ERROR, unrecognized tokens on command-line:  %s\n",
+      join(', ', map { sprintf "'%s'", $_ } @{$clArgs->Unknown});
+    $errors++;
+  }
+}
+
+exit(1)
+  if $errors;
+
+# if we're launched by inferno, we don't have a path
+
+if (exists $ENV{PATH} &&
+    defined $ENV{PATH}) {
+  my %pparts = map { $_ => 1 } split(/:/, $ENV{PATH});
+  my $missing = 0;
+  for my $ppart (split(/:/, DEFAULTPATH)) {
+    $missing++
+      unless exists $pparts{$ppart} && defined $pparts{$ppart};
+  }
+  $ENV{PATH} = DEFAULTPATH
+    unless $missing == 0;
+} else {
+  $ENV{PATH} = DEFAULTPATH;
+}
+
+# Verify that the clock is functioning
+{
+  my $dt = timelocal(localtime);
+  if ($dt < 1_000_000_000) {
+    printf STDERR "$msgp ERROR, device's clock is not set, time is incorrect\n";
+    exit(&DATE_TIME_INCORRECT);
+  }
+  $startTime = $dt;
+}
+
+# find/load our platform-specific package
+# ---------------------------------------
+my @places = (@INC, split(':', $ENV{PERL5LIB}));
+my $pkg = join('.', $hardwaremodel, 'pm');
+
+{
+  my $exists = 0;
+  for my $loc (@places) {
+    #  printf STDERR "checking %s\n", join('/', $loc, $pkg);
+    next unless -f join('/', $loc, $pkg);
+    $exists = 1;
+    last;
+  }
+  unless ($exists) {
+    printf STDERR "$msgp ERROR, cannot locate base object to load '%s'\n", $pkg;
+    exit(1);
+  }
+}
+
+require $pkg;
+my $obj = $hardwaremodel->new(Warnings => 1, Debug => $debug, Verbose => $verbose);
+
+unless (defined $obj) {
+  printf STDERR "$msgp ERROR, failed to load package for hardware model '%s'\n", $hardwaremodel;
+  exit(&INCORRECT_HW_MODEL);
+}
+
+unless (exists $obj->{Tests}->{$program} &&
+	defined $obj->{Tests}->{$program}) {
+  printf STDERR "$msgp ERROR, missing '%s' entry in HardwareModel object which is required for this test\n", $program;
+  exit(&MISSING_DATA_STRUCTURES);
+}
+
+unless (exists $obj->{Tests}->{$program}->{CameraTest} &&
+	defined $obj->{Tests}->{$program}->{CameraTest}) {
+  printf STDERR "$msgp ERROR, missing '%s' entry in HardwareModel object which is required for this test\n",
+    join('/', 'Tests', $program, 'CameraTest');
+  exit(&MISSING_DATA_STRUCTURES);
+}
+
+unless (exists $obj->{Tests}->{$program}->{CameraTest}->{On} &&
+	defined $obj->{Tests}->{$program}->{CameraTest}->{On}) {
+  printf STDERR "$msgp ERROR, missing '%s' entry in HardwareModel object which is required for this test\n",
+    join('/', 'Tests', $program, 'CameraTest/On');
+  exit(&MISSING_DATA_STRUCTURES);
+}
+
+# borrowed from Programming Perl
+
+local (*R, *W);    # R -> Reader, W -> Writer
+
+my ($status, $driver, @nvm);
+
+my $cobj = CameraInfo->new(Cameras => [ 0, 1 ],
+			   HardwareModelObject => $obj,
+			   Verbose => $verbose,
+			   Debug => $debug,
+			   Warnings => 1,
+			   InitOnly => 0);
+unless (defined $cobj) {
+  printf STDERR "$msgp ERROR, failed to initialize CameraInfo data structure\n";
+  exit(&NOCAMERADATA);
+}
+
+for my $camera (0..1) {
+  my $nvm = $cobj->getCameraNVM(Camera => $camera);
+  my $vcmv = $cobj->getVcmVendor(Camera => $camera);
+  $driver = $vcmv
+    if (defined $vcmv);
+}
+
+printf STDERR "$msgp VCM vendor is %s\n", defined $driver ? $driver : 'undefined'
+  if $debug || $verbose;
+
+my $serialno = &lockdownGet('SerialNumber');
+$serialno = 'unknown'
+  unless defined $serialno;
+
+my @allOutput = ();
+my $pid;
+
+if ($serialno =~ m<unknown>) {
+  printf STDERR "$msgp ERROR, failed to parse serial number from output of '%s'\n", 'gestalt_query get SerialNumber 2>&1';
+}
+print "Serial Number:  $serialno\n" if $verbose;
+
+my $fname = sprintf "%s/%s/%s_compassReadings.txt", &LOGROOT, $program, $serialno;
+
+{
+  my $logd = sprintf "%s/%s", $clArgs->get('logRoot'), $program;
+  unless (-d $logd) {
+    my $status = &execer("mkdir -p $logd",
+			 sub {
+			   my ($lineNo, $line, @remains) = (@_);
+			   return 0;
+			 });
+    if ($status != 1) {
+      unless (-d $logd) {
+	printf STDERR "$msgp ERROR, failed to create log directory '%s'\n", $logd;
+	exit(1);
+      }
+    }
+  }
+}
+
+my $stats = { };
+my %months = map { (&MOMAP)[$_] => $_ } (0..11);
+
+my $tsre = TIMESTAMPRE;
+$tsre = qr<$tsre>;
+
+
+my $sensorState = $clArgs->get('sensorState');
+
+my @focusCycle = <<ENDSHERE =~ m/(\S?.*\S)/g;
+setfocuspos 0 0
+getfocuspos 0
+setfocuspos 0 127
+getfocuspos 0
+setfocuspos 0 255
+getfocuspos 0
+ENDSHERE
+
+my @cmds = <<ENDSHERE =~ m/(\S?.*\S)/g;
+v off
+on 0
+start 0 $sensorState 0
+focusCycle
+stop 0
+q
+ENDSHERE
+
+my $promptre = qr<^\-\>\s*>;
+
+my $cmap = { 'v off' => { Matches => 1,
+			  Regex => qr<\s+(verbose)\:\s+(off)>,
+			},
+	     'on 0' => { Matches => 2,
+			 Regex => qr<^\s+(camChannel|result)\:\s+(0x[a-fA-F0-9]{8})>,
+		       },
+	     "start 0 $sensorState 0" => { Matches => 0,
+					   Regex => qr<.*>,
+					 },
+	     'setfocuspos 0 0' => { Matches => 3,
+				    Regex => qr<^\s+(result|channel|position)\:\s+(0x[a-fA-F0-9]{8})>,
+				  },
+	     'getfocuspos 0' => { Matches => 3,
+				  Regex => qr<^\s+(result|channel|position)\:\s+(0x[a-fA-F0-9]{2})>,
+				  },
+	     'setfocuspos 0 127' => { Matches => 3,
+				      Regex => qr<^\s+(result|channel|position)\:\s+(0x[a-fA-F0-9]{8})>,
+				    },
+	     'setfocuspos 0 255' => { Matches => 3,
+				      Regex => qr<^\s+(result|channel|position)\:\s+(0x[a-fA-F0-9]{8})>,
+				    },
+	     'stop 0' => { Matches => 0,
+			   Regex => qr<.*>,
+			 },
+	     'q' => { Matches => 0,
+		      Regex => qr<.*>,
+		    },
+	   };
+
+my @cmdTss = ('', '--Camera Commands--'); # '' separates compass readings from camera cmds with blank line
+
+my $procpid = open2(\*R, \*W, $obj->{Tests}->{$program}->{CameraTest}->{On}->[0]);
+$| = 1;
+
+print STDOUT "Sending camera commands\n"
+  if $debug || $verbose;
+
+my ($kvp, $returns);
+
+($status, $kvp, $returns) = &waitForPrompt({ Matches => 1, Regex => qr<^Device\s+0\:\s*>});
+unless ($status) {
+  printf STDERR "Timed out waiting for prompt from '%s'\n", CAMERATEST;
+  print W "q\n";
+  close(W);
+  close(R);
+  exit(1);
+}
+
+my ($chan, $focusval);
+
+use constant FOCUS0_ULIM => 5000;
+use constant FOCUS127_ULIM => 5000;
+use constant FOCUS255_ULIM => 5000;
+use constant FOCUS_UNITS => 'ms';
+
+$errors = 0;
+my $rcp = qr<\s+(result|channel|position)\:\s*(0x[a-fA-F0-9]+)>;
+my %tsh = ( );
+my %h = ( Focus0 => { Name => 'CalibratedInfinity',
+		      LLIM => 0,
+		      ULIM => &FOCUS0_ULIM,
+		      Values => [ ],
+		      Units => &FOCUS_UNITS,
+		      Failures => [ ],
+		    },
+	  Focus127 => { Name => 'CalibratedMidpt',
+			LLIM => 0,
+			ULIM => &FOCUS127_ULIM,
+			Values => [ ],
+			Units => &FOCUS_UNITS,
+			Failures => [ ],
+		      },
+	  Focus255 => { Name => 'CalibratedMacro',
+			LLIM => 0,
+			ULIM => &FOCUS255_ULIM,
+			Values => [ ],
+			Units => &FOCUS_UNITS,
+			Failures => [ ],
+		      },
+	);
+
+Cmds:
+while (my $cmd = shift(@cmds)) {
+  printf "Cmd = '%s'\n", $cmd
+    if $verbose;
+  next
+    if $cmd =~ m<^\s*$> || $cmd =~ m<^\s*\#>; # ignore comments and blank lines
+  if ($cmd =~ m<focusCycle>) {
+    for my $cycle (1..$clArgs->get('cycles')) {
+      unshift(@cmds, @focusCycle);
+    }
+    next;
+  }
+  unless (exists $cmap->{$cmd} && defined $cmap->{$cmd}) {
+    printf STDERR "$msgp ERROR, cmd '%s' missing from cmap hash\n", $cmd;
+    print W "stop 0\nq\n";
+    close(R);
+    close(W);
+    $status = 0;	# no more reading/writing R/W file handles
+    last Cmds;
+  }
+  $| = 1;
+  print W "$cmd\n";
+  my ($cmdTs, $tsVal) = &getTsMs();	# get timestamp in ms
+  $tsh{$tsVal} = $cmd;
+  chomp $cmdTs;
+  my $string = sprintf "%s:  %s", $cmdTs, $cmd;
+#  print STDOUT $verbose ? "$string\n" : '.'; # do we want to qualify this with 'if $verbose'?
+  $| = 1;
+  push(@cmdTss, $string);	# save for later appending to log file
+  print STDOUT "$string\n";
+
+  # we loop on getfocuspos results for 'N' iterations or until we get the focus position we were expecting
+  # ------------------------------------------------------------------------------------------------------
+
+  if ($cmd =~ m<getfocuspos\s+(\d+)>) {
+    my $getchan = $1;
+    if ($chan != $getchan) {
+      printf STDERR "$msgp ERROR, getfocuspos channel '%d' does not match setfocuspos '%d'\n", $getchan, $chan;
+      exit(1);
+    }
+    my $focusposErrors = 0;
+    for my $iter (1..&GETFOCUSPOS_ITERATIONS) {
+      ($status, $kvp, $returns) = &waitForPrompt($cmap->{$cmd});
+      unless ($status) {
+	my $errmsg = 'waitForPrompt() returned failing status';
+	push(@{$h{sprintf "Focus%d", $focusval}->{Failures}}, $errmsg);
+	printf STDERR "$msgp ERROR, %s\n", $errmsg;
+	print @{$returns}
+	  if scalar(@{$returns});
+	print W "stop 0\nq\n";
+	close(R);
+	close(W);
+	$errors++;
+	last;
+      }
+      if (exists $kvp->{position}) {
+	if ($focusval != hex($kvp->{position})) {
+	  printf STDERR "$msgp ERROR, setfocuspos %d resulted in position %s returned by getfocuspos\n",
+	    $focusval, $kvp->{position}
+	      if $debug;
+	  $errors++;
+	  $focusposErrors++;
+	} else {
+	  # getfocuspos returned the expected focus value:  save the time delta between the two cmds
+	  ($cmdTs, $tsVal) = &getTsMs();
+	  $errors = 0;
+	  my $fp = sprintf "Focus%d", $focusval;
+	  $h{$fp}->{Values}->[-1] = ($tsVal - $h{$fp}->{Values}->[-1]) * 1000;
+	  last;
+	}
+      }
+      unless ($iter == &GETFOCUSPOS_ITERATIONS) {
+	print W "$cmd\n";
+#	($cmdTs, $tsVal) = &getTsMs();
+#       $tsh{$tsVal} = $cmd;
+#	chomp $cmdTs;
+#	push(@cmdTss, sprintf "%s:  %s", $cmdTs, $cmd);
+      }
+    }
+    next
+      if $errors == 0;
+    $status = 0;
+
+    # giving up here
+    # --------------
+
+    my $fp = sprintf "Focus%d", $focusval;
+    ($cmdTs, $tsVal) = &getTsMs();
+    $h{$fp}->{Values}->[-1] = ($tsVal - $h{$fp}->{Values}->[-1]) * 1000;
+    my $msg = sprintf "Failed to get correct focus position %s after %d iterations (%s after %.3lf ms)",
+      $focusval, &GETFOCUSPOS_ITERATIONS, (exists $kvp->{position} ? hex($kvp->{position}) : 'unknown'),
+	&rnd(1000, $h{$fp}->{Values}->[-1]);
+    printf STDERR "$msgp ERROR, %s\n", $msg;
+    push(@{$h{$fp}->{Failures}}, $msg);
+    last;
+  } else {		# it's not getfocuspos, so it must be setfocuspos
+    ($status, $kvp, $returns) = &waitForPrompt($cmap->{$cmd});
+    unless ($status) {
+      my $msg = "waitForPrompt() returned failed status from command '$cmd'";
+      printf STDERR "$msgp ERROR, %s\n", $msg;
+      if (defined $focusval) {
+	my $fp = sprintf "Focus%d", $focusval;
+	push(@{$h{$fp}->{Failures}}, $msg);
+      }
+      print @{$returns}
+	if scalar(@{$returns});
+      print W "stop 0\nq\n";
+      close(R);
+      close(W);
+      exit(1);		# it's a failure--we don't care to continue
+#      last;
+    }
+    if ($cmd =~ m<setfocuspos\s+(\d+)\s+(\d+)>) {
+      ($chan, $focusval) = ($1, $2);
+      push(@{$h{sprintf "Focus%d", $focusval}->{Values}}, $tsVal);
+      if (exists $kvp->{position}) {
+	if ($focusval != hex($kvp->{position})) {
+	  printf STDERR "$msgp ERROR, setfocuspos %d resulted in position %s\n", $focusval, $kvp->{position};
+	  $errors++;
+	}
+      }
+    }
+  }
+}
+my $exitval = 1;
+{
+  $exitval = 0;
+  my $nl = 0;
+  while (1) { # read and echo any remaining STDOUT from app now that it (should have) exited
+    my $thing = <R>;
+    last unless defined $thing;
+    print STDOUT $thing
+      if $debug;
+    $nl = $thing =~ m<^.*$/$> ? 1 : 0;
+  }
+  close(W);
+  close(R);
+  unless ($nl) {
+    print STDOUT "\n"
+      if $debug;
+  }
+}
+
+printf STDERR "Parent waiting on $procpid (%s)\n", &CAMERATEST
+  if $debug;
+waitpid($procpid, 0);
+
+{
+  my @badfocus = ( );
+  for my $foc (keys %h) {
+    push(@badfocus, $foc)
+      if scalar($h{$foc}->{Values}) == 0;
+  }
+  if (scalar(@badfocus)) {
+    printf STDERR "$msgp ERROR, no sensor positioning times for focus position(s):  %s\n", join(', ', @badfocus);
+    print STDERR "FAIL\n";
+    &logResult('FAIL');
+    exit(1);
+  }
+  my $iters = $clArgs->get('cycles');
+  for my $focus (sort { $a cmp $b } keys %h) {
+    my ($mean, $min, $max) = &rnd(1000, &Statistics::meanMinMax(@{$h{$focus}->{Values}}));
+    my $sigma = $iters > 1 ? &rnd(1000, &Statistics::stddev($mean, @{$h{$focus}->{Values}})) : 0.0;
+    printf "%8s:  %7.3lfμ  [%7.3lf .. %7.3lf] %6.3lfσ (ms) out of %d\n", $focus, $mean, $min, $max, $sigma, $iters;
+    $h{$focus}->{Mean} = $mean;
+    $h{$focus}->{Min} = $min;
+    $h{$focus}->{Max} = $max;
+    $h{$focus}->{Sigma} = $sigma;
+  }
+}
+
+$startTime = &plistCanonicalTime($startTime);
+$endTime = &plistCanonicalTime(timelocal(localtime));
+my $version = &VERSION;
+my $vcmv = $driver == &ROHM ? 'Rohm' : $driver == &DONGWOON ? 'Dongwoon' : $driver == &ADI ? 'ADI' : 'unknown';
+
+my $plistf = join('/', PLISTDIR, PLISTNAME);
+
+if (-f $plistf &&
+    (! $clArgs->get('newplist'))) {
+  # already exists--must append to it
+  my $sections = &parsePdcaPlist($plistf);
+  my $nextKey = 1 + &Statistics::max(@{$sections->{Iterations}});
+  my $fh;
+  if (open($fh, ">$plistf")) {
+    print $fh @{$sections->{Header}};
+    print $fh @{$sections->{Tests}};
+    my $plistStart = <<"ENDSHERE";
+	<key>$nextKey</key>
+	<dict>
+		<key>Attributes</key>
+		<dict>
+			<key>serialnumber</key>
+			<string>$serialno</string>
+			<key>softwarename</key>
+			<string>VCMT</string>
+			<key>softwareversion</key>
+			<string>$version</string>
+			<key>VCM Vendor</key>
+			<string>$vcmv</string>
+		</dict>
+		<key>Tests</key>
+		<array>
+ENDSHERE
+    print $fh $plistStart;
+    my ($failures, @teststr) = &getTestStrings(\%h);
+    print $fh @teststr;
+    my $result = $failures ? 'FAIL' : 'PASS';
+    my $plistEnd =  <<"ENDSHERE";
+		</array>
+		<key>overallresult</key>
+		<string>$result</string>
+		<key>startTime</key>
+		<string>$startTime</string>
+		<key>stopTime</key>
+		<string>$endTime</string>
+	</dict>
+</dict>
+</plist>
+ENDSHERE
+    print $fh $plistEnd;
+    close($fh);
+    &logResult($result);
+  } else {
+    printf STDERR "$msgp ERROR, failed to open file '%s' for write:  $!\n", $plistf;
+    exit(1);
+  }
+} else {
+  my $plistStart = <<"ENDSHERE";
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>0</key>
+	<dict>
+		<key>Attributes</key>
+		<dict>
+			<key>serialnumber</key>
+			<string>$serialno</string>
+			<key>softwarename</key>
+			<string>VCMT</string>
+			<key>softwareversion</key>
+			<string>$version</string>
+			<key>VCM Vendor</key>
+			<string>$vcmv</string>
+		</dict>
+		<key>Tests</key>
+		<array>
+ENDSHERE
+
+  my ($failures, @teststr) = &getTestStrings(\%h);
+
+  my $result = $failures ? 'FAIL' : 'PASS';
+
+  printf "%s\n", $result;
+
+  &logResult($result);
+
+  my $plistEnd =  <<"ENDSHERE";
+		</array>
+		<key>overallresult</key>
+		<string>$result</string>
+		<key>startTime</key>
+		<string>$startTime</string>
+		<key>stopTime</key>
+		<string>$endTime</string>
+	</dict>
+</dict>
+</plist>
+ENDSHERE
+
+  {
+    my $plistf = join('/', PLISTDIR, PLISTNAME);
+    if (open(FH, ">$plistf")) {
+      print FH $plistStart;
+      printf FH "%s", join('', @teststr);
+      print FH $plistEnd;
+      close(FH);
+    } else {
+      printf STDERR "$msgp ERROR, failed to open file '%s' for write:  $!\n", $plistf;
+      exit(1);
+    }
+  }
+}
+
+exit($exitval);
+
+1;

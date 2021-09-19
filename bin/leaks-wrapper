@@ -1,0 +1,26 @@
+#!/bin/sh
+
+output=`leaks "$1" 2>&1 | tee "${BSDTESTS_TMPDIR}/$1.leakslog"`
+
+success=`echo $output | grep -q " for 0 total leaked bytes"`
+if [ $? -eq 0 ]; then
+    rm "${BSDTESTS_TMPDIR}$1.leakslog"
+    exit 0
+else
+	echo $output | grep -q " unable to get permission to examine process"
+	permission=$?
+
+	echo $output | grep -q " unable to instantiate a memory scanner"
+	cannot=$?
+
+	if [[ $permission -eq 0 || $cannot -eq 0 ]]; then
+		echo "Cannot examine process. Skipping."
+		exit 0
+	else
+		if [[ "$2" == "print" ]]; then
+			cat "${BSDTESTS_TMPDIR}/$1.leakslog"
+		fi
+
+		exit 1
+	fi
+fi

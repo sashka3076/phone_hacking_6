@@ -1,0 +1,775 @@
+#!/usr/bin/perl
+#
+# rewrite into one tool by ammon@apple.com, 11 may 2004.
+# last major update Jan 2008: SnowLeopard's top compatibility
+$main::VERSION = 3.4;
+
+use strict;
+use Getopt::Std;
+use lib '/AppleInternal/Library/Perl';
+# if the SimonSays environment is detected, use XILog
+BEGIN {
+	if (defined($ENV{TESTSUITE})) {
+		require XILog;
+	} else { # prevent "used only once" warnings
+		package XILog;
+		our $WARNING = 1; our $ERROR = 2;
+	}
+}
+my $gLogRef;
+
+### consts
+my $kDEBUG = 0;
+my @kItemsToIgnore = qw(top LoginCyclerTool);	# processes not to display
+my $kLogIntervalDefault = 60;
+my $kTotalSecsInDay = 24*60*60;
+my $kVeryLongTime = 400000000;
+my $kDefaultSimonSaysLineLimit = 14; # when multiple cols are marked as errors, SS truncation occurs around 18 lines
+my $kTopFormatStr = 'pid,ppid,uid,reg,rprvt,rshrd,rsize,vprvt,vsize,th,prt,time,cpu,command';
+
+my $kTimeSpacing = "%8s";
+# order of the process info columns from 'top' that we care about
+my @kTopColumns = qw(%CPU TIME #TH #PORTS #MREGS RPRVT RSHRD RSIZE VSIZE);
+# argument to printf for the process columns
+my $kOutputFormatProcess = $kTimeSpacing." $kTimeSpacing"x9;
+# printed labels names (in order) of our our own historical result
+my @kOutputColsProcess = qw(LOG-TIME %CPU CPU-TIME THREADS PORTS MREGS RPRVT RSHRD RSIZE VSIZE);
+# items in @kOutputColsProcess to check for growth
+my @kGrowthCols = (4..9);
+# stuff for the computer as a process
+my $kOutputFormatCPU = "$kTimeSpacing %60s %20s %41s";
+my @kOutputColsCPU = qw(LOG-TIME PROCESS-OVERVIEW LOAD-AVERAGE CPU-AVERAGE);
+my $kOutputFormatShMem = "$kTimeSpacing %60s %62s";
+my @kOutputColsShMem = qw(LOG-TIME SHARED-LIBRARIES MEMORY-REGIONS);
+my $kOutputFormatPhMem = "$kTimeSpacing %66s %22s %16s %16s";
+my @kOutputColsPhMem = qw(LOG-TIME PHYSICAL-MEMORY VIRTUAL-MEMORY PAGEINS PAGEOUTS);
+my $kOutputFormatSwap = "$kTimeSpacing %38s %38s %45s";
+my @kOutputColsSwap = qw(LOG-TIME SWAP PURGEABLE NETWORK);
+# terminal format escape sequences
+my $kUnderlineTerm = "\e[4m";
+my $kBoldTerm = "\e[1m";
+my $kBoldRedTerm = "\e[1;31m"; # 1;41m
+my $kInvertTerm = "\e[7m";
+my $kClearTerm = "\e[0m";
+
+### globals
+my $gLogPath = '/var/tmp/topLog.txt';
+my($gGrowthDetection, $gSemiQuiet, $gScoreThreshold, $gQuietAboutOneLiners) = (0,0,1,0);
+my $gOUTPUTFILE;
+my $gPrintBuffer = '';
+
+# collectors
+my %gHistoryHash;		# pid data
+my @gHistoryCPU;		# Threads+Procs+LoadAvg+CPU
+my @gHistoryShMem;		# SharedLibs+MemRegions
+my @gHistoryPhMem;		# PhysMem+VirtMem
+my @gHistorySwap;		# Swap+Purgeable (top -S)
+
+### read the log and stuff the historic process info in the global collectors
+sub processLogOutput
+{
+	my($secondsBetweenLogs, $limitLogLines) = @_;
+	my $currentTime;
+	my $gotShLibs;
+	my $lastTotalSecs;
+	my $skipCurrentLog;
+	my $pattern = join '|', map {'^'.(quotemeta).'$'} @kItemsToIgnore;
+	my $ignoredProcsRegex = qr/$pattern/o;
+	my %colNums;
+	my($lastTopOffset, $curLineOffset);
+	my($topOffsetAmount, $topEntryCount) = (0.0, 0.0);
+	my $logfile;
+	my $processesTempStrHack;
+
+	open($logfile, $gLogPath) or die "Couldn't open $gLogPath for reading: $!";
+
+	$limitLogLines = $kDefaultSimonSaysLineLimit if ($gLogRef && !defined($limitLogLines));
+	if ($limitLogLines && $limitLogLines > 1) {
+		my $topLogCount = 0;
+		while(<$logfile>) { $topLogCount++ if /^Processes\:/ } # beginning of a log section
+		seek($logfile, 0, 0);
+		$topOffsetAmount = $topEntryCount = $topLogCount / ($limitLogLines-1);
+	}
+
+PARSE_TOP: while(<$logfile>)
+	{
+		print "INPUT LINE: $_" if $kDEBUG;
+
+		# beginning of a log section
+		if (/^Processes\:(.+?)\s*$/) { # processes header
+			$processesTempStrHack = $1;
+			next;
+		}
+
+		if (/(\d+\:\d+\:\d+)$/) { # time header
+			$currentTime = $1;
+			$gotShLibs = 0;
+
+			# determine if we need to skip a section
+			if ($topOffsetAmount) {
+				$topEntryCount += 1.0;
+				if ($topEntryCount >= $topOffsetAmount) {
+					$skipCurrentLog = 0;
+					$topEntryCount-=$topOffsetAmount;
+				} else {
+					$skipCurrentLog = 1;
+					$lastTopOffset = $curLineOffset;
+					next;
+				}
+			} elsif ($secondsBetweenLogs) {
+				my($hours, $mins, $secs) = split ":", $currentTime;
+				my $totalSecs = $hours*60*60 + $mins*60 + $secs;
+				
+				if (defined($lastTotalSecs)) {
+					my $leapedDay;
+					if ($totalSecs < $lastTotalSecs) {
+						$totalSecs += $kTotalSecsInDay;
+						$leapedDay = 1;
+					}
+					
+					if (($totalSecs - $lastTotalSecs) >= $secondsBetweenLogs) {
+						$totalSecs -= $kTotalSecsInDay if ($leapedDay);
+						$skipCurrentLog = 0;
+					} else {
+						$skipCurrentLog = 1;
+						$lastTopOffset = $curLineOffset;
+						next;
+					}
+				}
+				$lastTotalSecs = $totalSecs;
+			}
+			
+			push @gHistoryCPU, [$currentTime, $processesTempStrHack];
+			next;
+
+		}
+		
+		$curLineOffset = tell $logfile;
+		next if ($skipCurrentLog);
+		
+		# next few lines of the top header
+		if (/^Load Avg\:\s+(.+?)\s*$/) {
+			push @{$gHistoryCPU[$#gHistoryCPU]}, ($1);
+			next;
+		}
+		if (/^CPU usage\:\s+(.+?)\s*$/) {
+			push @{$gHistoryCPU[$#gHistoryCPU]}, ($1);
+			next;
+		}
+		if (/^SharedLibs\:\s+(.+)\.$/) {
+			push @gHistoryShMem, [$currentTime, $1];
+			$gotShLibs = 1;
+			next;
+		}
+		if (/^MemRegions\:\s+(.+)\.$/) {
+			push @gHistoryShMem, [$currentTime, 'n/a'] unless $gotShLibs;
+			push @{$gHistoryShMem[$#gHistoryShMem]}, $1;
+			next;
+		}
+		if (/^PhysMem\:\s+(.+)\.$/) {
+			push @gHistoryPhMem, [$currentTime, $1];
+			next;
+		}
+		if (/^VM\:\s+(.+?,\s.+?)amework\svsize,\s+(\d+\(\d+\))\s.+?,\s+(\d+\(\d+\)).+\.$/) {
+			push @{$gHistoryPhMem[$#gHistoryPhMem]}, ($1, $2, $3);
+			next;
+		}
+		if (/^Swap\:\s+(.+?free)\.$/) {
+			push @gHistorySwap, [$currentTime, $1];
+			next;
+		}
+		if (/^Purgeable\:\s+(.+)\.$/) {
+			push @{$gHistorySwap[$#gHistorySwap]}, ($1);
+			next;
+		}
+		if (/^Networks\:\s+(.+)\.$/) {
+			push @{$gHistorySwap[$#gHistorySwap]}, ($1);
+			next;
+		}
+
+		# inside the pid data
+		if (/^\s*\d/) {
+			# put the process info into an array
+			my @fields = split '[\s\+\-]+';
+			shift @fields unless $fields[0];   # skip leading nulls
+			
+			# skip corrupted lines just in case
+			next if (@fields < keys %colNums);
+			
+			# fix process names with spaces by slicing and dicing
+			my $processName = join " ", @fields[$colNums{COMMAND}..$#fields];
+			
+			# skip over ignored processes (sh, perl, etc.)
+			next if $processName =~ $ignoredProcsRegex;
+			
+			# make a unique hash id for this processs. this text is also
+			# printed to describe each process
+			my $gHistoryHashId = "\"$processName\" PID:$fields[$colNums{PID}] PPID:$fields[$colNums{PPID}] UID:$fields[$colNums{UID}]";
+
+			# strip out +/- from the number fields (split now does this)
+#			foreach (@fields) { $_ = $1 if (/(\d+\.?\d*[MKBG]*|\>+)([+-])$/); }
+			
+			# package up the data neatly into our global %gHistoryHash
+			push @{$gHistoryHash{$gHistoryHashId}}, [$currentTime, @fields[@colNums{@kTopColumns}]];
+			next;
+		}
+
+		# find index numbers for column names if we haven't already
+		if (!(%colNums) && (/\bPID\b/)) {
+			my $index = 0;
+			foreach (split(' ')) { $colNums{$_} = $index++ }
+			next;
+		}
+	}
+
+	# if we reached the end of the log and skipped the last entry, include it
+	if ($skipCurrentLog) {
+		$skipCurrentLog = 0;
+		$secondsBetweenLogs = $topOffsetAmount = 0;
+		seek($logfile, $lastTopOffset, 0);
+		goto PARSE_TOP;
+	}
+
+	close $logfile or warn $!;
+}
+
+###### helper functions for printHistoricalResult ######
+### print to a buffer so that we don't xilog an excess of lines
+sub println
+{
+	my $line = shift;
+	$gPrintBuffer .= "$line\n";
+}
+sub dumpBuffer
+{
+	my $errorMode = shift;
+	if ($gLogRef) {
+		chomp $gPrintBuffer;
+		if ($errorMode) {
+			$gLogRef->error($gPrintBuffer, $errorMode);
+		} else {
+			$gLogRef->log($gPrintBuffer);
+		}
+	} elsif ($gOUTPUTFILE) {
+		print $gOUTPUTFILE $gPrintBuffer;
+	} else {
+		print $gPrintBuffer;
+	}
+	$gPrintBuffer = '';
+}
+
+sub startTestCase
+{
+	my($line, $description) = @_;
+	$description = '' unless $description;
+
+	if ($gLogRef) {
+		$gLogRef->beginTest($line, $description);
+	} elsif ($gOUTPUTFILE) {
+		print $gOUTPUTFILE "\n$kBoldTerm$kInvertTerm $line $kClearTerm $description\n";
+	} else {
+		print "\n$kBoldTerm$kInvertTerm $line $kClearTerm $description\n";
+	}
+}
+
+### compares elements in 2 arrays by reference. returns 1 if they are identical, 0 if diff
+sub compareArrayElements
+{
+	my($array1, $array2, $elements) = @_;
+	
+	foreach (@$elements) {
+		return 0 if ($$array1[$_] ne $$array2[$_]);
+	}
+	return 1;
+}
+
+# count duplicate lines and print result after TIME field when duplication ends
+my $gLastLine; my $gRepeatsCount;
+sub markDuplicateLines
+{
+	my($dataLine, $elements) = @_;
+
+	if ($gLastLine && $dataLine && &compareArrayElements($gLastLine, $dataLine, $elements)) {
+		$gRepeatsCount++;
+		$gLastLine = $dataLine;
+		return 1;
+	} else {
+		&println(sprintf ("$kTimeSpacing ($gRepeatsCount%s)", $$gLastLine[0], 'x')) if $gRepeatsCount;
+		$gRepeatsCount = 0;
+		$gLastLine = $dataLine;
+	}
+	return 0;
+}
+
+### stuff dummy items in a referenced array
+sub stuffArray
+{
+	my($array, $size) = @_;
+	for ($#$array..($size-1)) {
+		push @$array, '*MISSING DATA*';
+	}
+}
+
+sub printArrayWithFormat
+{
+	my($array, $columns, $format) = @_;
+	return unless @$array; # bail if no data - can happen if top didn't log swap
+	
+	$gLastLine = 0; $gRepeatsCount = 0;	# setup dup lines detection
+	my @elements = (1..$#$columns);		# items to check for changes
+	
+	if ($gLogRef) {
+		&println(sprintf("<u>$$format</u>", @$columns));
+	} else {
+		&println(sprintf($kUnderlineTerm.$$format.$kClearTerm, @$columns));
+	}
+	foreach my $dataLine (@$array) {
+		&stuffArray(\@$dataLine, $#$columns);	# workaround top sometimes flaking on us
+#		my @printLine = @$dataLine;
+#		if ($gBoldDiffItems && $gLastLine) {
+#			for (0..$#printLine) {
+#				$printLine[$_] = "" if ($printLine[$_] eq @$gLastLine[$_]);
+#			}
+#		}
+		next if &markDuplicateLines(\@$dataLine, \@elements);
+		&println(sprintf($$format, @$dataLine));
+	}
+	&markDuplicateLines(0, 0);
+}
+###### ######
+
+sub AppNameOnWhitelist
+{
+	my $appName = shift;
+	my $appWasRequested;
+
+	return 1 if $#ARGV == -1;
+	foreach my $app (@ARGV) {
+		$appWasRequested = 1 if substr(lc($appName), 0, length($app)) eq lc($app);
+	}
+	return $appWasRequested;
+}
+
+### check %gHistoryHash by pid for resource growth and report results
+sub printHistoricalResult
+{	
+	unless ($gSemiQuiet || $#ARGV >= 0)
+	{
+		### print history for the computer as a whole ###
+		&startTestCase("Computer History");
+		&printArrayWithFormat(\@gHistoryCPU, \@kOutputColsCPU, \$kOutputFormatCPU);
+		&dumpBuffer;
+		&println('');
+		&printArrayWithFormat(\@gHistoryShMem, \@kOutputColsShMem, \$kOutputFormatShMem);
+		&dumpBuffer;
+		&println('');
+		&printArrayWithFormat(\@gHistoryPhMem, \@kOutputColsPhMem, \$kOutputFormatPhMem);
+		&dumpBuffer;
+		&println('');
+		&printArrayWithFormat(\@gHistorySwap, \@kOutputColsSwap, \$kOutputFormatSwap);
+		&dumpBuffer;
+		if ($gLogRef) {
+			$gLogRef->endTest();
+		} else {
+			print "\n";
+		}
+	}
+	
+	### print history of each process by sorted name/pid ###
+	foreach my $key (sort {uc($a) cmp uc($b)} keys %gHistoryHash)
+	{
+		# growth detection
+		my $highScore = 0;
+		my @badcols = ();
+		my $numHistoryLines = @{$gHistoryHash{$key}};
+		my $growthErrorScore = $numHistoryLines - 2; # a score >= to this is reported as an error
+		print "\n$key growthErrorScore: $growthErrorScore" if $kDEBUG;
+
+		next if $gQuietAboutOneLiners && $numHistoryLines <= 1;
+
+		if ($gGrowthDetection && $numHistoryLines > 1)
+		{
+			my @history = ();
+			# put historical data of the columns we care about (@kGrowthCols) into fat 2d array
+			foreach my $dataLine (@{$gHistoryHash{$key}}) {
+				for (0..$#kGrowthCols) {
+					push @{$history[$_]}, @$dataLine[$kGrowthCols[$_]];
+				}
+			}
+			# guessResourceGrowth for each of these columns
+			for (0..$#kGrowthCols) {
+				my $column = $history[$_];
+				next if @$column <= 1;
+				my $score = &guessResourceGrowth($column);
+				if ($score >= $gScoreThreshold) {
+					$badcols[$kGrowthCols[$_]] = ($score >= $growthErrorScore) ? 2 : 1;
+					$highScore = $score if ($score > $highScore);
+				}
+			}
+		}
+
+		sub printBoldCols
+		{
+			my($data,$flags,$growthErrorScore,$isheader) = @_;
+			my($prefix,$postfix) = ('',''); # for the header styling
+			my $format;
+			my @kColoring;
+			if ($gLogRef) {
+				if ($isheader) {
+					$prefix = "<u>";
+					$postfix = "</u>";
+				}
+				@kColoring = ($kTimeSpacing, "<b>$kTimeSpacing</b>", "<b style=color:red>$kTimeSpacing</b>");
+			} else {
+				if ($isheader) {
+					$prefix = $kUnderlineTerm;
+					$postfix = $kClearTerm;
+				}
+				@kColoring = ($kTimeSpacing, $kBoldTerm.$kTimeSpacing.$kClearTerm.$prefix, $kBoldRedTerm.$kTimeSpacing.$kClearTerm.$prefix);
+			}
+			$format = join ' ', map { $$flags[$_] ? $kColoring[$$flags[$_]] : $kTimeSpacing } (0..$#$data);
+			&println(sprintf($prefix.$format.$postfix, @$data));
+		}
+
+		print "\t high score: $highScore" if $kDEBUG;
+		$highScore = 1 if !$gGrowthDetection && $growthErrorScore>=0; # if -Q but not -g
+		if (!$gSemiQuiet || $highScore)
+		{
+			# the header: process name sans quotes, pid+uid, column labels
+			my @appInfo = $key =~ /"(.*)"\s(.*)/;
+			next unless &AppNameOnWhitelist($appInfo[0]);
+			&startTestCase(@appInfo);
+			if ( $gGrowthDetection ) {
+				&printBoldCols(\@kOutputColsProcess, \@badcols, $growthErrorScore, 1);
+			} else {
+				&println(sprintf($gLogRef ? "<u>$kOutputFormatProcess</u>" : $kUnderlineTerm.$kOutputFormatProcess.$kClearTerm, @kOutputColsProcess));
+			}
+			
+			# the rest
+			$gLastLine = 0; $gRepeatsCount = 0;	# setup dup lines detection
+			my @elements = $gGrowthDetection ? (1, 3..$#kOutputColsProcess) : (1..$#kOutputColsProcess); # ignore CPU-TIME
+			foreach my $dataLine (@{$gHistoryHash{$key}})
+			{
+				my @diffcols = ();
+				my @printLine = @$dataLine;
+				if ( $gLastLine ) {
+					for (1..$#printLine) { $diffcols[$_] = 1 if ($printLine[$_] ne @$gLastLine[$_]) }
+				}
+				next if &markDuplicateLines(\@$dataLine, \@elements);
+				&printBoldCols(\@printLine, $gGrowthDetection ? \@badcols : \@diffcols, $growthErrorScore, 0);
+			}
+			&markDuplicateLines(0, 0);
+			if ($gLogRef && $gGrowthDetection && $highScore >= $gScoreThreshold) {
+				&dumpBuffer($highScore >= $growthErrorScore ? $XILog::ERROR : $XILog::WARNING);
+			} else {
+				&dumpBuffer;
+				if ($kDEBUG && $gGrowthDetection && $highScore >= $gScoreThreshold) {
+					print $highScore >= $growthErrorScore ? ":::ERROR:::\n" : ":::WARNING:::\n";
+				}
+			}
+			$gLogRef->endTest() if $gLogRef;
+		}
+	}
+}
+
+### growth detection: given an array of numbers, see if they grow
+my %greekMapping = ( B=>1, K=>1024, M=>1024**2, G=>1024**3 );
+sub guessResourceGrowth
+{
+	my($resourceUseArrayPtr) = @_;
+	
+	my $last = 0;
+	my @values = map {
+		my $val;
+		if ( $_ =~ /(\d+\.?\d*)([a-zA-Z])?$/ ) {
+			$val = $1 * ( $2 ? $greekMapping{$2} || 1 : 1);
+		} elsif ( $_ =~ /\>+/ ) {
+#			$val = $last + 1;	
+			# now we just force an error whevener >>> appears, in case
+			# we miss a bad spike like in finder_port_spike_log.txt
+			return scalar @$resourceUseArrayPtr;
+		}
+		$last = $val;
+	} @$resourceUseArrayPtr;
+
+	my $mid = (scalar @values) / 2;
+	my $median = $values[$mid];
+
+	my $score = 0;
+	for (0..$#values) {
+		$score += ($_ <=> $mid) * ($values[$_] <=> $median);
+	}
+	return $score;
+}
+
+### pids of all TopWatchers except ourself
+sub activeTopWatchers
+{
+	return split "\n", `/bin/ps -axww | /usr/bin/grep 'perl -w .*TopWatcher' | /usr/bin/grep -vE "grep|$$" | /usr/bin/awk '{print \$1}'`;
+}
+
+sub appendCurrentTopData
+{
+# primitive shell approach:
+#	system("/usr/bin/top -X -l1 >>$gLogPath");
+
+# method that avoids the shell and gets the current cpu rates by having
+# top quickly print out twice (manpage sez this is to get the deltas)
+	my $past1stDump;
+	local *PIPE;
+#	open(PIPE, '-|', '/usr/bin/top', '-XS', '-l2', '-s0');
+	open(PIPE, '-|', '/usr/bin/top', '-S', '-l', '2', '-s', '1', '-stats', $kTopFormatStr);
+	while(<PIPE>)
+	{
+		if ($past1stDump && /^Time/)
+		{
+			local *FILE;
+			open(FILE, ">>$gLogPath") or die "Could not open $gLogPath for writing! $!\n";
+			print FILE "\n$_";
+			while(<PIPE>) { print FILE }
+			close FILE;
+		}
+		$past1stDump = 1;
+	}
+	close PIPE;
+}
+
+my $g_top_pid;
+my $g_noShLibStats;
+sub collectTopData
+{
+	my $secondsBetweenLogs = shift;
+
+	# refuse to run if there are other TopWatchers open
+	if (&activeTopWatchers() > 0) {
+		print STDERR "TopWatcher is already running. Please quit it with $0 -k\n";
+		exit 1;
+	}
+	
+	if (-t STDOUT) {	# if we're hooked up to a tty
+		print "Recording 'top' every $secondsBetweenLogs seconds.  " if $secondsBetweenLogs;
+		print "Press control-c (^C) to stop...\n";
+	}
+
+	# run endlessly and wait around to be stopped
+	if ($g_top_pid = fork) {
+# code to wait for 'q' to be pressed. incompatible with being
+# backgrounded since it suspends top too
+#		system "stty -echo cbreak </dev/tty >/dev/tty 2>&1";
+#		while (1) {
+#			my $key;
+#			eval { $key = getc(STDIN) };
+#			unless (defined($key)) { last }		# break if we were interrupted
+#			if (($key eq 'q') || ($key eq 'Q')) {
+#				kill('INT', $g_top_pid);
+#				last;
+#			}
+#		}
+#		system "stty echo -cbreak </dev/tty >/dev/tty 2>&1";
+		eval { waitpid($g_top_pid, 0) };
+		
+		# if top was recording data, add current top output
+		&appendCurrentTopData() if $secondsBetweenLogs;
+	} elsif (defined $g_top_pid) {
+		if ($secondsBetweenLogs) {
+			open(STDOUT, ">$gLogPath") or die "Could not open $gLogPath for writing! $!\n";
+			if ($g_noShLibStats) {
+#				exec('/usr/bin/top', '-XS', '-l0', "-s $secondsBetweenLogs", '-F');
+				exec('/usr/bin/top', '-stats', $kTopFormatStr, '-S', '-l', '0', '-s', $secondsBetweenLogs, '-F');
+			} else {
+#				exec('/usr/bin/top', '-XS', '-l0', "-s $secondsBetweenLogs");
+				exec('/usr/bin/top', '-stats', $kTopFormatStr, '-S', '-l', '0', '-s', $secondsBetweenLogs);
+			}
+		} else {
+			unlink $gLogPath;
+			exec('/bin/sleep', $kVeryLongTime);
+		}
+	}
+}
+
+### main
+sub main()
+{
+	# if we get a SIGQUIT, stop top and don't print out the process history
+	my $dumpHistoryMode = 1;
+	$SIG{QUIT} = sub {
+		$dumpHistoryMode = 0; # assume that TopWatcher -k called us, so no history dump
+		kill('INT', $$);
+	};
+	$SIG{INT} = sub {
+		if ($g_top_pid) {
+			kill('INT', $g_top_pid);
+			$g_top_pid = 0;
+		} else {
+			die "Stopped";
+		}
+	};
+	$SIG{INFO} = sub {
+		&appendCurrentTopData();
+	};
+	
+	# get args
+	my %opts = ();
+	if ( !(getopts('hi:Ft:kgG:Qqco:l:', \%opts)) || ($opts{h}) ) {
+		require Pod::Usage;
+		import Pod::Usage;
+		pod2usage($opts{h} ? {-verbose=>2} : '');
+	}
+	my $secondsBetweenLogs = $opts{i};
+	my $limitLogLines = $opts{l};
+	$g_noShLibStats = $opts{F};
+	
+	# growth detection
+	$gGrowthDetection = $opts{g} || exists $opts{G};	
+	$gScoreThreshold = $opts{G} || $gScoreThreshold;
+	$gSemiQuiet = $opts{Q};
+	$gQuietAboutOneLiners = $opts{q};
+
+	# handle args
+	if ($opts{o}) {
+		open($gOUTPUTFILE, ">$opts{o}") or die "Couldn't open $opts{o} for writing: $!";
+	}
+	if ($opts{t}) {
+		$gLogPath = $opts{t} if ($opts{t} ne '.');
+	} elsif ($opts{k}) {
+		# politely quit all running TopWatchers except for ourself
+		my @topWatchers = &activeTopWatchers();
+		if (@topWatchers > 0) {
+			if (-t STDOUT) {	# if we're hooked up to a tty
+				print "Stopping TopWatcher data collecting...\n";
+			}
+			foreach (@topWatchers) { kill('QUIT', $_) }
+			# poll to make sure they have all quit - is there a better way?
+			do {
+				sleep 1;
+			} while (&activeTopWatchers());
+		}
+	} elsif ($opts{c}) {
+		# tell all running TopWatchers to log current top info (by
+		# sending them a SIGINFO)
+		my @topWatchers = &activeTopWatchers();
+		if (@topWatchers > 0) {
+			foreach (@topWatchers) { kill('INFO', $_) }
+			print "TopWatcher has been told to log current top data.\n" if -t STDOUT;
+			exit;
+		} else {
+			print STDERR "No TopWatchers are running!\n";
+			exit 1;
+		}
+	} else {
+		&collectTopData(defined($secondsBetweenLogs) ? $secondsBetweenLogs : $kLogIntervalDefault);
+	}
+	
+	# post-process results
+	if ($dumpHistoryMode)
+	{
+		if (defined($ENV{TESTSUITE})) {
+			$gLogRef = XILog->openLog('/tmp/', 'TopWatcher', 'com.apple.xintegration', 0, 1, 1);
+			
+			# copy raw log over to our SimonSaysResults folder for completeness
+			my $kTestResults = $ENV{'RESULTS'};
+			system("/bin/cp -fp \"$gLogPath\" $kTestResults/") if $kTestResults; #5034828
+#			system('/bin/cp', '-fp', $gLogPath, "$kTestResults/") if $kTestResults;
+			
+			my $kLogURL = $ENV{'UPLOAD_RESULTS'};
+			if ($kLogURL) {
+				$gLogRef->beginTest('Raw top log data', '');
+				my $topLogFileName = $gLogPath;
+				$topLogFileName =~ s/.*\///g; # strip away path components, ignoring edgecase of files named with /
+				$gLogRef->log("Log was copied <a href=\" $kLogURL/$topLogFileName\">here</a>") if $kLogURL;
+				$gLogRef->endTest();
+			}
+		} elsif (-t STDOUT) {	# if we're hooked up to a tty
+			print "Processing top log...\n";
+		}
+		
+		&processLogOutput($secondsBetweenLogs, $limitLogLines);
+		&printHistoricalResult();
+		
+		$gLogRef->closeLog() if ($gLogRef);
+	}
+
+	close $gOUTPUTFILE if $gOUTPUTFILE;
+}
+
+&main;
+
+__END__
+
+=head1 NAME
+
+TopWatcher - output top history for each item sorted by time
+
+=head1 SYNOPSIS
+
+TopWatcher [B<-i> I<interval>|B<-l> I<limit>|B<-g>|B<-G> I<threshold>|B<-q>|B<-Q>|B<-F>] [names]
+
+TopWatcher [B<-i> I<interval>|B<-l> I<limit>|B<-g>|B<-G> I<threshold>|B<-q>|B<-Q>] B<-t> I<file> [names]
+
+TopWatcher [B<-i> I<interval>|B<-l> I<limit>|B<-g>|B<-G> I<threshold>|B<-q>|B<-Q>] B<-k> [names]
+
+TopWatcher B<-c>
+
+=head1 DESCRIPTION
+
+Periodically logs output from 'top' until either control-c (^C) is pressed or TopWatcher is run again with -k, after which top history for the machine and each process is printed. Data values that change are bolded for emphasis, and identical lines are folded into a marker of the number of repeats: e.g. (5x). If growth detection (-g) is enabled, entire columns are bolded to speed investigation.
+
+If process names are given (space separated, case-insensitive & partial names accepted), only those processes are reported. If called within a SimonSays test script via RunTool, XILog is automatically used to report top history.
+
+=head1 OPTIONS
+
+=over
+
+=item B<-i> I<interval>
+
+Interval of seconds to wait between 'top' logs. Defaults to 60. A good value is usually around 1/20 of the total estimated test time. This option can also be used in post-processing to skip data in large logs. Passing 0 (zero) turns off automatic logging, and is meant for use with -c to control when top info is written.
+
+TopWatcher always records top values from the instant recording is stopped (unless zero was passed here).
+
+=item B<-l> I<limit>
+
+Log consideration limit. Useful to capture top data at a higher resolution than what is easily analyzable. Defaults to 0 (use all logs) for tty mode, and to 15 with SimonSays to reduce database bloat. The first and last logs are always included.
+
+=item B<-g>
+
+Enable resource growth detection. Columns that grow are bolded, and columns with growth on nearly every line or contain one or more >>> entries are colored red. Useful to catch steady growth, not spikes.
+
+=item B<-G> I<threshold>
+
+Growth score threshold. Conservatively defaults to 1, meaning that only one line of overall growth results in a column getting bolded. The max you can set this to is n-1, where n is the number of lines.
+
+=item B<-q>
+
+Quiet mode - Processes with only one line of data are excluded.
+
+=item B<-Q>
+
+Really quiet mode - Excludes Computer History, processes with one line of data, and processes without resource growth (if -g).
+
+=item B<-t> I<file>
+
+Top log to use for post-processing. If a single dot (.) is specified, the last saved log is used (/var/tmp/topLog.txt).
+
+=item B<-k>
+
+Report the last top history after stopping the running TopWatcher.
+
+=item B<-c>
+
+Tell the running TopWatcher to log current top data (via SIGINFO).
+
+=item B<-o> I<file>
+
+Write to the specified output file rather than the tty.
+
+=item B<-F>
+
+Do not have top calculate statistics on shared libraries (frameworks). This reduces the amount of processor time top consumes.
+
+=item B<-h>
+
+Prints this description.
+
+=back
+
+=cut

@@ -1,0 +1,212 @@
+#!/usr/bin/perl
+use strict;
+
+use Getopt::Std;
+use File::Basename;
+
+my %opt;
+getopts('abd:hlp:P:s', \%opt);
+usage() if ($opt{'h'});
+
+my $binary = shift;
+usage() unless ($binary);
+my %graph;
+my $padstring = '.';
+my $maxdepth = $opt{'d'} || 1000;
+my %prune;
+my %ignore;
+if ($opt{'p'}) {
+	for my $p (split /\s*,\s*/, $opt{'p'}) {
+		$prune{$p} = 1;
+	}
+}
+if ($opt{'P'}) {
+	for my $p (split /\s*,\s*/, $opt{'P'}) {
+		$ignore{$p} = 1;
+	}
+}
+
+# CLI compatibility with the argument format of the old 'dependencies'
+foreach my $extraarg (@ARGV) {
+	$opt{'a'} = 1 if ($extraarg =~ /-all/);
+	$opt{'l'} = 1 if ($extraarg =~ /-list/);
+	$opt{'b'} = 1 if ($extraarg =~ /-brief/);
+}
+
+usage() if ($opt{'a'} && $opt{'l'});
+
+# try to make sure we have the binary
+$binary = guessBinaryPath($binary);
+
+# if no other flag are given, -lb is essentially the same as dependent_libs,
+# which is faster
+if ($opt{'l'} && $opt{'b'} && (!($opt{'p'} || $opt{'P'} || $opt{'d'})) && (-e "/usr/local/bin/dependent_libs")) {
+	if ($opt{'s'}) {
+		system("/usr/local/bin/dependent_libs \"$binary\" | sort");
+	} else {
+		system('/usr/local/bin/dependent_libs', $binary);
+	}
+	exit;
+}
+
+getLibInfo($binary, 0);
+if ($opt{'l'}) {
+	if ($opt{'b'}) {
+		if ($opt{'s'}) {
+			print join("\n", sort keys %graph), "\n";
+		} else {
+			print join("\n", keys %graph), "\n";
+		}
+	} else {
+		print "TEXT      DATA    EXPORTS  Framework\n";
+		print "========  ======  =======  =========\n";
+		my $count = 0;
+		foreach my $lib ($opt{'s'} ? sort keys %graph : sort {$graph{$a}{'text'} <=> $graph{$b}{'text'}} keys %graph) {
+			my $node = $graph{$lib};
+			unless ($opt{'b'}) {
+				printf "%5d KB  %3d KB  %7d  ", $node->{'text'}/1024, $node->{'data'}/1024, $node->{'exports'};
+			}
+			print $lib;
+			print "\n";
+			++$count;
+		}
+		printf "TOTAL: %d libraries\n", $count;
+	}
+} else {
+	printTree($graph{$binary}, 0);
+}
+
+sub getDirectDeps {
+	my $path = shift;
+	
+	my $tool = 'otool -L';
+	if (!(-e $path)) {
+		# If the binary doesn't exist, it may be in the shared cache
+		$tool = 'dyld_shared_cache_util -dependents';
+	}
+	
+	my @deps = split /\s*\n\s*/, `$tool "$path"`;
+	shift @deps;
+	foreach my $line (@deps) { $line =~ s/\s*\([^)]*\)\s*$// }
+	return @deps;
+}
+
+sub getLibInfo {
+	my $path = shift;
+	my $depth = shift;
+
+	# continue only if not seen yet
+	return if ($graph{$path});
+	my %node;
+	$graph{$path} = \%node;
+
+	$node{'path'} = $path;
+	unless ($opt{'b'}) {
+		($node{'text'}, $node{'data'}) = ((split(/\n/, `/usr/bin/size "$path"`))[-1] =~ /^(\d*)\s+(\d*)/);
+		if ($opt{'l'}) {
+			$node{'exports'} = 0;
+			foreach my $line (split /\n/, `nm -g "$path"`) {
+				$node{'exports'}++ if $line =~ /^[0-9a-zA-Z]/;
+			}
+		}
+	}
+	# don't recurse if max depth is reached
+	return if ($depth+1 > $maxdepth);
+	if ($opt{'p'}) {
+		$path =~ /.*\/(.*)/;
+		return if ($prune{$1});
+	}
+	
+	my @deps = getDirectDeps($path);
+
+	$node{'deps'} = [];
+	foreach my $lib ($opt{'s'} ? sort @deps : @deps) {
+		next unless $lib;
+		if ($opt{'P'}) {
+			$lib =~ /.*\/(.*)/;
+			next if ($ignore{$1});
+		}
+		# fix up relative paths
+		if ($lib =~ /^\@executable_path/) {
+			my $originalname = $lib;
+			$binary =~ /(.*\/)/;
+			my $root = $1;
+			$lib =~ s/.*?\//$root/;
+			# if we are trying to fix a relative path but were invoked
+			# on a sub-component, we'll mangle the path. Try some hacks
+			# to guess the correct path.
+			if ((!-e $lib) && ($lib =~ /\/Contents\/.*\/Contents\//)) {
+				$lib =~ s/\/Contents\/.*\/Contents\//\/Contents\//;
+			}
+			if (!-e $lib) {
+				print STDERR "### Confused trying to resolve $originalname, giving up\n";
+				next;
+			}
+		}
+		if ($lib ne $path) {
+			getLibInfo($lib, $depth+1);
+			push @{ $node{'deps'} }, $graph{$lib};
+		}
+	}
+}
+
+sub printTree {
+	my $node = shift;
+	my $depth = shift;
+	return if ($depth > $maxdepth);
+	print ${padstring}x$depth, $node->{'path'};
+	unless ($opt{'b'}) {
+		printf " (TEXT %d KB / DATA %d KB)", $node->{'text'}/1024, $node->{'data'}/1024;
+	}
+	if ($node->{'seen'}) {
+		print " [DEPENDENTS: SEE EARLIER]\n";
+		return;
+	}
+	print "\n";
+	$node->{'seen'} = 1 unless ($opt{'a'});
+	return unless ($node->{'deps'});
+	foreach my $dep (@{ $node->{'deps'} }) {
+		printTree($dep, $depth+1);
+	}
+}
+
+# reimplement ~perf/bin/Support/binarypath in Perl to remove the dependency
+sub guessBinaryPath {
+	my ($basepath) = @_;
+	if (-d $basepath) {
+		$basepath =~ s#/$##;
+		my ($name, $path, $suffix) = fileparse($basepath, '\.[^.]*$');
+		return "$basepath/Contents/MacOS/$name" if -e "$basepath/Contents/MacOS/$name";
+		return "$basepath/$name" if -e "$basepath/$name";
+	}
+	return $basepath;
+}
+
+sub usage {
+	print <<EOF;
+
+Prints dependency graph for binary. Repeated subgraphs are pruned unless -a is used
+
+Usage: dependencies [-a | -l] [-bs] [-d <depth>] [-pP <lib>[,<lib>,...]] <path to binary>
+           -a : print full tree, repeating duplicate subtrees
+           -b : omit information about framework size
+   -d <depth> : search for dependencies to a maximum depth of <depth>
+           -l : print only a flat list of dependent frameworks, not the full tree
+     -p <lib> : prune below the comma-separated list of frameworks/libraries named
+                (omit their dependencies)
+     -P <lib> : like -p, but prunes above the given frameworks/libraries
+                (omit them and their dependencies)
+           -s : sort dependencies alphabetically
+
+Notes:
+    For compatibility with the old dependencies, it can also be invoked as:
+        dependencies <path to binary> [-list | -all] [-brief]
+    where -list corresponds to -l, -all to -a, and -brief to -b
+
+    In -lb mode, dependencies falls back on dependent_libs if possible.
+    To force it not to, add an arbitrarily large depth limit (e.g., -d1000)
+
+EOF
+	exit;
+}
+

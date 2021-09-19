@@ -1,0 +1,106 @@
+#! /usr/sbin/dtrace -s
+
+/* On iOS, you need to add "dtrace_dof_mode=1" to nvram boot-args for these to work. */
+
+#pragma D option quiet
+
+:useractivityd::UAUserActivityServer_Started
+{
+	printf("SERVER: Starting up, pid=%d **************************************************************************\n", arg0 );
+}
+
+:useractivityd::UAUserActivityServer_Resumed
+{
+	printf("SERVER: Resuming, pid=%d\n", arg0 );
+}
+
+:useractivityd::UAUserActivityServer_Suspended
+{
+	printf("SERVER: Suspending, pid=%d\n", arg0 );
+}
+
+:useractivityd::UAUserActivityServer_Advertised
+{
+	printf("SERVER: Advertising this item, type=%s uuid=%s\n", copyinstr(arg1), copyinstr(arg0) );
+}
+
+:useractivityd::UAUserActivityServer_AdvertisedDeferred
+{
+	printf("SERVER: Advertising deferred for this item, type=%s uuid=%s, %s\n", copyinstr(arg1), copyinstr(arg0), copyinstr(arg3) );
+}
+
+:useractivityd::UAUserActivityServer_AdvertismentRemoved
+{
+	printf("SERVER: AdvertisementRemoved, type=%s uuid=%s\n", copyinstr(arg1), copyinstr(arg0) );
+}
+
+:useractivityd::UAUserActivityServer_PickedNewAdvertisedActivity
+{
+	printf("SERVER: Picked advertisement, type=%s uuid=%s\n", copyinstr(arg1), copyinstr(arg0) );
+}
+
+:useractivityd::UAUserActivityServer_IdleInformation
+{
+	printf("SERVER: IdleInfo, suspended=%s deviceLocked=%s screenSaver=%s nextCheck=%d seconds\n",
+		arg0 ? "YES" : "NO", arg1  ? "YES" : "NO", arg2  ? "YES" : "NO", arg3 );
+}
+
+:useractivityd::UAUserActivityServer_IdleStateChanged
+{
+	printf("SERVER: Idle state changed, idle=%s\n", arg0 ? "YES" : "NO" );
+}
+
+:useractivityd::UAUserActivityServer_FrontPIDChanged
+{
+	printf("SERVER: frontPid=%d (old front=%d)\n", arg0, arg1 );
+}
+
+:useractivityd::UAUserActivityServer_ClientCreated
+{
+	printf("SERVER: Client created, pid=%d bundleID=%s\n", arg0, copyinstr(arg1) );
+}
+
+:useractivityd::UAUserActivityServer_ClientRemoved
+{
+	printf("SERVER: Client removed, pid=%d bundleID=%s\n", arg0, copyinstr(arg1) );
+}
+
+:useractivityd::UAUserActivityServer_AdvertisementsSuspended
+{
+	printf("SERVER: Advertisements suspended\n" );
+}
+
+:useractivityd::UAUserActivityServer_AdvertisementsResumed
+{
+	printf("SERVER: Advertisements resumed.\n" );
+}
+
+:useractivityd::UAUserActivityServer_Received
+{
+	printf("SERVER: Advertisement received, %s %s\n", copyinstr(arg0), copyinstr(arg1) );
+}
+
+:useractivityd::UAUserActivityServer_PayloadFetchStarted
+{
+	printf("SERVER: Payload fetch started, %s %s %d\n", copyinstr(arg0), copyinstr(arg1), arg2 );
+}
+
+:useractivityd::UAUserActivityServer_PayloadFetchFinished
+{
+	printf("SERVER: Payload fetch finished, %s %s %d %d\n", copyinstr(arg0), copyinstr(arg1), arg3, arg2 );
+}
+
+:useractivityd::UAUserActivityServer_BacklightStatus
+{
+	printf("SERVER: Backlight, screen %s %s\n", copyinstr(arg0), arg1 ? copyinstr(arg1) : "" );
+}
+
+:useractivityd::UAUserActivityServer_ScreenSaverStatus
+{
+	printf("SERVER: ScreenSaver, status=%s %s\n", copyinstr(arg0), arg1 ? copyinstr(arg1) : "" );
+}
+
+:useractivityd::UAUserActivityServer_AdvertisingBytes
+{
+	printf("SERVER: AdvertiseBytes, uuid=%s bytes=%s", arg0 ? copyinstr(arg0) : "-", arg1 ? copyinstr(arg1) : "-" );
+}

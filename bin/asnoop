@@ -1,0 +1,627 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Data::Dumper;
+$data::Dumper::Purity = 1;
+$data::Dumper::Purity = 1;
+
+use constant PERL5LIB => ('/var/root/Packages', '/AppleInternal/Library/PerlModules', '.');
+use constant DEFAULTPATH => '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/Developer/usr/bin';
+
+BEGIN {
+  if (exists $ENV{PERL5LIB} && defined $ENV{PERL5LIB}) {
+    for my $thing (&PERL5LIB) {
+      my @matches = grep { $thing eq $_ } split(/:/, $ENV{PERL5LIB});
+      unless (scalar(@matches) > 0) {
+	$ENV{PERL5LIB} .= ':' . $thing;
+	push(@INC, $thing);
+      }
+    }
+  } else {
+    $ENV{PERL5LIB} = join(':', &PERL5LIB);
+    push(@INC, &PERL5LIB);
+  }
+}
+
+use ClArgs;
+use ClArgsCb qw(Scalar Aref Bool);
+use Execer;
+use Utils qw(lockdownGet getBootArgs addBootArg rmBootArg);
+use Dir;
+use BB;
+use Oscar;
+
+use constant VERSION => 'deviceval-2.10.2';
+
+use constant PAYLOAD => '/var/root/audiosnoopPayload.tgz';
+use constant BOOTARGS_FILE => '/var/root/boot_args.txt';
+use constant DYSON_BOOTARG => 'amfi=7';
+use constant COMPASS_SAMPLE => 'compassTester -interval 0.01 -samples 1';
+use constant COMPASSTESTERTIMEOUT => 5;
+use constant MAX_OSCAR_RESETS => 5;
+use constant GET_CFG => qq<memdump -r -a syscfg -k 'CFG#'>;
+
+my ($pPath, $program) = $0 =~ m<^(.*/|)(.*),?(.*)$>;
+my $msgp = __PACKAGE__ . "::$program:";
+
+my $clArgs = ClArgs->new(Verbose => 0);
+my ($verbose, $debug) = (0, 0);
+
+#***************************************************************************
+#
+#   Subroutine : printUsage
+#       Author : Neil O'Sullivan
+#         Date : 22 Apr 2011
+#
+#  Description : Usage function.
+#
+#***************************************************************************
+
+sub printUsage {
+  my ($exitCode) = @_;
+
+  print <<ENDSHERE;
+
+$program <args> [-h | -help |-h] <file specs>
+
+where <args> are any combination of:
+
+	-debug
+	  This specifies debug mode, generating debug output.
+
+	-verbose
+	  This specifies verbose mode, generating verbose output.
+
+	-setup
+	  This sets up the device, moves files into place, sets boot-args
+	  and reboots the device.
+
+	-h | -help
+	  Prints this 'help' output and exits.
+
+ENDSHERE
+  exit($exitCode);
+}
+
+#***************************************************************************
+#
+#   Subroutine : registerOpts
+#       Author : Neil O'Sullivan
+#         Date : 07 Nov 2013
+#
+#  Description : register command-line options with callbacks
+#
+#***************************************************************************
+
+sub registerOpts {
+  my $clargs = shift;
+
+  for(['usage',		undef,	[qw(-h -help)],		sub { printUsage(0); }	],
+      ['debug',		0,	['-debug'],		sub {$debug = 1;}	],
+      ['verbose',	0,	['-verbose'],		sub {$verbose = 1;}	],
+      ['setup',		0,	[qw(-setup
+				   -nosetup)],		\&Bool			],
+      ['faceUp',	0,	['-faceUp'],		\&Bool			],
+      ['faceDown',	0,	['-faceDown'],		\&Bool			],
+      ['hwm',	  'J82AP',	['-hwm'],		\&Scalar		],
+      ['version',&VERSION,	[qw(-version
+				    --version)],	sub { printf "%s\n", &VERSION;
+							      exit(0); }	],
+     ) {
+    $clargs->add(@{$_});
+  }
+  1;
+}
+
+#***************************************************************************
+#
+#   Subroutine : setup
+#       Author : Neil O'Sullivan
+#         Date : 07 Nov 2013
+#
+#  Description : Set up unit for audiosnoop tests.
+#		 1.  check that the PAYLOAD exists
+#		 2.  make filesystem writeable
+#		 3.  unpack payload and verify contents are as expected
+#		 4.  verify extracted objects are as expected
+#		 5.  move objects into place
+#		 6.  save current boot-args to a file
+#		 7.  set boot-args for Dyson to run (if not already set)
+#		 8.  reboot (if boot-args changed)
+#
+#		 Returns 1 on error (0 if no boot-arg change), otherwise it
+#		 never returns.
+#
+#***************************************************************************
+
+sub setup {
+  my $self = shift;	# we need the platform object to get at DefaultBootArgs
+  my $mp = __PACKAGE__ . '::setup: ';
+
+  my $errors = 0;
+
+  # first let's confirm we have the payload available
+  unless (-r &PAYLOAD) {	# 1.
+    printf STDERR "$mp ERROR, missing payload file '%s'\n", &PAYLOAD;
+    return 1;
+  }
+
+  for my $cmd ('mount -uw /',				# 2.
+	       sprintf("tar xzf %s", &PAYLOAD)) {	# 3.
+    my $status = &execCmd($cmd);
+    unless ($status == 1) {
+      printf STDERR "$mp ERROR, command '%s' returned bad status %d\n", $cmd, $status;
+      $errors++;
+    }
+  }
+
+  printf STDERR "$mp unpacked payload %s\n", &PAYLOAD
+    if $debug || $verbose;
+
+  # now confirm the files we're interested in are here
+
+  for my $filething ({'-d' => ['Dyson_package', 'ATF.framework']}) {	# 4.
+    for my $key (keys %{$filething}) {
+      if ($key eq '-d') {
+	for my $value (@{$filething->{$key}}) {
+	  unless (-d $value) {
+	    printf STDERR "$mp ERROR, missing directory '%s' from '%s'\n", $value, &PAYLOAD;
+	    $errors++;
+	  }
+	}
+      } elsif ($key eq '-f') {
+	for my $value (@{$filething->{$key}}) {
+	  unless (-f $value) {
+	    printf STDERR "$mp ERROR, missing file '%s' from '%s'\n", $value, &PAYLOAD;
+	    $errors++;
+	  }
+	}
+      } elsif ($key eq '-r') {
+	for my $value (@{$filething->{$key}}) {
+	  unless (-r $value) {
+	    printf STDERR "$mp ERROR, missing file '%s' from '%s'\n", $value, &PAYLOAD;
+	    $errors++;
+	  }
+	}
+      } elsif ($key eq '-x') {
+	for my $value (@{$filething->{$key}}) {
+	  unless (-x $value) {
+	    printf STDERR "$mp ERROR, missing file '%s' from '%s'\n", $value, &PAYLOAD;
+	    $errors++;
+	  }
+	}
+      }
+    }
+  }
+  return 1 if $errors;
+
+  unless (&execCmd('mv ATF.framework /Library/Frameworks/')) {		# 5.
+    print STDERR "$mp ERROR, failed to move ATF.framework/ to /Library/Frameworks/\n";
+    return 1;
+  }
+
+  print STDERR "$mp moved ATF.framework to /Library/Frameworks\n"
+    if $debug || $verbose;
+
+  my ($status, $bootargs) = &getBootArgs();
+
+  my $bootargsfile = &BOOTARGS_FILE;
+  if (open(FH, ">$bootargsfile")) {
+    printf FH "%s\n", join(' ', @{$bootargs});		# 6.
+    close(FH);
+  } else {
+    printf STDERR "$mp ERROR, failed to open file '%s' for write:  $@\n", $bootargsfile;
+    return 1;
+  }
+
+  # force set default boot-args:  rdar://16424017
+  # ---------------------------------------------
+
+  $bootargs = $self->{DefaultBootArgs};
+
+  my $cmd = sprintf "nvram boot-args='%s'", join(' ', @{$bootargs});
+
+  # we set it explicitly below because we *add to it* later with the Dyson boot-arg
+
+  printf STDERR "$mp ERROR, failed to set default boot-args with command:\n\t%s\n", $cmd
+    unless &execCmd($cmd);	# <---- here is where we set boot-args
+
+#  my @commands = ("echo 'rebooting'");
+  my @commands = ();
+
+  unless (grep { $_ eq &DYSON_BOOTARG } @{$bootargs}) {
+
+    # adds Dyson boot-arg setting to commands to be invoked before rebooting
+
+    ($status, $bootargs) = &addBootArg(&DYSON_BOOTARG);	# 7.
+    return 1 unless $status;
+
+    printf STDERR "$mp adding boot-arg '%s' with\n    %s\n", &DYSON_BOOTARG, $bootargs
+      if $debug || $verbose;
+
+    push(@commands, $bootargs);
+  }
+
+  push(@commands, 'reboot');
+
+  for $cmd (@commands) {	# here we set boot-args, then reboot, # 8.
+
+    $status = &Execer::execer($cmd,
+			      sub {
+				my ($lineNo, $line) = (@_);
+				printf STDERR $line;
+				return 0;
+			      });
+
+    printf STDERR "$mp invoked:  %s\n", $cmd
+      if $debug || $verbose;
+
+    unless ($status == 1) {
+      printf STDERR "$mp ERROR, command '%s' returned bad status %d\n", $cmd, $status
+	unless $cmd eq 'reboot';
+    }
+  }
+
+  printf STDERR "$mp commands are:\n%s\n", join("\n", @commands);
+
+  # return code becomes exit code
+  return(0);
+}
+
+######
+# main
+######
+
+&registerOpts($clArgs);		# register options
+
+my $errors = 0;
+
+unless($clArgs->process([@ARGV])) {	# process command-line
+  print STDERR "$msgp WARNING, error processing command-line\n";
+  $errors++;
+}
+
+my $remnants = $clArgs->Unknown;
+if (defined $remnants && scalar(@{$remnants}) > 0) {
+  printf STDERR "$msgp ERROR, unrecognized tokens on command-line:  %s\n",
+    join(', ', map { sprintf "'%s'", $_ } @{$remnants});
+  $errors++;
+}
+
+exit(1)
+  if $errors;
+
+my $hwm = &lockdownGet('HardwareModel') || $clArgs->get('hwm');
+my $sn = &lockdownGet('SerialNumber') || 'unknownSN';
+
+$hwm =~ s<(?:AP|DEV)$><>;
+
+# look for the package supporting this platform and load it
+
+my @places = (@INC, split(':', $ENV{PERL5LIB}));
+my $pkg = join('.', $hwm, 'pm');
+
+{
+  my $exists = 0;
+  for my $loc (@places) {
+    #  printf STDERR "checking %s\n", join('/', $loc, $pkg);
+    next unless -f join('/', $loc, $pkg);
+    $exists = 1;
+    last;
+  }
+  unless ($exists) {
+    printf STDERR "$msgp ERROR, cannot locate base object to load '%s'\n", $pkg;
+    exit(1);
+  }
+}
+
+require $pkg;
+
+# create the object
+# -----------------
+
+my $obj = $hwm->new(Warnings => 1, Debug => $debug, Verbose => $verbose);	# turn off later
+
+print Dumper($obj)
+  if $debug || $verbose;
+
+exit(&setup($obj))
+  if $clArgs->get('setup');
+
+# we require that ZHeadingMap be defined and populated 
+# with Z+ and Z- keys and faceup/facedown values
+
+if (! ($clArgs->get('faceUp') || $clArgs->get('faceDown'))) {
+  # then we require a heading map
+  unless (exists $obj->{ZHeadingMap} &&
+	  defined $obj->{ZHeadingMap}) {
+    printf STDERR "$msgp ERROR, platform %s does not define ZHeadingMap which is required\n",
+      ref($obj);
+    exit(1);
+  }
+  for my $key (qw(Z+ Z-)) {
+    unless ($obj->{ZHeadingMap}->{$key} =~ m<^Face(?:Up|Down)$>) {
+      printf STDERR "$msgp ERROR, platform %s {ZHeadingMap}->{%s} unrecognized:  '%s', expect 'face(up|down)'\n",
+	ref($obj), $key, $obj->{ZHeadingMap}->{$key};
+      $errors++;
+    }
+  }
+}
+
+
+exit(1) if $errors;
+
+$SIG{ALRM} = sub { die "timeout" };
+
+my $uberstatus = 1;
+
+{
+  # Sample: 168 Interval: 0.016889 secs x: -27.448883  y: +14.849396 z: +17.399292 uTime: 0.018387 secs CurrentTime: Oct 28 15:01:42
+
+  # here we grab a compass sample and use the Z orientation in wave file names
+  # --------------------------------------------------------------------------
+
+  my @lines = ();
+
+  # first, let's make sure Oscar is responding
+  my $oo = Oscar->new(Debug => $debug,
+		      Verbose => $verbose);
+  my $pingSucceeded = 0;
+  for my $iteration (1..&MAX_OSCAR_RESETS) {
+    my ($s, $r, $txt) = $oo->oexec(Cmd => 'Ping');
+    $pingSucceeded = $s == 1 && defined $r && ref($r) eq 'ARRAY' && scalar(@{$r}) > 0;
+    last if $pingSucceeded;
+
+    # otherwise, ping failed and we need to reset Oscar
+
+    printf STDERR "$msgp ERROR, Oscar ping failed on iteration %d, returning status %d, text:\n%s\n",
+      $iteration, $s,
+      defined $txt && ref($txt) eq 'ARRAY' ? join('', @{$txt}) : '[none]';
+    my $ss = 1;
+    unless ($s == 1 &&
+	    scalar(@{$r}) > 0) {
+      # then Ping failed, so we should try resetting Oscar before we try talking to compass
+      for my $cmd (qw(Stop Reset Start)) {
+	($s, $r) = $oo->oexec(Cmd => $cmd);
+	$ss &= $s;
+      }
+    }
+  }
+
+  unless ($pingSucceeded) {
+    printf STDERR "$msgp ERROR, failed to get Oscar into a functional state after %d attempts\n",
+      &MAX_OSCAR_RESETS;
+    exit(1);
+  }
+    
+  eval {
+    alarm(&COMPASSTESTERTIMEOUT);  # 5 seconds for compassTester to respond with some text
+				   # so we don't hang forever waiting for it to return
+
+    $uberstatus = &Execer::execer(&COMPASS_SAMPLE,
+				  sub {
+				    my ($lineNo, $line) = (@_);
+				    push(@lines, $line);
+				    printf "%s:  %s", $lineNo, $line
+				      if $debug;
+				    if ($line =~ m<Interval\:.*?x\:\s+([\-\+]\d+\.?\d*)\s+y\:\s+([\-\+]\d+\.?\d*)\s+z\:\s+([\-\+]\d+\.?\d*)>) {
+				      # for J82, Z- is face-up, Z+ is face-down
+				      $obj->{ZHeading} = $3;
+				    }
+				    return 0;
+				  });
+    alarm(0);
+    printf STDERR "$msgp ERROR, bad status (%d) returned from attempt to read a compass sample\n",
+      $uberstatus
+	unless $uberstatus;
+  };
+  my $status = $@ && $@ =~ m<timeout> ? 0 : 1;
+  unless ($status && $uberstatus) {
+    printf STDERR "$msgp ERROR, compassTester failed to return after %d seconds, got:\n%s\n",
+      &COMPASSTESTERTIMEOUT, join('', map { sprintf "\t::%s", $_ } @lines);
+    exit(1);
+  }
+}
+
+# confirm we were able to parse a positive or negative floating point Z-heading from compassTester
+
+unless (exists $obj->{ZHeading} &&
+	defined $obj->{ZHeading}) {
+  printf STDERR "$msgp ERROR, failed to get Z-heading from compassTester\n";
+  exit(1);
+} elsif ($obj->{ZHeading} !~ m<^([\-\+]\d+\.?\d*)$>) {
+  printf STDERR "$msgp ERROR, ZHeading '%s' does not match the floating point number regex\n",
+    $obj->{ZHeading} || 'undefined';
+  exit(1);
+} else {
+  my $zvalue = $obj->{ZHeading};
+  $obj->{ZHeading} = sprintf "Z%s", $zvalue >= 0 ? '+' : '-';
+  printf STDOUT "$msgp ZHeading is %.3lf, %s\n", $zvalue,
+    $obj->{ZHeadingMap}->{$obj->{ZHeading}};
+}
+
+$obj->{ForceOrientation} = $clArgs->get('faceUp') ? 'FaceUp'
+  : $clArgs->get('faceDown') ? 'FaceDown' : undef;
+
+# faceup = reflected, so we do qrecord but no SoundCheck
+# facedown = radiated, so we do no qrecord, only SoundCheck
+
+my $orientation = $obj->{ZHeadingMap}->{$obj->{ZHeading}};
+
+if (defined $obj->{ForceOrientation}) {
+
+  # warn if compass Z heading does not match forced orientation
+
+  $orientation = $obj->{ForceOrientation};
+
+  printf STDERR "$msgp WARNING, compass Z suggests %s, forcing %s\n",
+    $obj->{ZHeadingMap}->{$obj->{ZHeading}}, $obj->{ForceOrientation}
+    if exists $obj->{ZHeading} && defined $obj->{ZHeading} &&
+    $obj->{ZHeadingMap}->{$obj->{ZHeading}} !~ $obj->{ForceOrientation};
+}
+
+$obj->{WaveFiles} = [ ];
+
+unless (exists $obj->{AudioSnoop} &&
+	defined $obj->{AudioSnoop} &&
+	(ref($obj->{AudioSnoop}) eq 'ARRAY' ||
+	 ref($obj->{AudioSnoop}) eq 'HASH')) {
+  printf STDERR "$msgp ERROR, failed to find ARRAY or HASH ref in %s AudioSnoop object\n", ref($obj);
+  exit(1);
+} else {
+
+  my $reftype = ref($obj->{AudioSnoop});
+  printf STDERR "$msgp %s->{AudioSnoop} reference type is %s\n%s\n", ref($obj), $reftype,
+    join(',', $reftype =~ m<ARRAY> ? @{$obj->{AudioSnoop}} : keys %{$obj->{AudioSnoop}})
+    if $debug || $verbose;
+
+  # now we need to deal with either a hash ref or an array ref
+  # hash ref suggests FaceUp vs. FaceDown while array ref implies same code for both sides
+
+  my @iterator;
+  if ($reftype =~ m<ARRAY>) {
+    @iterator = @{$obj->{AudioSnoop}};
+    printf STDERR "$msgp iterating over AudioSnoop array ref for %s\n", ref($obj)
+      if $debug || $verbose;
+  } elsif (exists $obj->{AudioSnoop}->{$orientation} &&
+	   defined $obj->{AudioSnoop}->{$orientation}) {
+    if (ref($obj->{AudioSnoop}->{$orientation}) =~ m<ARRAY>) {
+      @iterator = @{$obj->{AudioSnoop}->{$orientation}};
+      printf STDERR "$msgp iterating over AudioSnoop->{%s} array ref for %s\n", $orientation, ref($obj)
+	if $debug || $verbose;
+    } else {
+      printf STDERR "$msgp ERROR, %s->{AudioSnoop}->{%s} is not an ARRAY REF\n", ref($obj), $orientation;
+      exit(1);
+    }
+  } else {
+    printf STDERR "$msgp ERROR, %s unrecognized orientation '%s' for Z heading %s, expect Face(Up|Down)\n", ref($obj),
+      $orientation, $obj->{ZHeading};
+    exit(1);
+  }
+  for my $cmd (@iterator) {
+    my $status = $obj->execASCmd(Cmd => $cmd);    # this is where all the interesting work happens
+    printf STDERR "$msgp command '%s' returned status %d\n", $cmd, $status
+      if $debug || $verbose;
+    $uberstatus &= $status;
+  }
+}
+
+my $nwavefiles = scalar(@{$obj->{WaveFiles}});
+printf STDERR "$msgp:  %d wave files generated:  %s\n", $nwavefiles, join(',', @{$obj->{WaveFiles}});
+
+my $fname = 'NULL';
+
+# save CFG# from syscfg
+{
+  my $cfg;
+  my @getCfgLines = ();
+  my $sts = &Execer::execer(&GET_CFG . ' 2>&1',
+			    sub {
+			      my ($lineNo, $line) = (@_);
+			      push(@getCfgLines, $line);
+			      print STDERR $line if $debug;
+			      $cfg = $1
+				if $line =~ m<^\s*CFG\#\:\s+(.*)$>;
+			      return 0;
+			    });
+  if ($sts == 1 && defined $cfg) {
+    my $forceOrient = defined $obj->{ForceOrientation} ? $obj->{ForceOrientation} : '';
+    my $cfgFname = sprintf "%s-%s-%s-audiosnoopCfg.txt", $hwm, $sn, $obj->{ZHeading} . $forceOrient;
+    if (open(FH, ">$cfgFname")) {
+      printf FH "%s\n", $cfg;
+      close(FH);
+      push(@{$obj->{WaveFiles}}, $cfgFname);
+      $nwavefiles++;
+    } else {
+      printf STDERR "$msgp ERROR, failed to open file '%s' for write:  $@\n", $cfgFname;
+    }
+  } else {
+    printf STDERR "$msgp ERROR, command '%s' returned status %d\n", &GET_CFG, $sts
+      if $sts != 1;
+    printf STDERR "$msgp ERROR, command '%s' returned output:\n%s\n", &GET_CFG,
+      join('', @getCfgLines);
+  }
+}			
+
+if ($nwavefiles) {
+  my $ts = { };
+  my $status = &Utils::populateTimeStamp($ts);
+  my $timestamp = sprintf "%04d%03s%02d-%02d.%02d.%02d", map { $ts->{$_} }
+    qw(year mth mday hour min sec);
+
+  $fname = sprintf "%s-%s-%s-audiosnoopWavs-%s.tgz", $hwm, $sn,
+    defined $obj->{ForceOrientation} ? $obj->{ZHeading} . $obj->{ForceOrientation}
+    : $obj->{ZHeading},		# < 0 ? 'Z-' : 'Z+'
+    $timestamp;
+
+  my $cmd = "tar czf $fname " . join(' ', @{$obj->{WaveFiles}});
+  $status = &execCmd($cmd);
+  if ($status) {
+    my @takeMe = @{$obj->{WaveFiles}};
+
+    # we only need to remove these once, so check that they exist first
+
+    for my $file (&PAYLOAD, &BOOTARGS_FILE) {
+      push(@takeMe, $file)
+	if -f $file;
+    }
+    my @failures = ();
+    for my $rmf (@takeMe) {
+
+      # try politely to remove generated files
+      unless (unlink($rmf)) {
+	printf STDERR "$msgp ERROR, failed to remove file '%s'\n", $rmf;
+	push(@failures, $rmf);
+      }
+
+      # try more forcibly to remove whatever failed to remove above
+      $status = &Execer::execer(sprintf("rm -f %s", join(' ', @failures)),
+				sub {
+				  my ($lineNo, $line) = (@_);
+				  print STDERR $line;
+				  return 0;
+				})
+	if scalar(@failures);
+    }
+  } else {
+    printf STDERR "$msgp ERROR, command '%s' returned bad status '%d':  $@\n", $cmd, $status;
+    $fname = undef	# tar failed, so fname likely does not exist
+      unless -f $fname;
+  }
+}
+
+# results in /var/root/ but no need to be that specific
+
+printf STDOUT "Results in:  %s\n", $fname
+  if defined $fname;
+
+# We let the Mac host clean up since it may invoke us more than once
+# It needs to remove Dyson_package, ATF.framework, boot-args file, resultsFile
+# and then needs to reboot device (which will have removed Dyson boot-arg).
+
+# We only remove the Dyson-specific boot-arg (once).
+# The Mac host will issue the reboot after copying the results back
+# and removing the copied file from the device.
+
+{
+  # remove the Dyson boot-arg if it still thinks it's there
+
+  my ($status, $baString) = &Utils::rmBootArg(&DYSON_BOOTARG);
+  if ($status &&		# then the boot-arg still exists
+      defined $baString) {	# and this is the command to remove it
+    $status = &Execer::execer($baString,	# execute the command
+			      sub {
+				my ($lineNo, $line) = (@_);
+				printf STDERR $line;
+				return 0;
+			      });
+    printf STDERR "$msgp ERROR, command '%s' returned bad status %d\n", $baString, $status
+      unless ($status);
+  }
+}
+
+exit(0);
+
+1;

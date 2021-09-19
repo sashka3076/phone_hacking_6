@@ -1,0 +1,128 @@
+#!/bin/bash
+
+SCRIPT_DIR=/usr/local/lib/livetrace
+TRACER_DIR=$SCRIPT_DIR/tracers
+TRIGGER_DIR=$SCRIPT_DIR/triggers
+
+CONTROL_FILE=/var/mobile/Library/Caches/com.apple.livetrace.d
+
+PREF_APPID=/var/mobile/Library/Preferences/com.apple.livetrace
+PREF_SELECTED_TRACER_KEY="live trace selected tracer"
+PREF_SELECTED_TRIGGER_KEY="live trace selected trigger"
+
+livetrace_start() {
+    local TRACER=$(defaults read "$PREF_APPID" "$PREF_SELECTED_TRACER_KEY")
+    local TRIGGER=$(defaults read "$PREF_APPID" "$PREF_SELECTED_TRIGGER_KEY")
+    cat "$TRACER_DIR/$TRACER" "$TRIGGER_DIR/$TRIGGER" > "$CONTROL_FILE.tmp"
+    mv "$CONTROL_FILE.tmp" "$CONTROL_FILE"
+}
+
+livetrace_stop() {
+    rm -r "$CONTROL_FILE"
+}
+
+livetrace_select() {
+    defaults write "$PREF_APPID" "$PREF_SELECTED_TRACER_KEY" "$1"
+    defaults write "$PREF_APPID" "$PREF_SELECTED_TRIGGER_KEY" "$2"
+    chown mobile:mobile "$PREF_APPID.plist"
+}
+
+livetrace_init() {
+    if [[ ! -e "$PREF_APPID.plist" ]]
+    then
+        local TRACER=$(ls "$TRACER_DIR" | head -1)
+        local TRIGGER=$(ls "$TRIGGER_DIR" | head -1)
+        livetrace_select $TRACER $TRIGGER
+    fi
+}
+
+livetrace_help() {
+    cat <<"END"
+Control the status of livetrace:
+
+livetrace list
+    List all the available livetrace scripts
+
+livetrace status
+    Print whether livetrace is running, and the currently selected scripts
+
+livetrace start tracer_name [trigger_name]
+    Start livetrace with the selected tracer and optional trigger. The .d is optional.
+    Example: livetrace start cpusample stackshot
+
+livetrace stop
+    Stop a currently running livetrace
+
+livetrace restart
+    Restart livetrace with the currently running scripts
+
+END
+}
+
+livetrace_init
+
+COMMAND=$1; shift
+case "$COMMAND" in
+    list)
+        echo "Tracers:"
+        ls "$TRACER_DIR"
+        echo
+        echo "Triggers:"
+        ls "$TRIGGER_DIR"
+        ;;
+    restart)
+        if [[ ! -e "$CONTROL_FILE" ]]
+        then 
+            echo "Can't restart: LiveTrace is not running"
+            exit
+        fi
+        livetrace_stop
+        livetrace_start
+        ;;
+    start)
+        TRACER=${1%.d}.d; shift
+        if [[ -z "$1" ]]
+        then
+            TRIGGER=none.d
+        else
+            TRIGGER=${1%.d}.d; shift
+        fi
+
+        if [[ -e "$CONTROL_FILE" ]]
+        then
+            echo "Can't start: LiveTrace is already running"
+            exit
+        elif [[ ! -e "$TRACER_DIR/$TRACER" ]] || [[ ! -e "$TRIGGER_DIR/$TRIGGER" ]]
+        then
+            echo "Can't start: Tracer or trigger not found"
+            exit
+        fi
+
+        livetrace_select "$TRACER" "$TRIGGER"
+        livetrace_start
+        ;;
+    stop)
+        if [[ ! -e "$CONTROL_FILE" ]]
+        then
+            echo "Can't stop: LiveTrace is not running"
+            exit
+        fi
+
+        livetrace_stop
+        ;;
+    status)
+        if [[ -e "$CONTROL_FILE" ]]
+        then
+            echo "LiveTrace is running"
+        else
+            echo "LiveTrace is not running"
+        fi
+        echo "    Selected tracer and trigger:"
+        echo "   " $(defaults read "$PREF_APPID" "$PREF_SELECTED_TRACER_KEY") $(defaults read "$PREF_APPID" "$PREF_SELECTED_TRIGGER_KEY")
+        ;;
+    *)
+        livetrace_help
+        exit
+        ;;
+esac
+

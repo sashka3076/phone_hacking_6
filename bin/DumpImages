@@ -1,0 +1,138 @@
+#!/usr/bin/perl -w
+#
+#  DumpImages
+#  PerformanceTools
+#
+#  Created by Ben Nham on 8/9/12.
+#  Copyright 2009 Apple. All rights reserved.
+#
+
+use strict;
+use POSIX qw(strftime);
+use warnings;
+no warnings 'portable';
+
+use constant false => 0;
+use constant true => 1;
+
+sub usage {
+    print STDERR "Usage: DumpImages [-noleaks] [-noheap] [-all] [-h|-help] <process name>\n";
+    print STDERR "Runs vmmap on process name, finds image regions and uses memread to dump out those regions as raw binaries\n";
+}
+
+my $run_leaks = true;
+my $run_heap = true;
+my $include_purgable = false;
+my $arg = shift(@ARGV);
+my $execname = undef;
+
+while (defined $arg) {
+    if ($arg eq "-noleaks") {
+        $run_leaks = false;
+    } elsif ($arg eq "-noheap") {
+        $run_heap = false;
+    } elsif  ($arg eq "-all") {
+        $include_purgable = true;
+    } elsif  ($arg eq "-h" || $arg eq "-help") {
+        usage();
+        exit(0);
+    } else {
+        $execname = $arg;
+        my $extra_arg = shift(@ARGV);
+        if ($extra_arg) {
+            print STDERR "Unexpected argument $extra_arg\n";
+            usage();
+            exit(1);
+        }
+        last;
+    }
+
+    $arg = shift(@ARGV);
+}
+
+unless ($execname) {
+    print STDERR "Error: No process specified.\n";
+    usage();
+    exit(1);
+}
+
+chomp(my $pid = `pidof $execname`);
+die "No pid for process named $execname found" unless $pid;
+
+my $boot_args = `nvram boot-args`;
+unless ($boot_args =~ /amfi_unrestrict_task_for_pid=1/ or $boot_args =~ /amfi=[13]/) {
+    die "Incorrect boot-args, need amfi_unrestrict_task_for_pid=1, amfi=3 or amfi=1";
+}
+
+
+my $time = POSIX::strftime("%d%b-%H-%M-%S", localtime(time()));
+
+my $dir_name = "DumpImages-$execname-$time";
+my $dir_path = "/tmp/$dir_name";
+mkdir $dir_path;
+
+my $top_before_path = "$dir_path/top-before-$time.txt";
+my $top_after_path = "$dir_path/top-after-$time.txt";
+my $ios_debug_path = "$dir_path/IOSDebug-$time.txt";
+my $vmmap_path = "$dir_path/vmmap-$execname-$time.txt";
+my $vmcat_path = "$dir_path/vmcat-$execname-$time.txt";
+my $heap_path = "$dir_path/heap-$execname-$time.txt";
+my $leaks_path = "$dir_path/leaks-$execname-$time.txt";
+my $tar_path = "$dir_path.tgz";
+
+system "top -l 2 -orprvt >$top_before_path";
+
+if ($execname eq "SpringBoard") {
+    print "Asking to dump SpringBoard. Launching Memory Muncher and waiting 20 seconds for it to exit...\n";
+    system 'LaunchApp -unlock com.apple.MemoryMuncher -Rate 0.01';
+    sleep 20;
+}
+
+print "Running memnote and mempurge and waiting 10 seconds...\n";
+system "memnote $pid";
+system "mempurge";
+sleep 10;
+
+system "top -l 2 -orprvt >$top_after_path";
+system "IOSDebug >$ios_debug_path";
+
+my @vmmap_out = `vmmap -resident -dirty -purge -interleaved -noCoalesce $execname | tee $vmmap_path`;
+
+if ($run_heap) {
+    system "heap $execname >$heap_path";
+}
+
+system "vmcat -vx $pid > $vmcat_path";
+
+my @mem_regions;
+for my $line (@vmmap_out) {
+    #Image IO               000000011680c000-0000000116810000 [   16K     0K     0K     0K] rw-/rwx SM=PRV PURGE=E
+    #CoreAnimation          02392000-02393000 [    4K     4K     4K     0K] r--/r-- SM=PRV
+    if ($line =~ /^([a-zA-Z]+(\s[a-zA-Z]+)*)\s+([0-9a-z]+)-([0-9a-z]+) \[\s*\d+K\s+\d+K\s+(\d+)K\s+(\d+)K\s*\]\s+...\/...\s+SM=...\s+(PURGE=(\w))?.*/) {
+        my ($tag, $start, $end, $dirty, $swap, $purge) = ($1, $3, $4, $5, $7, $8);
+        # next if ($dirty == 0 && $swap == 0);    # Broken on 64-bit, either switch from vmmap to vmcat or wait until compressed pages are counted
+        next if (!$include_purgable && defined($purge) && ($purge =~ /V|E/));
+        if ($tag =~ /CG image|CG raster data|CoreAnimation|Image IO|IOKit|CoreUI image data/) {
+            $tag =~ s/\s+/_/g;
+
+            push(@mem_regions, [$tag, $start, $end]);
+        }
+    }
+}
+
+print "Dumping " . scalar(@mem_regions) . " images...\n";
+
+for my $region_ref (@mem_regions) {
+    my ($tag, $start, $end) = @$region_ref;
+    my $length = hex($end) - hex($start);
+
+    system "memread $pid 0x$start $length >$dir_path/$tag-0x$start.bin";
+}
+
+if ($run_leaks) {
+    system "leaks $execname >$leaks_path";
+}
+
+system "tar -czvf $tar_path -C /tmp $dir_name";
+
+print "\nDone. Wrote all information to $tar_path\n";

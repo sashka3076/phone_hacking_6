@@ -1,0 +1,497 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use constant PERL5LIB => ('/var/root/Packages', '/AppleInternal/Library/PerlModules');
+use constant DEFAULTPATH => '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/Developer/usr/bin';
+use constant TEST_TIME => 10 * 60;		# test time in seconds
+use constant CPU_STIM => 'dotpr_s8_24_withDutyCycle';
+use constant CPU_STIM_P102 => 'thermalSwiftSyntheticDutyCycle';
+use constant CPU_STIM_P105 => 'thermalA9DotprS824DutyCycle';
+use constant DEFAULT_DUTY_CYCLE => 50;
+use constant CPU_STIM_ARGS => [ 4096, 1_000_000, &DEFAULT_DUTY_CYCLE, 0 ];
+use constant DUTY_CYCLE_INDEX => 2;
+use constant CPU_STIM_ARGS_P102 => [ '-i', &DEFAULT_DUTY_CYCLE, qw(-c 0 -l 512)];
+use constant DUTY_CYCLE_INDEX_P105 => 1;
+use constant GPU_STIM => 'GLES2PowerVirus_NonUI';
+use constant GPU_STIM_ARGS => [ '-n', 100 ];
+use constant VERSION => '1787:1788';
+
+use constant DATE_TIME_INCORRECT => 99;
+
+BEGIN {
+  if (exists $ENV{PERL5LIB} && defined $ENV{PERL5LIB}) {
+    for my $thing (&PERL5LIB) {
+      my @matches = grep { $thing eq $_ } split(/:/, $ENV{PERL5LIB});
+      unless (scalar(@matches) > 0) {
+	$ENV{PERL5LIB} .= ':' . $thing;
+	push(@INC, $thing);
+      }
+    }
+  } else {
+    $ENV{PERL5LIB} = join(':', &PERL5LIB);
+    push(@INC, &PERL5LIB);
+  }
+}
+
+use Time::HiRes qw(usleep gettimeofday tv_interval);
+use POSIX;
+use Time::Local;
+
+use ClArgs;
+use ClArgsCb qw(Scalar Aref Bool);
+use Execer qw(execer);
+use SpawnMon;
+use Utils qw(rnd crc16 lockdownGet);
+
+use constant THERMHID => 'thermhid';
+use constant HDQTOOL => 'hdqtool';
+
+# Global declarations and command-line parsing.
+# Real code lies below subroutine definitions.
+# ---------------------------------------------
+my ($pPath, $program) = $0 =~ m<^(.*/|)(.*),?(.*)$>;
+$program =~ s<_\d+_\d+$><>;
+my $msgp = __PACKAGE__ . "::$program:";
+
+my $clArgs = ClArgs->new(Verbose => 0);
+my ($debug, $verbose) = (0, 0);
+my $dutyCycleIndex;
+
+#***************************************************************************
+#
+#   Subroutine : printUsage
+#       Author : Neil O'Sullivan
+#         Date : 01 Aug 2011
+#
+#  Description : Usage function.
+#
+#***************************************************************************
+
+sub printUsage {
+  my ($exitCode) = @_;
+
+  print <<ENDSHERE;
+
+$program <args> [-h | -help |-h] <file specs>
+
+where <args> are any combination of:
+
+	-debug
+	  This specifies debug mode, generating verbose output.
+
+	-h | -help
+	  Prints this 'help' output and exits.
+
+	-verbose | -noverbose
+	  turns on/off verbose mode.  Verbose mode is normally off.
+
+	-testTime <secs> | -testtime <secs> | -tt <secs>
+	  specifies the total elapsed time, in seconds, for the test to run.  Default is 600 seconds (10 minutes).
+
+	-dutyCycle <percent> | -dc <percent>
+	  specifies the duty cycle to use for dotpr_s8_24_withDutyCycle.  Default is 50.  Valid range is 0..99.
+
+	-[no]logging | -[no]log
+	  specifies that thermhid and hdqtool logging to a csv file should be done.  Default is -nologging.
+
+	-logInterval <secs> | -li <secs>
+	  specifies the number of seconds to elapse between csv logging events.  Default is 5 seconds.
+
+	-logRoot </path/to> | -logr </path/to>
+	  specifies the rooted directory where the log file ($program.log) is written.  Default is
+	  /var/logs/BurnIn/$program.  Depending on behavior, there may be no log file generated.
+
+	-csv </path/to/output.csv>
+	  specifies the filespec of the output csv file, defaults to /var/logs/BurnIn/$program/$program.csv
+	  if none specified.  csv is written only if -logging specified.  The csv file will contain thermhid
+	  and hdqtool output combined.  Note the csv file is rooted in the directory specified by
+	  -logRoot </path/to> or /var/logs/BurnIn, followed by /$program/$program.csv.
+
+	-relaunchInterval <secs> | -rli <secs>
+	  specifies the number of seconds to elapse bewteen relaunching GPU stim.  Default is 1 second.
+
+$program runs CPU power virus in parallel with GPU power virus for the specified period of time (see -testTime above).
+If logging of thermal/hdqtool data to a csv file is required, use -logging.
+
+ENDSHERE
+  exit($exitCode);
+}
+
+#***************************************************************************
+#
+#   Subroutine : registerOpts
+#       Author : Neil O'Sullivan
+#         Date : 01 Aug 2011
+#
+#  Description : register command-line options with callbacks
+#
+#***************************************************************************
+
+my $consts = {LOGROOT => '/var/logs/BurnIn',
+	      CSVFILE => (sprintf "%s.csv", $program),
+	      PLISTDIR => '/var/logs/Inferno',
+	      PLISTNAME => (sprintf "_pdca_%s.plist", $program),
+	     };
+
+sub registerOpts {
+  my $clargs = shift;
+
+  for(['usage',		undef,	[qw(-h -help)],		sub { printUsage(0); }	],
+      ['debug',		    0,	['-debug'],		sub {$debug = 1;}	],
+      ['verbose',	    0,	['-verbose'],		sub {$verbose = 1;}	],
+      ['version',    &VERSION,	['--version'],		sub { printf "%s\n", &VERSION;
+							      exit(0); }],
+      ['ED',		    0,	['--errorDescriptions'], sub { exit(0); }],	# Inferno bogosity
+      ['logRoot',    $consts->{LOGROOT},
+				[qw(-logr -logRoot)],	\&Scalar	],
+      ['csv',	     $consts->{CSVFILE},
+				['-csv'],		\&Scalar	],
+      ['testTime',  &TEST_TIME,	[qw(-testTime -tt
+				    -testtime)],	\&Scalar	],
+      ['dutycycle', &DEFAULT_DUTY_CYCLE,
+                                [qw(-dutyCycle -dc)],   \&Scalar        ],
+      ['logging',	    0,	[qw(-logging -log
+				    -nologging -nolog)],
+                                                        \&Bool		],
+      ['relaunchInterval',  1,	[qw(-relaunchInterval
+				    -rli)],		\&Scalar	],
+      ['logInterval',	    5,	[qw(-logInterval
+				    -li)],		\&Scalar	],	) {
+    $clargs->add(@{$_});
+  }
+  1;
+}
+
+#***************************************************************************
+#
+#   Subroutine : plistCanonicalTime
+#       Author : Neil O'Sullivan
+#         Date : 24 Jul 2011
+#
+#  Description : Takes in time value in seconds since the epoch and returns a
+#		 formatted string corresponding to the plist canonical time
+#		 format:  'YYYY-MM-DD HH:MM:SS'
+#
+#                Returns:  time formatted above as a string
+#
+#***************************************************************************
+
+sub plistCanonicalTime {
+  my ($s) = (@_);
+
+  my @t = localtime($s);
+
+  return sprintf "%04d-%02d-%02d %02d:%02d:%02d", 1900 + $t[5], 1 + $t[4], $t[3], (@t)[2, 1, 0];
+}
+
+#***************************************************************************
+#
+#   Subroutine : stateToTxt
+#       Author : Neil O'Sullivan
+#         Date : 01 Aug 2011
+#
+#  Description : Translates a state variable into a human readable text string.
+#
+#                Returns:  text string
+#
+#***************************************************************************
+
+use constant SEEKING_THERMHID => 0;
+use constant IN_THERMHID => 1;
+use constant SEEKING_HDQTOOL => 2;
+use constant IN_HDQTOOL => 3;
+
+use constant STATE_PROGRESSION => (SEEKING_THERMHID, IN_THERMHID, SEEKING_HDQTOOL, IN_HDQTOOL);
+
+sub stateToTxt {
+  my ($state) = (@_);
+
+  return $state == SEEKING_THERMHID ? 'SEEKING THERMHID'
+    : $state == IN_THERMHID ? 'IN THERMHID'
+      : $state == SEEKING_HDQTOOL ? 'SEEKING HDQTOOL'
+	: $state == IN_HDQTOOL ? 'IN HDQTOOL' : 'unknown';
+}
+
+#***************************************************************************
+#
+#   Subroutine : mythdqCb
+#       Author : Neil O'Sullivan
+#         Date : 01 Aug 2011
+#
+#  Description : User-side implementation of SpawnMon callback to parse/merge
+#		 output of both thermhid and hdqtool sensibly into a csv
+#
+#                Returns:  text string
+#
+#***************************************************************************
+
+sub mythdqCb {
+  my ($lineno, $line, $thing) = @_;
+  my $mp = __PACKAGE__ . '::mythdqCb: ';
+
+  my $root = $thing->{CallBackState};
+
+  my $stateIn = &stateToTxt($thing->{CallBackState}->{StateVar});
+
+  $thing->{State}->{Matched} = 0;
+  if ($root->{StateVar} == SEEKING_THERMHID ||
+      $root->{StateVar} == IN_THERMHID) {
+    my $status = \&SpawnMon::thermhidCb($lineno, $line, $thing);
+    if ($root->{StateVar} == SEEKING_THERMHID) {
+      $root->{StateVar} = IN_THERMHID
+	if $root->{Matched};
+    } else {
+      $root->{StateVar} = SEEKING_HDQTOOL
+	unless $root->{Matched};
+    }
+  }
+  if ($root->{StateVar} == SEEKING_HDQTOOL ||
+      $root->{StateVar} == IN_HDQTOOL) {
+    my $status = \&SpawnMon::hdqtoolCb($lineno, $line, $thing);
+    if ($root->{StateVar} == SEEKING_HDQTOOL) {
+      $root->{StateVar} = IN_HDQTOOL
+	if $root->{Matched};
+    } elsif ($root->{Matched} == 0) {
+      $root->{StateVar} = SEEKING_THERMHID;
+    }
+  }
+
+  my $stateOut = &stateToTxt($root->{StateVar});
+
+  printf STDOUT "$mp state in:  %s, matched %d, state out:  %s, line:  %s", $stateIn,
+    $root->{Matched}, $stateOut, $line
+      if $debug;
+
+  return 0;
+}
+
+#***************************************************************************
+#
+#   Subroutine : setDutyCycle
+#       Author : Neil O'Sullivan
+#         Date : 07 Oct 2011
+#
+#  Description : Sets the duty cycle set on the command-line for CPU_STIM_ARGS.
+#
+#                Returns:  array ref of arguments for the CPU stimulus.
+#
+#***************************************************************************
+
+sub setDutyCycle {
+  my ($args, $dc) = (@_);
+
+  $args->[$dutyCycleIndex] = $dc
+    if $dc != &DEFAULT_DUTY_CYCLE;
+  return $args;
+}
+
+######
+# main
+######
+
+my ($startTime, $endTime);
+
+&registerOpts($clArgs);		# register options
+
+my $errors = 0;
+
+unless($clArgs->process([@ARGV])) { # process command-line
+  print STDERR "$msgp WARNING, error processing command-line\n";
+  $errors++;
+}
+
+if (scalar(@{$clArgs->Unknown}) > 0) {
+  my @unk = grep { $_ !~ m<^\s*$> } @{$clArgs->Unknown};
+  if (scalar(@unk) > 0) {
+    printf STDERR "$msgp ERROR, unrecognized tokens on command-line:  %s\n",
+      join(', ', map { sprintf "'%s'", $_ } @unk);
+    $errors++;
+  }
+}
+
+exit(1)
+  if $errors;
+
+# if we're launched by inferno, we don't have a path
+
+if (exists $ENV{PATH} &&
+    defined $ENV{PATH}) {
+  my %pparts = map { $_ => 1 } split(/:/, $ENV{PATH});
+  my $missing = 0;
+  for my $ppart (split(/:/, DEFAULTPATH)) {
+    $missing++
+      unless exists $pparts{$ppart} && defined $pparts{$ppart};
+  }
+  $ENV{PATH} = DEFAULTPATH
+    unless $missing == 0;
+} else {
+  $ENV{PATH} = DEFAULTPATH;
+}
+
+# Verify that the clock is functioning
+{
+  my $dt = timelocal(localtime);
+  if ($dt < 1_000_000_000) {
+    printf STDERR "$msgp ERROR, device's clock is not set, time is incorrect\n";
+    exit(&DATE_TIME_INCORRECT);
+  }
+  $startTime = $dt;
+}
+
+my ($serialno, $hardwaremodel) = ('unknown', 'unknown');
+{
+  my $thing = { SerialNumber => 'unknown', HardwareModel => 'unknown' };
+  for my $k (keys %{$thing}) {
+    $thing->{$k} = &lockdownGet($k) || 'unknown';
+    if ($thing->{$k} =~ m<unknown>) {
+      print STDERR "$msgp ERROR, failed to parse $k from output of 'gestalt_query'\n";
+    }
+  }
+  ($serialno, $hardwaremodel) = map { $thing->{$_} } qw(SerialNumber HardwareModel);
+}
+print "Serial Number:  $serialno\nHardwareModel:  $hardwaremodel" if $verbose;
+
+my $logPath = join('/', $clArgs->get('logRoot'), $program);
+my $status = &execer("mkdir -p $logPath",
+		     sub {
+		       my ($lineNo, $line, @remains) = (@_);
+		       print $line;
+		       return 0;
+		     });
+unless ($status == 1) {
+  printf STDERR "$msgp ERROR, failed to make directory %s\n", $logPath;
+  exit(1);
+}
+
+my $logf = sprintf "%s/%s.log", $logPath, $program;
+my $logh;
+unless (open($logh, ">$logf")) {
+  printf STDERR "$msgp ERROR, failed to open log file '%s' for write\n", $logf;
+  exit(1);
+}
+printf $logh "FAIL\n";		# just in case the DOE does not successfully complete
+close($logh);			# we write PASS if we make it through the tests below
+
+my $th;
+
+if ($clArgs->get('logging')) {
+
+  $th = SpawnMon->new(Command => 'thermhid ; hdqtool',
+		      InvFreq => $clArgs->get('logInterval'),
+		      Duration => $clArgs->get('testTime'),
+		      LogFile => join('/', $logPath, $clArgs->get('csv')),
+		      CallBack => \&mythdqCb,
+		      CallBackState => {StateVar => SEEKING_THERMHID,
+					DataHash => { },
+				       });
+}
+
+# this will be relaunched after a 1s delay after it exits
+
+my $gpupv = SpawnMon->new(Command => GPU_STIM,
+			  CommandOptions => GPU_STIM_ARGS,
+			  LogFile => '/dev/null',
+			  InvFreq => $clArgs->get('relaunchInterval'),
+			  Duration => $clArgs->get('testTime'),
+			 );
+
+# this should run forever until test time expires, at which point it will be force exited by the alarm firing
+
+my ($cpustim, $cpustimargs);
+if ($hardwaremodel =~ m<^P10[1-3]>) {
+  $cpustim = &CPU_STIM_P102;
+  $cpustimargs = &CPU_STIM_ARGS_P102;
+} elsif ($hardwaremodel =~ m<^P10[5-7]>) {
+  $cpustim = &CPU_STIM_P105;
+  $cpustimargs = &CPU_STIM_ARGS_P102;
+} else {
+  $cpustim = &CPU_STIM;
+  $cpustimargs = &CPU_STIM_ARGS;
+}
+
+my $cpupv = SpawnMon->new(Command => $cpustim,
+			  CommandOptions => &setDutyCycle($cpustimargs, $clArgs->get('dutycycle')),
+			  LogFile => '/dev/null',
+			  Duration => $clArgs->get('testTime'),
+			 );
+
+my @pids = map { $_->{PID} } ($gpupv, $cpupv);
+push(@pids, $th->{PID})
+  if defined $th;
+
+for my $pid (@pids) {
+  printf "Waiting for pid %d\n", $pid
+    if $debug;
+  waitpid($pid, 0);
+}
+
+unless (open($logh, ">$logf")) {
+  printf STDERR "$msgp ERROR, failed to open log file '%s' for write\n", $logf;
+  exit(1);
+}
+
+printf $logh "PASS\n";
+close($logh);
+
+$startTime = &plistCanonicalTime($startTime);
+$endTime = &plistCanonicalTime(timelocal(localtime));
+
+# if we've made it this far, we've passed
+
+my $result = 'PASS';
+my $failureMessage = '';
+my $exitval = 0;
+my $version = &VERSION;
+
+my $plist = <<"ENDSHERE";
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>0</key>
+	<dict>
+		<key>Attributes</key>
+		<dict>
+			<key>serialnumber</key>
+			<string>$serialno</string>
+			<key>softwarename</key>
+			<string>PMUStress</string>
+			<key>softwareversion</key>
+			<string>$version</string>
+		</dict>
+		<key>Tests</key>
+		<array>
+			<dict>
+				<key>testname</key>
+				<string>$program</string>
+				<key>result</key>
+				<string>$result</string>
+				<key>failure_message</key>
+				<string>$failureMessage</string>
+			</dict>
+		</array>
+		<key>overallresult</key>
+		<string>$result</string>
+		<key>startTime</key>
+		<string>$startTime</string>
+		<key>stopTime</key>
+		<string>$endTime</string>
+	</dict>
+</dict>
+</plist>
+ENDSHERE
+
+{
+  my $plistf = join('/', $consts->{PLISTDIR}, $consts->{PLISTNAME});
+  if (open(FH, ">$plistf")) {
+    print FH $plist;
+    close(FH);
+  } else {
+    printf STDERR "$msgp ERROR, failed to open file '%s' for write:  $!\n", $plistf;
+    exit(1);
+  }
+}
+
+exit($exitval);

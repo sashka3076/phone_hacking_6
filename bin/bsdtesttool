@@ -1,0 +1,66 @@
+#!/bin/sh
+# Copyright 2009 Apple Inc. All rights reserved.
+
+echo "BSD Test Suite"
+echo " Built: 20150711224759 on 14A389"
+echo " "
+echo ""
+
+BINDIR="/usr/local/bin"
+if [ -n "$BSDTESTS_BINDIR" ]; then
+	BINDIR=$BSDTESTS_BINDIR
+fi
+
+TESTDIR="/usr/local/share/bsdtests"
+if [ -n "$BSDTESTS_TESTDIR" ]; then
+	TESTDIR=$BSDTESTS_TESTDIR
+fi
+
+LOGDIR=$(echo ~/Library/Logs/bsdtests/)
+if [ $(whoami) == "root" ]; then
+	LOGDIR="/Library/Logs/bsdtests/"
+fi
+if [ -n "$BSDTESTS_LOGDIR" ]; then
+	LOGDIR=$BSDTESTS_LOGDIR
+fi
+NOW=`date +%Y%m%d%H%M%S`
+LOG="${LOGDIR}bsdtests.$$.${NOW}.log"
+
+export BSDTESTS_LOG=$LOG
+export BSDTESTS_LOGDIR=$LOGDIR
+export BSDTESTS_TESTDIR=$TESTDIR
+export BSDTESTS_BINDIR=$BINDIR
+
+if [ -z "$BSDTESTS_TMPDIR" ]; then
+	export BSDTESTS_TMPDIR="$(mktemp -d -t bsdtests)/"
+fi
+
+function runtest
+{
+	pushd "$1" > /dev/null;
+	PROJ=$(basename "$1"); shift
+	echo "BSD Test: $PROJ ..."
+	./runtests --nosummary "$@" | tee -a $LOG
+	popd > /dev/null
+}
+
+mkdir -p $LOGDIR
+touch $LOG
+
+echo "Log file:         $LOG"
+echo "Temporary files:  $BSDTESTS_TMPDIR"
+echo ""
+
+if [ -n "$1" ]; then
+	PROJ="$1"; shift
+	runtest "$TESTDIR/$PROJ" "$@";
+	cat $LOG | $BINDIR/bsdtestsummarize
+	exit 0
+fi
+
+for T in $TESTDIR/*;
+do
+	runtest "$T";
+done
+
+cat $LOG | $BINDIR/bsdtestsummarize

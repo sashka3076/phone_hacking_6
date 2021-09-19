@@ -1,0 +1,112 @@
+#!/bin/sh
+# timeEvents
+# PerformanceTools
+#
+# Times UIKit based events using dtrace.
+#
+# timeFunction created by Tim Lee on 5/3/2011.
+# timeEvents forked by David Chan on 6/25/2012
+# Copyright 2012 Apple Inc. All rights reserved.
+#
+
+me=`basename $0`
+
+if (($# == 0)); then
+	echo "usage: $me [options] ProcessName <additional args to dtrace>"
+	echo ""
+	echo "       Options: -u       Use microseconds (us) rather than milliseconds (ms)"
+	echo "                -s       Measure time since the last thing that happened"
+	echo ""
+	echo "       Example:"
+	echo "                1. $me MobileSMS"
+	echo "                2. Tap a button"
+	echo "                3. Get this output (touch down, then touch up)"
+	echo "                          event	    8 ms"
+	echo "                          txn	    3 ms"
+	echo "                          event	  245 ms"
+	echo "                          txn	   76 ms"
+
+	exit 1
+fi
+
+while getopts ":us" opt; do
+	case $opt in
+		u)  us=1 ;;
+		s)  since=1 ;;
+		\?) echo "Invalid option -$OPTARG" >&2 ; exit 1 ;;
+		:)  echo "Option -$OPTARG requires an argument." >&2 ; exit 1 ;;
+	esac
+done
+
+shift $(($OPTIND-1))
+
+if (($# < 1)); then
+	echo "Please specify a process name to time events." >&2
+	exit 1
+fi
+
+if [ $us ]; then
+	unit_label="us"
+	unit_scale="1000"
+	unit_buffer="10"
+else
+	unit_label="ms"
+	unit_scale="1000000"
+	unit_buffer="5"
+fi
+
+if [ $since ]; then
+	prefix_format='%'$unit_buffer'd '$unit_label'\t'
+	prefix_arg="(self->now - last) / $unit_scale,"
+else
+	prefix_format=""
+	prefix_args=""
+fi
+
+pid=`pgrep -x "$1"`
+
+begin_msg="Ready to time events."
+probes='
+pid$target:UIKit:_UIApplicationHandleEvent*:entry
+{
+	self->event_start = timestamp;
+}
+
+pid$target:UIKit:_UIApplicationHandleEvent*:return
+{
+	self->now = timestamp;
+	printf("'$prefix_format'event\t%'$unit_buffer'd '$unit_label'\n", '$prefix_arg' (self->now - self->event_start) / '$unit_scale');
+	last = timestamp;
+}
+	
+pid$target:QuartzCore:*commit_transaction*:entry
+{
+	self->txn_start = timestamp;
+}
+
+pid$target:QuartzCore:*commit_transaction*:return
+{
+	self->now = timestamp;
+	printf("'$prefix_format'txn\t%'$unit_buffer'd '$unit_label'\n", '$prefix_arg' (self->now - self->txn_start) / '$unit_scale');
+	last = timestamp;
+}
+'
+
+dtrace='
+#pragma D option quiet
+
+BEGIN
+{
+	printf("'$begin_msg'\n");
+	last = timestamp;
+}
+'$probes'
+'
+
+### Run DTrace
+echo "Starting up dtrace..."
+if ((${#pid} > 0)); then
+        dtrace -p $pid -n "$dtrace" $3
+else
+        dtrace-wait -quiet "$1" -n "$dtrace" $3
+fi

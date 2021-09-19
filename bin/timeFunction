@@ -1,0 +1,536 @@
+#!/bin/sh
+# timeFunction
+# PerformanceTools
+#
+# Times a function using dtrace.
+#
+# Created by Tim Lee on 5/3/2011.
+# Copyright 2011 Apple Inc. All rights reserved.
+#
+
+me=`basename $0`
+msg="Counting time in calls..."
+timestamp='timestamp'
+
+
+function printHelp() {
+    echo "       Usage: $me [options] ProcessName '<module>:<probefunc>' <additional args to dtrace>"
+    echo ""
+    echo "       Options:"
+    echo "                -a         Aggregate more stats (note: each probe hit is slower)."
+    echo "                -c         Count all calls of the function (note: only use with -i, each probe hit is slower)."
+    echo "                -d <s>     Run timeFunction for a duration of <s> seconds. (<s> is requred)."
+    echo "                -e <n>     Run timeFunction for <n> number of calls. (<n> is requred)."
+    echo "                -g <g>     Only aggregate calls greater than <g> microseconds (<g> is required)."
+    echo "                -h         Print this help."
+    echo "                -i         Include time in recursive functions from entry to the correctly"
+    echo "                               corresponding return (note: this will not include recursive calls"
+    echo "                               in the function call count unless -c is also used)."
+    echo "                -l         Time launch only, exit after _reportAppLaunchFinished returns"
+    echo "                               Breaks with mutually exclusive calls, but fixing this causes significant overhead."
+    echo "                -m         Print out the mean time (µs) as a single number only."
+    echo "                -p         Print out the dtrace script (doesn't execute)."
+    echo "                -q         Quiet mode (only print aggregate results)."
+    echo "                -r         Count time between calls instead of time of each call."
+    echo "                -s <t>     Aggregate by call stack (either \"userstack\" or \"kernelstack\" is required for <t>)."
+    echo "                -t         Display both wall clock time and CPU time (cannot be used with -v)."
+    echo "                -u <num>   Show userstacks <num> deep (<num> is required)."
+    echo "                -v         Use vtimestamp instead of timestamp."
+    echo "                -w         Use dtrace -W to wait for process launch."
+    echo ""
+    echo "       Examples:"
+    echo "                 $me -u 20 -w MobileSMS 'IMDPersistence:IMDSMSRecordSetUIAttributes'"
+    echo "                 $me -a -e 100 -g 200 -v -q backboardd QuartzCore:CA??WindowServer??Server??render_for_time*"
+    echo "                 $me -p -f fbt 'com.apple.iokit*:*IOAccelGLContext*processDataBuffers*'"
+}
+
+
+
+### Parse Command Line Arguments ###
+
+while getopts ":acd:e:fg:hilmpqrs:tu:vw" opt; do
+    case $opt in
+        a)  shouldAggregate=1 ;;
+        c)  countAll=1 ;;
+        d)  if [[ $OPTARG =~ ^[0-9]+$ ]]; then
+                    timeToRun="$OPTARG"
+            else
+                echo "-d takes a numeric argument (amount of time in seconds to run)."
+                exit 1
+            fi
+        ;;
+        e)  if [[ $OPTARG =~ ^[0-9]+$ ]]; then
+                numberOfCallsToTime="$OPTARG"
+            else
+                echo "-e takes a numeric argument (the number of calls to time before stopping)."
+                exit 1
+            fi
+        ;;
+        g)  if [[ $OPTARG =~ ^[0-9]+$ ]]; then
+                    greaterThan="$OPTARG"
+            else
+                echo "-g takes a numeric argument (count calls greater than <g> number of microseconds)."
+                exit 1
+            fi
+        ;;
+        h)  printHelp=1 ;;
+        i)  recursive=1 ;;
+        l)  timeLaunch=1 ;;
+        m)  meanOnly=1; msg=''; quietMode=1 ;;
+        p)  printProbe=1 ;;
+		q)	quietMode=1 ;;
+        r)  reverse=1;  msg="Counting time between calls..." ;;
+        s)  if [[ $OPTARG == "kernelstack" ]]; then
+                storeAs="stack(100)"
+            elif [[ $OPTARG == "userstack" ]]; then
+                if [ $ustack ]; then
+                    storeAs=$(echo "$ustack" | sed 's/;//')
+                else
+                    storeAs="ustack(100)"
+                fi
+            else
+                echo "Must specify either userstack or kernelstack."
+                exit 1
+            fi
+        ;;
+        t)  useBothTimestamps=1 ;;
+        u)  if [[ $OPTARG =~ ^[0-9]+$ ]]; then
+                ustack="ustack($OPTARG);"
+                if [ $storeAs ]; then
+                    storeAs="ustack($OPTARG)"
+                fi
+            else
+                echo "-u takes a numeric argument (number of stack frames to show)."
+                exit 1
+            fi
+        ;;
+        v)  timestamp='vtimestamp' ;;
+        w)  launch=1 ;;
+        \?) echo "Invalid option -$OPTARG" >&2 ; exit 1 ;;
+        :)  echo "Option -$OPTARG requires an argument." >&2 ; exit 1 ;;
+    esac
+done
+
+if (($# == 0)); then
+    printHelp
+    exit 1
+fi
+
+if [ $printHelp ]; then
+    printHelp
+    exit 1
+fi
+
+if [ $useBothTimestamps ] && [ $timestamp == 'vtimestamp' ] ; then
+    echo "-t and -v are mutually exclusive."
+    printHelp
+    exit 1
+fi
+
+shift $(($OPTIND-1))
+
+if (($# < 2)); then
+    echo "Not enough args.  Pass at least a Process Name and a dtrace pid module/func pair." >&2
+    exit 1
+fi
+
+
+
+### DTrace Script Setup ###
+
+beginProbe='    BEGIN
+    {
+        printf("'$msg'\n");
+        overallStart=timestamp;
+        vOverallStart=vtimestamp;
+        this->duration = 0;
+        this->vduration = 0;
+    }
+'
+
+# Check if the 'processName' is really a PID
+if [[ $1 =~ ^[0-9]+$ ]] ; then
+   pidSpecified=1
+fi
+
+if [ $launch ]; then
+    pid='$target'
+elif [ $pidSpecified ]; then
+    pid="$1"
+elif [ $printProbe ]; then
+    pid='$pid_'"$1"
+else
+    pid=`pgrep -x "$1"`
+fi
+
+if [[ "$1" = "fbt" ]]; then
+    probe1="fbt:$2:entry"
+    probe2="fbt:$2:return"
+else
+    probe1="pid$pid:$2:entry"
+    probe2="pid$pid:$2:return"
+fi
+
+if [ $reverse ]; then
+    msg="Counting time between calls..."
+    tmp=$probe1
+    probe1=$probe2
+    probe2=$tmp
+fi
+
+printTotalCount=''
+if [ $countAll ]; then
+    if [ $recursive ]; then
+        countAll='@totalCount["count"] = count();'
+        printTotalCount='printa("Num Calls (including recusion)  %@u \n", @totalCount["count"]);'
+    else
+        echo "-c should only be used with -i"
+    fi
+fi
+
+print_agg_fmt=''
+print_agg_args=''
+print_agg_v_args=''
+
+if [ $storeAs ]; then
+    agg_sum='@sum['$storeAs'] = sum(this->duration);'
+    agg_vSum='@vsum['$storeAs'] = sum(this->vduration);'
+else
+    agg_sum='@sum["sum"] = sum(this->duration);'
+    agg_vSum='@vsum["sum"] = sum(this->vduration);'
+fi
+print_sum='printa("Sum     %@u us\n", @sum["sum"]);'
+print_vSum='printa("Sum     %@u us\n", @vsum["sum"]);'
+print_agg_fmt=$print_agg_fmt'\\tSum: %@d'
+print_agg_args=$print_agg_args', @sum'
+print_agg_v_args=$print_agg_v_args', @vsum'
+
+if [ $storeAs ]; then
+    agg_min='@min['$storeAs'] = min(this->duration);'
+    agg_vMin='@vmin['$storeAs'] = min(this->vduration);'
+else
+    agg_min='@min["min"] = min(this->duration);'
+    agg_vMin='@vmin["min"] = min(this->vduration);'
+fi
+print_min='printa("Min     %@u us\n", @min["min"]);'
+print_vMin='printa("Min     %@u us\n", @vmin["min"]);'
+print_agg_fmt=$print_agg_fmt'\\tMin: %@d'
+print_agg_args=$print_agg_args', @min'
+print_agg_v_args=$print_agg_v_args', @vmin'
+
+
+if [ $storeAs ]; then
+    agg_max='@max['$storeAs'] = max(this->duration);'
+    agg_vMax='@vmax['$storeAs'] = max(this->vduration);'
+else
+    agg_max='@max["max"] = max(this->duration);'
+    agg_vMax='@vmax["max"] = max(this->vduration);'
+fi
+print_max='printa("Max     %@u us\n", @max["max"]);'
+print_vMax='printa("Max     %@u us\n", @vmax["max"]);'
+
+print_agg_fmt=$print_agg_fmt'\\tMax: %@d'
+print_agg_args=$print_agg_args', @max'
+print_agg_v_args=$print_agg_v_args', @vmax'
+
+print_agg_fmt=$print_agg_fmt'\\tCount: %@d'
+print_agg_args=$print_agg_args', @count'
+print_agg_v_args=$print_agg_v_args', @count'
+
+if [ $storeAs ]; then
+    agg_avg='@avg['$storeAs'] = avg(this->duration);'
+    agg_vAvg='@vavg['$storeAs'] = avg(this->vduration);'
+else
+    agg_avg='@avg["avg"] = avg(this->duration);'
+    agg_vAvg='@vavg["avg"] = avg(this->vduration);'
+fi
+print_avg='printa("Mean     %@u us\n", @avg["avg"]);'
+print_vAvg='printa("Mean     %@u us\n", @vavg["avg"]);'
+
+print_agg_fmt=$print_agg_fmt'\\tAvg: %@d'
+print_agg_args=$print_agg_args', @avg'
+print_agg_v_args=$print_agg_v_args', @vavg'
+
+
+if [ $shouldAggregate ]; then
+    agg='
+        '$agg_sum'
+        @count["count"] = count();
+        '$agg_avg'
+        '$agg_min'
+        '$agg_max'
+'
+    if [ $useBothTimestamps ]; then
+    agg=$agg'
+        '$agg_vSum'
+        '$agg_vAvg'
+        '$agg_vMin'
+        '$agg_vMax'
+'
+    fi
+
+    if [ $useBothTimestamps ]; then
+        cpuEndProbe='
+        printf("\nElapsed(CPU)	  %d ms\n", (vtimestamp - vOverallStart)/1000000);
+        '$print_vSum'
+        '$print_vMin'
+        '$print_vMax'
+        printa("Num Calls	%@u \n", @count["count"]);
+        '$printTotalCount'
+        '$print_vAvg'
+'
+    fi
+
+    endProbe='    END
+    {
+        printf("\nElapsed(wall)	  %d ms\n", (timestamp - overallStart)/1000000);
+        '$print_sum'
+        '$print_min'
+        '$print_max'
+        printa("Num Calls	%@u \n", @count["count"]);
+        '$printTotalCount'
+        '$print_avg'
+        '$cpuEndProbe'
+    }
+'
+fi
+
+calculateDuration='
+	this->duration = ('$timestamp' - self->start)/1000;
+	self->start = 0;
+	self->count = 0;'
+
+if [ $useBothTimestamps ]; then
+    calculateDuration=$calculateDuration'
+	this->vduration = (vtimestamp - self->vstart)/1000;
+        this->vstart = 0;
+'
+fi
+
+
+if [ $storeAs ]; then
+    storeDuration='
+        @['$storeAs'] = quantize(this->duration);
+'
+    if [ $useBothTimestamps ]; then
+        storeDuration=$storeDuration'
+        @v['$storeAs'] = quantize(this->vduration);
+'
+    fi
+
+    if [ $shouldAggregate ]; then
+	agg='
+            '$agg_sum'
+            @count['$storeAs'] = count();
+            '$agg_avg'
+            '$agg_min'
+            '$agg_max'
+        '
+
+        if [ $useBothTimestamps ]; then
+            agg=$agg'
+            '$agg_vSum'
+            '$agg_vAvg'
+            '$agg_vMin'
+            '$agg_vMax'
+'
+        fi
+
+        endProbe='    END
+    {
+        printf("\nElapsed(wall)   %d ms\n", (timestamp - overallStart)/1000000);
+        printf("\n");
+
+        printf("Aggregated results by callstack...\n");
+        printf("\n");
+        printa("%k\n'$print_agg_fmt'\n", '$print_agg_args');'
+
+        if [ $useBothTimestamps ]; then
+            endProbe=$endProbe'
+        printf("\nAggregated CPU time results by callstack...\n\n");
+        printa("%k\n'$print_agg_fmt'\n"'$print_agg_v_args');'
+        fi
+
+        endProbe=$endProbe'
+
+        printf("\n==================================");
+        printf("==================================");
+        printf("==================================\n");
+    }
+'
+    fi
+else
+    storeDuration='
+        @["Durations(us)"] = quantize(this->duration);
+'
+    if [ $useBothTimestamps ]; then
+        storeDuration=$storeDuration'
+        @["Durations(CPU us)"] = quantize(this->vduration);
+'
+    fi
+fi
+
+if [ $meanOnly ]; then
+    storeDuration=''
+    agg='@avg["avg"] = avg(this->duration);'
+    if [ $useBothTimestamps ]; then
+    agg=$agg'
+@vavg["avg"] = avg(this->vduration);'
+    fi
+    beginProbe='    BEGIN
+    {
+        overallStart=timestamp;
+        vOverallStart=vtimestamp;
+        this->duration = 0;
+        this->vduration = 0;
+    }
+'
+    endProbe='
+    END
+    {
+        printa("%@u", @avg["avg"]);
+    }
+'
+fi
+
+if [ $timeLaunch ]; then
+    exitProbe='    pid$pid:UIKit:*_reportAppLaunchFinished*:return
+    {
+        exit(0);
+    }
+'
+else
+    exitProbe=''
+fi
+
+if [ $quietMode ]; then
+	printDuration=''
+elif [ $useBothTimestamps ]; then
+	printDuration='printf("%10s %20s %d us (wall) %d us (CPU)\n", probemod, probefunc, this->duration, this->vduration);'
+else
+	printDuration='printf("%10s %20s %d us\n", probemod, probefunc, this->duration);'
+fi
+
+# If we only want to log durations greater than a given value g, use two return probes.
+# The first probe calculates the duration, the second uses that duration as a predicate.
+if [ $greaterThan ]; then
+	logDuration=''$probe2'
+    / self->start /
+    {
+        '$calculateDuration'
+    }
+
+    '$probe2'
+    / this->duration >= '$greaterThan' /
+    {
+        '$storeDuration''
+else
+	logDuration=''$probe2'
+    / self->start /
+    {
+        '$calculateDuration'
+        '$storeDuration''
+fi
+
+if [ $useBothTimestamps ]; then
+    startVTime='self->vstart=vtimestamp;'
+fi
+
+# Create the probes for timing functions.
+if [ $recursive ]; then
+probes='
+    '$probe1'
+    / !self->count /
+    {
+        self->start='$timestamp';
+        '$startVTime'
+    }
+
+    '$probe1'
+    {
+        self->count++;
+        '$countAll'
+    }
+
+    '$logDuration'
+        '$agg'
+        '$printDuration'
+        '$ustack'
+        this->duration = 0;
+    }
+
+    '$probe2'
+    / self->count > 1 /
+    {
+        self->count--;
+    }'
+else
+probes='
+    '$probe1'
+    {
+        self->start='$timestamp';
+        '$startVTime'
+    }
+
+    '$logDuration'
+        '$agg'
+        '$printDuration'
+        '$ustack'
+        this->duration = 0;
+    }'
+fi
+
+# Create a probe for stopping after a certain number of calls, if needed.
+if [ $numberOfCallsToTime ]; then
+    stopIfReachedCallLimitProbe='
+    '$probe2'
+    / ++numberOfCallsMade == '$numberOfCallsToTime' /
+    {
+        exit(0);
+    }
+'
+fi
+
+# Create a timeout probe, if needed.
+if [ $timeToRun ]; then
+    timeoutProbe='
+    profile:::tick-1sec
+    /++elapsed_seconds == '$timeToRun'/
+    {
+        exit(0);
+    }
+'
+else
+    timeoutProbe=''
+fi
+
+
+dtraceScript='
+#pragma D option quiet
+
+'$beginProbe'
+'$probes'
+'$stopIfReachedCallLimitProbe'
+'$timeoutProbe'
+'$exitProbe'
+'$endProbe'
+'
+
+
+
+### Run DTrace ###
+
+if [ $printProbe ]; then
+    # Escape newline escape sequences in the print statements to have them print literally
+    dtraceScript=${dtraceScript//\\n/\\\\n}
+
+    if  [ $launch ]; then
+        echo dtrace -W "$1" -q -n "'$dtraceScript'" | grep -v pragma | tr -d "$trString" | sed "$sedString"
+    else
+        echo dtrace -q -n "'$dtraceScript'" | grep -v pragma | tr -d "$trString" | sed "$sedString"
+    fi
+elif [ $launch ]; then
+    dtrace -W "$1" -q -n "$dtraceScript" $3
+else
+    dtrace -n "$dtraceScript" $3
+fi

@@ -1,0 +1,562 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Time::HiRes qw(usleep gettimeofday tv_interval);
+use POSIX;
+use Time::Local;
+
+use constant PERL5LIB => ('/var/root/Packages', '/AppleInternal/Library/PerlModules');
+use constant DEFAULTPATH => '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin';
+
+BEGIN {
+  if (exists $ENV{PERL5LIB} && defined $ENV{PERL5LIB}) {
+    for my $thing (&PERL5LIB) {
+      my @matches = grep { $thing eq $_ } split(/:/, $ENV{PERL5LIB});
+      unless (scalar(@matches) > 0) {
+	$ENV{PERL5LIB} .= ':' . $thing;
+	push(@INC, $thing);
+      }
+    }
+  } else {
+    $ENV{PERL5LIB} = join(':', &PERL5LIB);
+    push(@INC, &PERL5LIB);
+  }
+  my @pathIn = exists $ENV{PATH} && defined $ENV{PATH} ? split(/:/, $ENV{PATH}) : ();
+  for my $dpath (split(':', &DEFAULTPATH)) {
+    my @matches = grep { $dpath eq $_ } @pathIn;
+    unless (scalar(@matches) > 0) {
+      push(@pathIn, $dpath);
+    }
+  }
+  $ENV{PATH} = join(':', @pathIn);
+}
+
+use Execer qw(execer);
+use SpawnMon;
+use Utils qw(rnd crc16);
+use ClArgs;
+use ClArgsCb qw(Scalar Aref Bool);
+use Statistics;
+use Data::Dumper;
+
+use constant DURATION => 2;
+use constant SLEEPDURATION => 5;
+use constant CMDTIMEOUT => 5;
+use constant ITERATIONS => 1000;
+use constant OSCARCMD => 'oscarctl';
+use constant RESET_OSCAR => qw(reset start);
+use constant PING_OSCAR => 'ping';
+use constant VERSION => 'deviceval-2.10.2';
+
+use constant AXES => qw(X Y Z);
+
+use constant TIMESTAMPRE => '(\S{3})\s+(\S{3})\s+(\d+)\s+(\d+)\:(\d+)\:(\d+)\.(\d+)\s+(\d{4})';
+use constant MOMAP => qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+
+# Global declarations and command-line parsing.
+# Real code lies below subroutine definitions.
+# ---------------------------------------------
+my ($pPath, $program) = $0 =~ m<^(.*/|)(.*),?(.*)$>;
+my $msgp = __PACKAGE__ . "::$program:";
+
+my $clArgs = ClArgs->new(Verbose => 0);
+my ($debug, $verbose) = (0, 0);
+
+my $ioClassCount = { };
+my $sortedCCKeys = [ ];
+
+my $tsre = &TIMESTAMPRE;
+$tsre = qr<$tsre>;
+
+my %months = map { (&MOMAP)[$_] => $_ } (0..11);
+
+#***************************************************************************
+#
+#   Subroutine : printUsage
+#       Author : Neil O'Sullivan
+#         Date : 04 Dec 2012
+#
+#  Description : Usage function.
+#
+#***************************************************************************
+
+sub printUsage {
+  my ($exitCode) = @_;
+
+  print <<ENDSHERE;
+
+$program <args> [-h | -help |-h]
+
+where <args> are any combination of:
+
+	-debug
+	  This specifies debug mode, generating verbose output.
+
+	-h | -help
+	  Prints this 'help' output and exits.
+
+	-verbose | -noverbose
+	  turns on/off verbose mode.  Verbose mode is normally off.
+
+	-version
+	  writes the software version to STDOUT and exits.
+
+	-timeout <seconds>
+	  specifies the maximum amount of time to wait for an 'oscar' command to complete
+	  before we try to kill it.  Default timeout is 5 seconds.
+
+	-duration <seconds>
+	  specifies the minimum number of seconds per cycle (default is 2, minimum is 0);
+	  cycle time is padded with application sleep time to achieve the proper cycle time.
+
+	-cycles <ncycles>
+	  specifies the number of iterations to run Oscar resets
+
+	-[no]cc
+	  specifies whether we should also log output of ioclasscount to output csv.
+	  Default is -nocc, so if you want ioclasscount data in the csv, use -cc.
+
+	-o <csvFile> | -ocsv <csvFile>
+	  specifies the name of the output csv file (used STDOUT otherwise).
+
+$program iteratively does Oscar resets, invoking:
+
+	oscarctl reset
+	oscarctl start
+	oscarctl ping
+
+It measures the time it takes to reset and start, and logs this to a csv.  It also records
+the status returned by each command and whether it succeeded or not.
+
+ENDSHERE
+  exit($exitCode);
+}
+
+#***************************************************************************
+#
+#   Subroutine : registerOpts
+#       Author : Neil O'Sullivan
+#         Date : 04 Dec 2012
+#
+#  Description : register command-line options with callbacks
+#
+#***************************************************************************
+
+sub registerOpts {
+  my $clargs = shift;
+
+  for (['usage',    undef,	[qw(-h -help)],		sub { printUsage(0); }	],
+       ['debug',	0,	['-debug'],		sub {$debug = 1;}	],
+       ['verbose',	0,	['-verbose'],		sub {$verbose = 1;}	],
+       ['version',	0,	['-version'],		sub {printf "%s\n", &VERSION; exit(0);}],
+       ['timeout', &CMDTIMEOUT,	['-timeout'],		\&Scalar		],
+       ['duration',
+	        &DURATION,	['-duration'],		\&Scalar		],
+       ['cycles',
+	      &ITERATIONS,	['-cycles'],		\&Scalar		],
+       ['csv',	    undef,	['-o', '-ocsv'],	\&Scalar		],
+       ['cc',		0,	[qw(-cc -nocc)],	\&Bool			],
+      ) {
+    $clargs->add(@{$_});
+  }
+  1;
+}
+
+sub lockdownGet {
+  my ($thing) = (@_);
+  my $mp = __PACKAGE__ . '::lockdownGet: ';
+
+  my $result = sprintf "unknown_%s", $thing;
+  my @allOutput = ( );
+  my $cmd;
+  if ($thing eq 'SerialNumber') {
+    $cmd = 'gestalt_query -undecorated SerialNumber';
+  } elsif ($thing eq 'HardwareModel') {
+    $thing = 'HWModelStr';
+    $cmd = 'gestalt_query -undecorated HWModelStr';
+  } else {
+    $cmd = sprintf "lockdown_query get NULL %s 2>&1", $thing;
+  }
+
+  my $status = &Execer::execer($cmd,
+			       sub {
+				 my ($lineNo, $line) = (@_);
+				 push(@allOutput, $line);
+				 chomp $line;
+				 if ($line !~ m<^\s$>) {
+				   $result = $line;
+				   $result = $1
+				     if $result =~ m<$thing\:\s*\"(\S+)\">;
+				 }
+				 return 0;
+			       });
+  if ($result =~ m<^unknown_>) {
+    printf STDERR "$mp ERROR, failed to parse %s from output of '%s'\n", $thing, $cmd;
+    for (@allOutput) {
+      printf STDERR $_;
+    }
+    return undef;
+  }
+  return $result;
+}
+
+sub getSwVers {
+  my $mp = __PACKAGE__ . '::getSwVers: ';
+
+  my $cmd = 'sw_vers';
+  my $results = { };
+  my @allOutput = ( );
+  my $status = &Execer::execer($cmd,
+			       sub {
+				 my ($lineNo, $line, $r) = (@_);
+				 push(@allOutput, $line);
+				 chomp $line;
+				 $r->{$1} = $2
+				   if ($line =~ m<^(\S+)\:\s*(.*)\s*$>);
+				 return 0;
+			       }, $results);
+  if (scalar(keys %{$results}) < 1) {
+    printf STDERR "$mp ERROR, no matches found from command '%s'\n\t%s\n", $cmd,
+      join("\n\t", @allOutput);
+    return undef;
+  }
+  return $results;
+}
+
+sub getTsUs {
+  my ($s, $us) = gettimeofday();
+  $us = &rnd(1_000_000, $us / 1_000_000);
+  $s += $us;
+  return $s;
+}
+
+sub getTsMs {
+  my ($thing) = (@_);
+  my ($s, $us) = gettimeofday();
+  my $ms = &rnd(1, $us / 1000);
+  if ($ms > 999) {
+
+    # since ms are rounded up from us, ms can be >= 1000
+
+    $s++;
+    $ms -= 1000;
+  }
+
+  my $t = scalar localtime($s);
+  #  $t =~ s/\s+/ /g;
+  my @s = split(/\s+/, $t);
+  my $msstr = sprintf ".%03d", $ms; # append ms to seconds field
+  $s[3] .= $msstr;
+
+  if (defined $thing &&
+      ref($thing) =~ m<hash>i &&
+      exists $thing->{Time} &&
+      defined $thing->{Time}) {
+    unless ($thing->{Time} < ($s + ($ms / 1000))) {
+      push(@s, &getBackCamTemp()); # append back camera temp.
+      $thing->{Time} += 1;
+    }
+  }
+  return join(' ', @s) . "\n";
+}
+
+#***************************************************************************
+#
+#   Subroutine : ioClassCount
+#       Author : Neil O'Sullivan
+#         Date : 08 Apr 2013
+#
+#  Description : Run ioclasscount and save results.
+#
+#***************************************************************************
+
+sub ioClassCount {
+  my $mp = __PACKAGE__ . '::ioClassCount: ';
+
+  my $h = { };
+  my $update = scalar(@{$sortedCCKeys}) == 0;
+
+  my $status = &Execer::execer('ioclasscount',
+			       sub {
+				 my ($lineNo, $line, $hr) = (@_);
+				 if ($line =~ m<^(\S+)\s+=\s+(\d+)>) {
+				   my ($k, $v) = ($1, $2);
+				   if ($update || (exists $ioClassCount->{$k} &&
+						   defined $ioClassCount->{$k})) {
+				     $hr->{$k} = $v
+				   } elsif (! $update) {
+				     printf STDERR "$mp ERROR, ran across '%s = %s' in ioclasscount results, unknown previously\n",
+				       $k, $v;
+				   }
+				 }
+				 return 0;
+			       }, $h);
+  if ($update) {
+    $ioClassCount = $h;
+    $sortedCCKeys = [ sort { $a cmp $b } keys %{$ioClassCount} ];
+    printf STDERR "$mp found %d ioclasscount keys\n", scalar(@{$sortedCCKeys});
+  } else {
+    for my $key (@{$sortedCCKeys}) {
+      unless (exists $h->{$key} && defined $h->{$key}) {
+	$h->{$key} = 0;
+	printf STDERR "$mp expected to find key '%s' -- missing\n", $key;
+      }
+    }
+  }
+
+  return $h;
+}
+
+sub resetOscar {
+  my ($iteration, $fh) = (@_);
+  my $mp = __PACKAGE__ . '::resetOscar: ';
+  my $status = 1;
+
+#  printf STDERR "Resetting oscar...\n"
+#    if $debug || $verbose;
+
+  my $elapsedTime = 0;
+
+  $SIG{ALRM} = sub { die "timeout" };
+
+  my $times = { };
+
+  my $cycle = 1;
+
+  my @results = ($iteration);
+  my $passfail;
+  my $cmdStart;
+
+  for my $cmdsuffix (&RESET_OSCAR) {
+    my $cmd = sprintf "%s %s", &OSCARCMD, $cmdsuffix;
+#    $cmdsuffix =~ s<\s*2\>\&1><>;
+    printf STDERR "$cmd\n"
+      if $debug || $verbose;
+    my $cmdEnd;
+    my $timeRemaining;
+    $cmdStart = &getTsUs();
+    push(@results, &rnd(1000, $cmdStart)) if $cycle == 1;
+    eval {
+      alarm($clArgs->get('timeout'));
+      $status &= &execer("$cmd 2>&1",
+			 sub {
+			   my ($lineNo, $line) = (@_);
+			   print STDERR $line if $debug;
+			   return 0;
+			 });
+      $timeRemaining = alarm(0);
+    };
+    $passfail = $@ && $@ =~ m<timeout> ? 0 : 1;
+    $status &= $passfail ? $status : 0;
+    unless ($status) {
+      # we either timed out or the command returned bad status
+      unless ($passfail) {
+	# this is the timeout case
+      } else {
+	# this is the NON-timeout case
+	printf STDERR "$msgp ERROR, command '%s' returned bad status '%d', timeRemaining is %s\n",
+	  $cmd, $status, defined $timeRemaining ? $timeRemaining : 'undefined';
+      }
+    }
+    $cmdEnd = &getTsUs();
+    my $idx = ucfirst $cmdsuffix;
+    $times->{$idx}->{Duration} = &rnd(1000, $cmdEnd - $cmdStart);
+    $times->{$idx}->{StartTime} = &rnd(1000, $cmdStart);
+    $times->{$idx}->{'Pass/Fail'} = $passfail;
+    $times->{$idx}->{Status} = $status;
+
+    printf STDERR "Iteration %d, %s %s %s %s\n", $iteration, $idx,
+      $times->{$idx}->{'StartTime'}, $cmdEnd, $times->{$idx}->{Duration}
+	if $debug || $verbose;
+    push(@results, map { $times->{$idx}->{"$_"} } qw(Pass/Fail Status Duration)) if $cycle++ == 1;
+  }
+
+  my $idx = ucfirst((&RESET_OSCAR)[-1]);  # the last command
+  $idx =~ s<\s*2\>\&1><>;
+  if ($passfail) {
+    my $cmd = sprintf "%s %s", &OSCARCMD, &PING_OSCAR;
+
+    # then we were successful--or so we think
+  PASSFAIL:
+    for my $i (1..10) {
+      my $retstatus;
+      printf STDERR "Iteration %d - '$cmd'\n", $i
+	if $verbose || $debug;
+      $status = &execer("$cmd 2>&1",
+			sub {
+			  my ($lineNo, $line) = (@_);
+			  print STDERR $line if $verbose || $debug;
+			  if ($line =~ m<ping\s+result\:\s*\(os/kern\)\s+successful\s+\((\d+)\)>) {
+			    $retstatus = $1;
+			    return $retstatus == 0 ? 0 : 1;
+			  } elsif ($line =~ m<ping\s+result\:\s*\([^\)]*\)\s+(.*)\s+\((\S+)\)>) {
+			    my ($msg, $sts) = ($1, $2);
+			    return 1
+			      if $msg =~ m<device\s+offline>;
+			  }
+			  return 0;
+			});
+      printf STDERR "%d - oscarctl ping returned status %d, retstatus %s\n", $i, $status,
+	defined $retstatus ? $retstatus : 'undef'
+	  if $debug || $verbose;
+      if ($status &&
+	  defined $retstatus &&
+	  $retstatus == 0) {
+	$passfail = 1; # that's good status from ping, so it things it's alive
+	last PASSFAIL;
+      }
+      printf STDERR "   oscarctl ping  returned bad status %d, retstatus %s\n", $status,
+	defined $retstatus ? $retstatus : 'undef'
+	  if $debug || $verbose;
+      if ($i != 10) {
+	sleep(2);
+	next PASSFAIL;
+      }
+      $passfail = 0; # we fall through on last iteration (failed), so indicate failure
+      $status = 0;
+      $times->{$idx}->{Duration} = &rnd(1000, &getTsUs() - $cmdStart);
+    }
+  }
+  $times->{$idx}->{"Pass/Fail"} = $passfail;
+  $times->{$idx}->{Status} = $status;
+  push(@results, map { $times->{$idx}->{"$_"} } qw(Pass/Fail Status Duration));
+
+  if ($clArgs->get('cc')) {
+    my $ioccResults = &ioClassCount();
+    push(@results, map { $ioccResults->{$_} } @{$sortedCCKeys});
+  }
+
+  # Iteration, Start Time, (Pass/Fail, Status, Duration)x(Reset, Start)
+  printf $fh "%s\n", join(',', @results);
+
+  my $oscctlExists = 0;
+  &execer('ps auxww',
+	  sub {
+	    my ($lineNo, $line) = (@_);
+	    $oscctlExists = 1
+	      if ($line =~ m<oscarctl>);
+	    return 0;
+	  });
+	      
+  &execer('killall oscarctl',
+	  sub {
+	    my ($lineNo, $line) = (@_);
+	    print STDERR $line
+	      if $debug || $verbose;
+	    return 0;
+	  })
+    if ($oscctlExists || (! $status));
+
+  printf STDERR "resetOscar:  returning status %d\n", $status if $debug || $verbose;
+  return $status;
+}
+
+my $th = { Second => { Index => 0, Fmt => "%02d", Offset => 0 },
+	   Minute => { Index => 1, Fmt => "%02d", Offset => 0 },
+	   Hour   => { Index => 2, Fmt => "%02d", Offset => 0 },
+	   YDay   => { Index => 7, Fmt => "%03d", Offset => 0 },
+	   WDay   => { Index => 6, Fmt => "%d", Offset => 0 },
+	   MDay   => { Index => 3, Fmt => "%02d", Offset => 0 },
+	   Month  => { Index => 4, Fmt => "%02d", Offset => +1 },
+	   Year   => { Index => 5, Fmt => "%04d", Offset => +1900 },
+	 };
+
+sub epoch2canonical {
+  my ($epochtime) = (@_);
+  my @ts = localtime($epochtime);
+
+  # 20120525-120220:  YYYYMMDD-HHmmSS
+
+  return sprintf join('-',
+		      join('',
+			   (map { sprintf $th->{$_}->{Fmt}, $ts[$th->{$_}->{Index}] + $th->{$_}->{Offset} }
+			    qw(Year Month MDay))),
+		      join('',
+			   (map { sprintf $th->{$_}->{Fmt}, $ts[$th->{$_}->{Index}] + $th->{$_}->{Offset} }
+			    qw(Hour Minute Second)))
+		     );
+
+}
+
+# ####
+# Main
+# ####
+
+&registerOpts($clArgs);		# register options
+
+unless($clArgs->process([@ARGV])) { # process command-line
+  print STDERR "$msgp error processing command-line\n";
+  exit(1);
+}
+
+my $sn = &lockdownGet('SerialNumber') || 'unknown';
+my $hwm = &lockdownGet('HardwareModel') || 'unknown';
+$hwm =~ s<AP><>;
+
+if ($debug) {
+  printf STDERR "SerialNumber:  '%s'\n", $sn;
+  printf STDERR "HardwareModel:  '%s'\n", $hwm;
+}
+
+my $failures = 0;
+
+my $duration = $clArgs->get('duration');
+if ($duration < 0) {
+  printf STDERR "$msgp ERROR, minimum duration is 0, you specified %d\n", $duration;
+  exit(1);
+}
+
+my $of = \*STDOUT;
+my $ocsv = $clArgs->get('csv');
+if (defined $ocsv) {
+  my $swvers = &getSwVers();
+  $ocsv = sprintf "%s_%s_%s_%s.csv", $hwm, $sn,
+    (defined $swvers &&
+     exists $swvers->{BuildVersion} &&
+     defined $swvers->{BuildVersion} ? join('_', $swvers->{BuildVersion}, $program) : $program),
+       &epoch2canonical(time)
+	 if ($ocsv =~ m<serialnumber> || $ocsv =~ m<serialno>);
+  unless (open($of, ">$ocsv")) {
+    printf STDERR "$msgp ERROR, failed to open filed '%s' for write:  $!\n", $ocsv;
+    exit(1);
+  }
+}
+
+my @t = qw(Pass/Fail Status Duration);
+my @h = ('Iteration', 'Start Time');
+for my $cmdsuffix (&RESET_OSCAR) {
+  $cmdsuffix =~ s<\s*2\>\&1><>;
+  push(@h, map { sprintf "%s %s", ucfirst($cmdsuffix), $_ } @t);
+}
+
+if ($clArgs->get('cc')) {
+  my $ioccResults = &ioClassCount();
+  push(@h, @{$sortedCCKeys});
+}
+
+printf $of "%s\n", join(',', @h);
+
+for my $iteration (1..$clArgs->get('cycles')) {
+  my $startTime = &getTsUs();
+  my $status = &resetOscar($iteration, $of);
+  $failures++ unless $status == 1;
+  my $endTime = &getTsUs();
+  my $elapsedTime = $endTime - $startTime;
+  my $sleepTime = $clArgs->get('duration') - $elapsedTime;
+  $sleepTime = $sleepTime < 0 ? 0 : POSIX::floor($sleepTime);
+  printf STDERR "Sleeping %d seconds:  duration:  %s, elapsedTime %s\n", $sleepTime,
+    $clArgs->get('duration'), $elapsedTime
+      if $debug || $verbose;
+  sleep($sleepTime)
+    if $iteration < $clArgs->get('cycles') &&
+      $sleepTime > 0;
+}
+
+close($of)
+  if defined $ocsv;
+
+printf STDERR "%d failures out of %d cycles\n", $failures, $clArgs->get('cycles');
+
+1;

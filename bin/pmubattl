@@ -1,0 +1,2607 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use constant PERL5LIB => ('/var/root/Packages', '/AppleInternal/Library/PerlModules');
+use constant DEFAULTPATH => '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/Developer/usr/bin';
+use constant MAX_ITERATIONS => 3;
+use constant VERSION => 'deviceval-2.10.2';
+
+BEGIN {
+  if (exists $ENV{PERL5LIB} && defined $ENV{PERL5LIB}) {
+    for my $thing (&PERL5LIB) {
+      my @matches = grep { $thing eq $_ } split(/:/, $ENV{PERL5LIB});
+      unless (scalar(@matches) > 0) {
+	$ENV{PERL5LIB} .= ':' . $thing;
+	push(@INC, $thing);
+      }
+    }
+  } else {
+    $ENV{PERL5LIB} = join(':', &PERL5LIB);
+    push(@INC, &PERL5LIB);
+  }
+  if (exists $ENV{PATH} && defined $ENV{PATH}) {
+    my @path = split(/:/, $ENV{PATH});
+    for my $thing (split(/:/, &DEFAULTPATH)) {
+      push(@path, $thing) unless grep { $thing eq $_ } @path;
+    }
+    $ENV{PATH} = join(':', @path);
+  } else {
+    $ENV{PATH} = &DEFAULTPATH;
+  }
+}
+
+use POSIX;
+use Time::Local;
+
+use ClArgs;
+use ClArgsCb qw(Scalar Aref Bool);
+use Execer qw(execer);
+use Utils qw(rnd lockdownGet);
+use SpawnMon;
+use MotionSensors;
+use StressRack qw(TestStatusMessage);
+use File::Copy qw(cp copy mv move);
+
+use constant CMD_RETRY => 5;		# how many times to try a command before giving up
+
+use constant DEFAULT_SN => 'PlaceHolder';
+
+use constant PS_AUXWW => 'ps auxww';
+use constant SETBATT_ON => 'setbatt on';
+use constant SETBATT_RAW => 'setbatt raw';
+use constant SETBATT_LOGFILE => '/var/root/setbatt-drain-log.txt';
+use constant HDQTOOL => 'hdqtool -d';
+use constant POWERLOG => 'powerlog -Bq';
+
+use constant PLIST_FILE => '/private/var/tmp/com.apple.pmubattl_mobile.plist';
+use constant SYS_PLIST_FILE => '/System/Library/LaunchDaemons/com.apple.pmubattl.plist';
+use constant SCHEDULEWAKE => 'pmset schedule wakeorpoweron';
+use constant SHUTDOWN => 'halt';
+use constant REQUIRED_BOOT_ARGS => qw(amfi_allow_any_signature=1
+				      amfi_unrestrict_task_for_pid=1
+				      amfi_get_out_of_my_way=1
+				      cs_enforcement_disable=1);
+
+use constant HDQT => qw(DataLogIndex
+			Temperature Voltage Flags NominalAvailableCapacity FullAvailableCapacity RemainingCapacity
+			FullChargeCapacity AverageCurrent TimeToEmpty TimeToFull PresentDOD
+			Internal_Temp Qmax AveragePower OCV_Current OCV_Voltage
+			CycleCount StateOfCharge RemCapOverUnder DODatEOC TrueRemainingCapacity PassedCharge
+			DOD0 Qstart DesignCapacity IMAX NCC Status DeviceType FWVersion HWVersion ChemID);
+
+# exit error codes and meanings
+
+use constant NO_SERIAL_NUMBER => 70;
+use constant NO_HARDWARE_MODEL => 71;
+use constant NO_USER => 72;
+use constant UNRECOGNIZED_USER => 73;
+use constant MUST_BE_RUN_AS_ROOT => 74;
+use constant FAILED_TO_REMOVE_COOKIE => 75;
+use constant CANNOT_OPEN_PLIST => 76;
+use constant ILLEGAL_DRAINTO => 77;
+use constant CANNOT_OPEN_SYS_PLIST => 78;
+use constant ILLEGAL_DRAIN_CHARGE_COMBO => 79;
+use constant CHARGETO_OUT_OF_RANGE => 80;
+use constant FAILED_TO_OPEN_FILE => 81;
+use constant FAILED_TO_GET_MOBILE_STATUS => 82;
+use constant UNRECOGNIZED_CMD_LINE_TOKENS => 83;
+use constant MUST_BE_RUN_AS_MOBILE => 84;
+use constant UNRECOGNIZED_PLATFORM => 85;
+use constant FAILURE_WHILE_DRAINING => 86;
+use constant LAUNCH_AS_MOBILE_FAILED => 87;
+use constant MULTIPLE_INSTANCES_OF_ME => 88;
+use constant MISSING_REQUIRED_BOOT_ARGS => 89;
+
+use constant SENSORS => qw(accel compass gyro);
+use constant AXES => qw(X Y Z);
+use constant SENSOR_SAMPLE_DURATION => 7;
+
+use constant BATTERYTRAP_REBOOT_STATEOFCHARGE => 3;
+use constant DEFAULT_CHARGE_DISPLAY_LEVEL => 0.10;
+use constant DEFAULT_BRIGHTNESS => 0.50;
+
+# Curved battery capacity (UI-only)
+# notifyutil -g com.apple.springboard.curvedBatteryCapacity
+
+# Global declarations and command-line parsing.
+# Real code lies below subroutine definitions.
+# ---------------------------------------------
+my ($pPath, $program) = $0 =~ m<^(.*/|)(.*),?(.*)$>;
+my $msgp = __PACKAGE__ . "::$program:";
+
+# for logging to console
+my $TimeStamp = time;
+my $vBatt = 0;
+
+my $clArgs = ClArgs->new(Verbose => 0);
+my ($debug, $verbose) = (0, 0);
+my $iteration = 0;
+my $obj;			# this is the abstract device object
+my %errHash = ();
+my %setbright = ( Min => 0.0,		# or 0
+		  Nom => 0.5,		# or 255
+		  Max => 1.0,		# or 511
+		);
+my @drainPIDs = ( );
+my @loggingPIDs = ( );
+my $setbattDrainPID;
+my @stackedValues = ();
+
+my %chargerMap = (2 => {Name => 'B1',
+			Current => 1000,
+		       },
+		  4 => {Name => 'B9',
+			Current => 2100,
+		       },
+		  5 => {Name => 'B45',
+			Current => 2400,
+		       },
+		 );
+
+my %thermhidMap = ('voltages' => 'v',
+		   'currents' => 'i',
+		   'thermistors' => 't',
+		  );
+my $thermhidData = { };
+#my $thermhidExtras = { currents => { 'thermhid -ti: IPAg  PMU ich_avg' => 0, }, };
+my $thermhidExtras = { };
+
+my $stats = { 'accel' => { },
+	      'compass' => {  },
+	      'gyro' => { },
+	      'Passes' => 0,
+	    };
+my $logfile = { };
+my $oscarResets = 0;
+my %intervalMap;
+my @sensorTesterColumns = ();
+my @sensors = ();
+
+#***************************************************************************
+#
+#   Subroutine : stackdump
+#       Author : Neil O'Sullivan
+#         Date : 06 Dec 2011
+#
+#  Description : Dumps stack.
+#
+#***************************************************************************
+
+sub stackdump {
+  my $mp = __PACKAGE__ . '::' . 'stackdump: ';
+
+  my $i = 1;		# 1 -> skip current frame (this subroutine)
+  my @frames = ( );
+
+  while (my ($package, $filename, $line, $subroutine, $hasargs, $wantarray,
+	     $evaltext, $is_require, $hints, $bitmask) = caller($i++)) {
+    push(@frames, sprintf "%s %s%s%s line %5d", $filename, $package, '::', $subroutine, $line);
+  }
+  $i = 1;
+  while (scalar(@frames)) {
+    printf STDOUT "    $mp %3d. %s\n", $i++, pop(@frames);
+  }
+  return;
+}
+
+#***************************************************************************
+#
+#   Subroutine : logger
+#       Author : Neil O'Sullivan
+#         Date : 03 Aug 2012
+#
+#  Description : Invokes logger to write to system log.
+#
+#***************************************************************************
+
+sub logger {
+  my $string = join(" ", 'syslog -s -l n', shift @_);
+  chomp($string);
+  if (open(LOGCMD, "$string 2>&1 |")) {
+    while (<LOGCMD>) {
+      ;
+    }
+    if (!close(LOGCMD)) {
+	print STDERR "ERROR:  command '$string' returned bad status:  $!/$?\n";
+    }
+  } else {
+    print STDERR "ERROR:  command '$string' failed:  $!\n";
+    # failure to log not fatal, just continue
+  }
+  return 0;
+}
+
+#***************************************************************************
+#
+#   Subroutine : printUsage
+#       Author : Neil O'Sullivan
+#         Date : 25 Feb 2011
+#
+#  Description : Usage function.
+#
+#***************************************************************************
+
+sub printUsage {
+  my ($exitCode) = @_;
+
+  print <<ENDSHERE;
+
+$program <args> [-h | -help |-h]
+
+where <args> are any combination of:
+
+        -drainto <number>
+          If specified, sets the battery percentage to drain to prior to beginning test.
+          Default is not set, so if none provided, no drain cycle will be done.  Any value
+	  specified which is less than 3 will be assumed to be 0 (i.e., discharge to
+	  battery trap).
+
+	-chargeto <number>
+	  The battery percentage to charge to after a discharge cycle.  Defaults to 100%.  If
+	  -drainto and -chargeto are both specified, the -drainto value must be less than the
+	  -chargeto value.
+
+	-chargecmd '<command-line>'
+	  This specifies a command-line to emit to the shell after turning around from discharging
+	  to charging.  There is no default, and if multiple commands are necessary, they can either
+	  be ganged in a quoted string and separated by semicolons, or multiple -chargecmd's may be
+	  specified on the command-line, e.g., -chargecmd 'ls' -chargecmd 'pwd'.
+
+	-tcycle <number>
+	  If specified, sets the number of seconds to sleep between each test iteration,
+          default is 15 seconds.
+
+        -lcycle <number>
+          If specified, sets the number of seconds between each csv update, default is
+          60 seconds.
+
+	-cycles <number>
+	  If specified, sets the number of times to cycle through the drain/charge cycle;
+	  defaults to 1.  If set to < 1 no cycles will be run.
+
+	-haltFor <minutes> | -hf <minutes> | -h4 <minutes>
+	  Indicates the number of minutes for which the device must be shut down after reaching the
+	  minimum state of charge, after which the unit will boot and continue with the charging phase.
+	  The default is 0 which means do not shutdown between discharge/charge cycles.  Similarly, if
+	  a value of 0 is specified, there will be no shutdown.  It is recommended that a minimum of at
+	  least 3 minutes be specified so that the device does not miss the wake-up call before it is
+	  able to completely shut down.
+
+	-delay <seconds>
+	  delays the start of the code for <seconds> seconds, giving the user a chance to disconnect
+	  from tethering cable and connect to B141 and a charger.  Default is '-delay 0' (no delay).
+
+	-[no]cpuvirus
+	-[no]gpuvirus
+	  Indicates whether to run a CPU virus and/or GPU virus during battery discharge.  The default
+	  is -cpuvirus and -gpuvirus; to turn one of them off, use -nocpuvirus or -nogpuvirus.
+
+	-[no]powerlog | -nopl
+	  Indicates whether to include results from 'powerlog -Bq' (we record current as reported
+	  by battery).  Default is -powerlog.
+
+	-[no]t | -[no]thermistors
+	-[no]i | -[no]currents
+	-[no]v | -[no]voltages
+	  Indicates whether to include thermhid-derived thermistor, current and/or voltage data in
+	  the resultant csv.  The default for each is to be OFF:  -not, -noi, -nov.
+
+	-[no]ignoreBootArgs
+	  By default, we check for certain boot-args being set to enable us to be launched at boot.
+	  If you wish to skip that check, use -ignoreBootArgs; default is -noignoreBootArgs.
+
+	-[no]wireless | -now
+	  By default, wireless is left in its current/default state.  If the unit goes into
+	  battery trap while discharging, wireless will be in whatever default state is has
+	  after booting unless -nowireless (or -now) is specified, in which case wireless
+	  will be turned off after charging starts.
+
+	-[no]sensors
+	  specifies whether or not to do sensor statatistics logging each cycle.  The default is
+	  -nosensors, so if you want sensor statistics logged to the csv, use -sensors.
+
+	-ai <accelInterval>
+	  specifies the accel sensor sample interval, defaults to 0.005 seconds (200Hz).
+	  Only matters if -sensors specified above.
+
+	-ci <compassInterval>
+	  specifies the compass sensor sample interval, defaults to 0.01 seconds (100Hz).
+	  Only matters if -sensors specified above.
+
+	-gi <gyroInterval>
+	  specifies the gyro sensor sample interval, defaults to 0.005 seconds (200Hz).
+	  Only matters if -sensors specified above.
+
+        -[no]clearlogs | -[no]cl
+          If -clearlogs or -cl is specified, any previously created log files are removed
+          before logging is started.  This is the default.  If -noclearlogs or -nocl is
+          specified, then any existing log files will be added to.
+
+        -[no]spew
+          If -nospew specified, terminal output is redirected to the unit's log file,
+          otherwise it's written periodically to STDERR.
+
+	-processLog </path/to/processLog.log>
+	  If specified, causes a log of the process table periodically (set by -logInterval) to
+	  /path/to/processLog.log.  If not specified, no process logging is done.
+
+	-logInterval <seconds>
+	  specifies the process log interval.  By default this is 300 seconds (5 minutes).  To
+	  cause it to log the process table every minute, use '-logInterval 60'.
+	
+	-[no]wakeup (enabled by default)
+	  Tells pmubattl whether or not to intervene and wake itself back up.  This should be
+	  turned off when $program is managed by another app such as the NonUI Sequencer App.
+
+	-ignoreDisplay
+	  Tells pmubattl whether or not to shut off the display.  If enabled, it instead just
+	  adjusts the brightness to a low level and leaves the display on.  This should be
+	  enabled when $program is run by another app that is using the display with a GUI.
+
+$program Creates a csv file gas gauge/battery voltage readings, PMU voltage readings (VBAT)
+and charge current.  It stops logging when the battery reaches full charge (charge current
+is zero).
+
+ENDSHERE
+  exit($exitCode);
+}
+
+#***************************************************************************
+#
+#   Subroutine : registerOpts
+#       Author : Neil O'Sullivan
+#         Date : 24 Jan 2011
+#
+#  Description : register command-line options with callbacks
+#
+#***************************************************************************
+
+sub registerOpts {
+  my $clargs = shift;
+
+  for(['usage',		undef,	[qw(-h -help)],		sub { printUsage(0); }	],
+      ['tcycle',	   15,	[qw(-tcycle -tc)],	\&Scalar		],
+      ['lcycle',	   60,	[qw(-lcycle -lc)],	\&Scalar		],
+      ['drainto',       undef,  [qw(-drainto -dt)],     \&Scalar		],
+      ['chargeto',        100,  [qw(-chargeto -ct)],    \&Scalar		],
+      ['socfuzz',           4,  [qw(-socfuzz)],         \&Scalar		],
+      ['chargecmd',	undef,	['-chargecmd'],		\&Aref			],
+      ['wireless',	    1,	[qw(-now -nowireless
+				    -wireless -w)],	\&Bool			],
+      ['powerlog',	    1,	[qw(-powerlog -nopowerlog
+				    -pl -nopl)],	\&Bool			],
+      ['clearlogs',         1,  [qw(-clearlogs -cl
+				    -noclearlogs
+				    -nocl)],            \&Bool                  ],
+      ['delay',		    0,	['-delay'],		\&Scalar		],
+      ['spew',              1,  [qw(-spew -nospew)],    \&Bool                  ],
+      ['wakeup',      1,  [qw(-wakeup -nowakeup)],            \&Bool                  ],
+      ['cycles',	    1,  ['-cycles'],		\&Scalar		],
+      ['haltFor',           0,  [qw(-haltFor
+				    -hF -hf -h4)],      \&Scalar		],
+      ['cpuvirus',	    1,	[qw(-nocpuvirus
+				    -cpuvirus)],	\&Scalar		],
+      ['gpuvirus',	    1,	[qw(-nogpuvirus
+				    -gpuvirus)],	\&Scalar		],
+      ['mobile',	undef,	['-mobile'],		\&Scalar		],
+      ['root',		    1,	[qw(-root -noroot)],	\&Bool			],
+      ['ignoreDisplay',	0,	[qw(-ignoreDisplay)],	\&Bool			],
+      ['ignoreBootArgs',    0,	[qw(-noignoreBootArgs
+				    -ignoreBootArgs)],	\&Bool			],
+      ['atboot',	    0,	[qw(-atboot
+				    -noatboot)],	\&Bool			],
+      ['processLog',	undef,	['-processLog'],	\&Scalar		],
+      ['logInterval',	  300,	['-logInterval'],	\&Scalar		],
+      ['sensors',	    0,	[qw(-nosensors
+				    -sensors)],		\&Bool			],
+      ['thermistors',	    0,	[qw(-not -nothermistors
+				    -t -thermistors)],	\&Bool			],
+      ['currents',	    0,	[qw(-noi -nocurrents
+				    -i -currents)],	\&Bool			],
+      ['voltages',	    0,	[qw(-nov -novoltages
+				    -v -voltages)],	\&Bool			],
+      ['ai',	        0.005,	['-ai'],		\&Scalar		],
+      ['ci',	        0.010,	['-ci'],		\&Scalar		],
+      ['gi',	        0.005,	['-gi'],		\&Scalar		],
+      ['debug',		    0,	['-debug'],		sub {$debug = 1;}	],
+      ['HWTest',	    0,	['-HWTest'],	        \&Bool			],
+      ['csvpath',	undef,  ['-csvpath'],		\&Scalar		],
+      ['logpath',	undef,  ['-logpath'],		\&Scalar		],
+      ['verbose',	    0,	['-verbose'],		sub {$verbose = 1;}	],
+      ['version',	0,	['-version'],		sub {printf "%s\n", &VERSION; exit(0);}],
+     ) {
+    $clargs->add(@{$_});
+  }
+  1;
+}
+
+#***************************************************************************
+#
+#   Subroutine : pmsetCanonicalTime (original in sleepwake)
+#       Author : Neil O'Sullivan
+#         Date : 20 Jun 2011
+#
+#  Description : Creates a canonical time string to feed to 'pmset schedule wake'
+#                which requires some monkeying with date/time values.  It is
+#                assumed the timeval passed in is in seconds from the epoch and
+#                includes the sleep time added in, in seconds.
+#
+#                Returns canonical time in string form.
+#
+#***************************************************************************
+
+sub pmsetCanonicalTime {
+  my ($timeval) = @_;
+
+  my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime($timeval);
+
+  my $last2yearDigits = join('', (split('', "$year"))[-2..-1]);
+  return sprintf "%02d/%02d/%02d %02d:%02d:%02d", $mon+1, $mday, $last2yearDigits, $hour, $min, $sec;
+}
+
+#***************************************************************************
+#
+#   Subroutine : logIt
+#       Author : Neil O'Sullivan
+#         Date : 20 Jan 2011
+#
+#  Description : Logs a message to the log file.
+#
+#***************************************************************************
+
+sub logIt {
+  my ($file, $msg) = (@_);
+
+  my $fh;
+  my $opened = 0;
+
+  if ((defined $file) && open($fh, ">>$file")) {
+    $opened = 1;
+  } else {
+    $fh = \* STDERR;
+  }
+
+  my $ts = sprintf "%s", scalar localtime;
+  $_ = $msg;
+  $msg .= "\n" unless tr/\n//;
+  print $fh "$ts $msg";
+  close($fh) if $opened;
+
+  return 1;
+}
+
+#***************************************************************************
+#
+#   Subroutine : logErr
+#       Author : Neil O'Sullivan
+#         Date : 26 Feb 2011
+#
+#  Description : Logs an error message to the log file (if it hasn't already seen it).
+#
+#***************************************************************************
+
+sub logErr {
+  my ($file, $msg) = (@_);
+
+  my $fh;
+  my $opened = 0;
+
+  if (exists $errHash{"$msg"} &&
+      defined $errHash{"$msg"}) {
+    $errHash{"$msg"}++;
+    return;
+  }
+  $errHash{"$msg"} = 1;
+
+  return(&logIt((ref($file) =~ m<hash>i ? $file->{LogFile} : $file), $msg));
+}
+
+#***************************************************************************
+#
+#   Subroutine : runCmd
+#       Author : Neil O'Sullivan
+#         Date : 25 Feb 2011
+#
+#  Description : Runs a command on a device.
+#
+#                Returns status and array ref of output lines.
+#
+#***************************************************************************
+
+sub runCmd {
+  my ($devh, $sn, $cmd, $timeout, $promptre) = (@_);
+
+  my $mp = __PACKAGE__ . '::runCmd: ';
+
+  my @lines = ( );
+
+  my $status = &execer($cmd,
+		       sub {
+			 my ($lineNo, $line) = (@_);
+			 print STDERR $line if $debug;
+			 push(@lines, $line);
+			 return 0;
+		       });
+
+  printf STDERR "$mp:  $cmd ---> %d\n", $status
+    if $debug;
+
+  return (($status == 1 ? 0 : 1), [ @lines ]);
+}
+
+#***************************************************************************
+#
+#   Subroutine : launchSensorTesters
+#       Author : Neil O'Sullivan
+#         Date : 18 Feb 2013
+#
+#  Description : Launches accel/compass/gyroTester apps in the background
+#                for 10 seconds.
+#
+#                Returns array of PIDs (or empty array in case of error).
+#
+#***************************************************************************
+
+sub launchSensorTesters {
+  my ($devh, $sn) = (@_);
+  my @spids = ( );
+
+  my @sensors = grep { $_ =~ m<accel|compass|gyro> } keys %{$obj->{SensorMap}};
+  # first kill any <sensor>Tester application that might be running
+  # ---------------------------------------------------------------
+
+  my $regex = sprintf "(?:%s)Tester", join('|', @sensors);
+  $regex = qr<$regex>;
+  my ($killed, $status);
+
+  for my $ii (1..2) {		# take 2 stabs at killing any running sensor Tester appilcation
+    $killed = 0;
+    $status = &Execer::execer('ps auxww',
+			      sub {
+				my ($lineNo, $line) = (@_);
+				if ($line =~ $regex &&
+				    $line =~ m<root\s+(\d+)\s+.*>) {
+				  my $pid = $1;
+				  kill 9 => $pid;
+				  $killed = 1;
+				  printf STDERR "$msgp ERROR, found pid %s, killing\n%s", $pid, $line;
+				}
+				return 0;
+			      });
+    last unless $killed;
+  }
+
+  for my $sensor (@sensors) {
+
+    unlink($logfile->{$sensor})		# remove log file if it already exists
+      if -f $logfile->{$sensor};
+
+    my $dur = &SENSOR_SAMPLE_DURATION;
+
+    my $smo = SpawnMon->new(Command => sprintf("%sTester", $sensor),
+			    CommandOptions => ['-interval', $intervalMap{$sensor}],
+			    Duration => $dur,
+			    LogFile => $logfile->{$sensor},
+			    Annotator => \&Utils::getTsMsString,
+			    Debug => 0);
+    push(@spids, $smo->{PID})
+      if defined $smo;
+  }
+  return (@spids);
+}
+
+sub sensorTesterColumns {
+  my @h = ('Pass/Fail', 'Oscar Resets');
+  for my $sensor (@sensors) {
+    my $snsr = ucfirst $sensor;
+    push(@h, sprintf("%s Readings", $snsr),
+	 (map { sprintf "%s Interval %s", $snsr, $_ } qw(Max Mean Sigma)),
+	 map { sprintf "%s %s Sigma", $snsr, $_ } &AXES);
+  }
+  return @h;
+}
+
+sub defaultSensorTesterRow {
+  my @sensorStuff = ( );
+  for my $sensor (@sensors) {
+    push(@sensorStuff,
+	 0,		# <sensor> readings
+	 0, 0, 0,	# <sensor> Interval Max|Mean|Sigma,
+	 0, 0, 0,	# <sensor> X|Y|Z Sigma
+	);
+  }
+  return ['NoData', $oscarResets, @sensorStuff];
+}
+
+sub getSensorTesterRow {
+  my ($iteration, $stats) = (@_);
+
+  my @results = ($stats->{$iteration}->{Status} ? 'Pass' : 'Fail', $oscarResets);
+  for my $sensor (@sensors) {
+    push(@results, $stats->{$iteration}->{$sensor}->{Lines});
+    push(@results, map { $stats->{$iteration}->{$sensor}->{Stats}->{Interval}->{$_} } qw(Max Mean Sigma));
+    push(@results, map { $stats->{$iteration}->{$sensor}->{Stats}->{$_}->{Sigma} } &AXES);
+  }
+  return [@results];
+}
+
+sub getSensorStats {
+  my ($devh, $sn, $spids) = (@_);
+
+  my $mp = __PACKAGE__ . '::getSensorStats: ';
+
+  for my $pid (@{$spids}) {
+    printf STDERR "Waiting on PID %d\n", $pid
+      if $debug || $verbose;
+    waitpid($pid, 0);
+  }
+
+  my $status = &MotionSensors::updateStats($stats, $iteration, $logfile, $oscarResets, \%intervalMap,
+					   $clArgs, $obj, [ @sensors ], 0, 5);
+  if ((! $status) &&
+      exists $obj->{PMU} &&
+      defined $obj->{PMU} &&
+      $obj->{PMU} !~ m<Adriana>) {
+    my $status = &MotionSensors::resetOscar();
+    printf STDERR "$mp ERROR, resetOscar returned bad status %d\n", $status
+      unless $status;
+    $oscarResets++;
+  }
+
+  my @r = (($stats->{$iteration}->{Status} ? 'Pass' : 'Fail'), $oscarResets);
+  for my $sensor (@sensors) {
+    push(@r, $stats->{$iteration}->{$sensor}->{Lines});
+    push(@r, map { $stats->{$iteration}->{$sensor}->{Stats}->{Interval}->{$_} } qw(Max Mean Sigma));
+    push(@r, map { $stats->{$iteration}->{$sensor}->{Stats}->{$_}->{Sigma} } &AXES);
+  }
+  return [@r];
+}
+
+sub setBrightness {
+  my ($level) = (@_);
+  
+  my $mp = __PACKAGE__ . '::setBrightness: ';
+
+  my $status = &execer("setbright $level",
+            sub {
+                  my ($lineNo, $line) = (@_);
+                  print $line;
+                  return 0;
+                });
+
+  return $status;
+}
+
+sub verifyBacklightOff {
+  my $mp = __PACKAGE__ . '::verifyBacklightOff: ';
+
+  my %sb;
+
+  my $status = &execer('setbright',
+		       sub {
+			 my ($lineNo, $line) = (@_);
+			 if ($line =~ m<^Current\:\s+(\d+\.?\d*)\s+\[(\d+\.?\d*),\s+(\d+\.?\d*)\]\s*$>) {
+			   ($sb{Min}, $sb{Max}, $sb{Nom}) = ($1, $2, $3);
+			   $sb{Nom} = &rnd($sb{Min} =~ m<^\d+\.\d*> ? 100 : 1, $sb{Max} / 2);
+			 }
+			 return 0;
+		       });
+
+  if (exists $sb{Nom} && defined $sb{Nom} && $sb{Nom} != 0) {
+    $status = &execer('powerswitch lcd off ; setbright 0.0',
+		      sub {
+			my ($lineNo, $line) = (@_);
+			print $line;
+			return 0;
+		      });
+  }
+  return 1;
+}
+
+# Let's rewrite this bloody function and get it right
+# ---------------------------------------------------
+
+sub getSetbattRaw {
+  my ($devh, $sn, $charging) = (@_);
+
+  my $mp = __PACKAGE__ . '::getSetbattRaw: ';
+  my $pmumv;
+
+  my $ii = 0;
+  while (++$ii) {
+    undef $pmumv;
+    my $status = &execer(&SETBATT_RAW,
+			 sub {
+			   my ($lineNo, $line) = (@_);
+			   $pmumv = $1
+			     if $line =~ m<raw\s+battery\s+voltage\:\s+(\d+)\s+mV>;
+			   return 0;
+			 });
+    &logErr($devh->{$sn}->{LogFile},
+	    sprintf("$mp ERROR, command '%s' returned bad status '%d'\n", &SETBATT_RAW, $status))
+      unless $status == 1;
+		    
+    # bounce on success OR we're discharging and exceeded our failure cap
+    last if ($status && defined $pmumv) || ($ii > &CMD_RETRY && (! $charging));
+  }
+  return defined $pmumv ? $pmumv : 0;
+}
+
+sub getHDQTool {
+  my ($devh, $sn, $charging) = (@_);
+  my $mp = __PACKAGE__ . '::getHDQTool: ';
+
+  my %hdqh;
+
+  my $ii = 0;
+  while (++$ii) {
+    %hdqh = map { $_ => 0 } (&HDQT);
+    $hdqh{StateOfCharge} = -1;
+    
+    my $status = &execer(&HDQTOOL,
+			 sub {
+			   my ($lineNo, $line, $hdqh) = @_;
+			   $hdqh->{$2} = $1
+			     if $line =~ m<^0x[0-9a-f]+\:\s+0x[0-9a-f]+,\s+([\+\-]?\d+)\s+(\S+)>;
+			   return 0;
+			 }, \%hdqh);
+    &logErr($devh->{$sn}->{LogFile},
+	    sprintf("$mp ERROR, command '%s' returned bad status '%d'\n", &HDQTOOL, $status))
+      unless $status == 1;
+
+    # Flags == -1 usually means a failed hdqtool read
+    # bounce on success OR we're discharging and exceeded our failure cap
+    last if ($status && $hdqh{Flags} + 0 != -1) || ($ii > &CMD_RETRY && (! $charging));
+  }
+  return \%hdqh;
+}
+
+sub verifySetbattDrainRunning {
+  my $mp = __PACKAGE__ . '::verifySetbattDrainRunning: ';
+
+  printf STDERR "$mp setbatt drain PID is '%s'\n", defined $setbattDrainPID ? $setbattDrainPID : 'undef';
+
+  return 0 unless defined $setbattDrainPID;
+
+  my $value = kill 0 => $setbattDrainPID;
+  printf STDERR "$mp 'kill 0, %d' produced result %d\n", $setbattDrainPID, $value
+    if $debug;
+
+  if ($value) {
+    my $state;
+    my $status = &Execer::execer(sprintf("ps -vw -p %d", $setbattDrainPID),
+				 sub {
+				   my ($lineNo, $line) = (@_);
+				   return 0
+				     if $line =~ m<^\s*PID>;
+				   chomp $line;
+				   $line =~ s<^\s*><>;
+				   my @fields = split(/\s+/, $line);
+				   if ($debug) {
+				     for my $i (0..1) {
+				       printf STDERR "$mp fields[%d] = '%s'\n", $i,
+					 defined $fields[$i] ? $fields[$i] : 'undef';
+				     }
+				     if (defined $fields[0]) {
+				       printf STDERR "$mp fields[0] is defined:  '%s'\n", $fields[0];
+				       if ($fields[0] =~ m<^\d+>) {
+					 printf STDERR "$mp fields[0] is numeric:  %d\n", $fields[0];
+					 if ($fields[0] == $setbattDrainPID) {
+					   printf STDERR "$mp fields[0] matches setbattDrainPID\n";
+					   if (defined $fields[1]) {
+					     printf STDERR "$mp fields[1] is defined:  '%s'\n", $fields[1];
+					   } else {
+					     printf STDERR "$mp fields[1] is UNDEFINED\n";
+					   }
+					 } else {
+					   printf STDERR "$mp fields[0] (%s) does NOT match setbattDrainPID (%d)\n",
+					     $fields[0], $setbattDrainPID;
+					 }
+				       } else {
+					 printf STDERR "$mp fields[0] is NOT numeric\n";
+				       }
+				     } else {
+				       printf STDERR "$mp fields[0] is UNDEFINED\n";
+				     }
+				   }
+				   $state = $fields[1]
+				     if defined $fields[0] &&
+				       $fields[0] =~ m<^\d+$> &&
+					 $fields[0] == $setbattDrainPID &&
+					   defined $fields[1];
+				   printf STDERR "$mp state is '%s'\n", defined $state ? $state : 'undef'
+				     if $debug;
+				   return 0;
+				 });
+    return 1 if defined $state && $state ne 'Z';
+  }
+
+  printf STDERR "$mp ERROR, 'setbatt drain' pid %d is zombied; reaping\n", $setbattDrainPID;
+  kill 9 => -$setbattDrainPID;
+  waitpid($setbattDrainPID, 0);
+  printf STDOUT "$mp drainPIDs before:  %s,  drainPIDs after:  ", join(',', @drainPIDs)
+    if $debug;
+  @drainPIDs = grep { $_ != $setbattDrainPID } @drainPIDs;
+  printf STDOUT "%s\n", join(',', @drainPIDs)
+    if $debug;
+
+  printf STDERR "$mp ERROR, relaunching 'setbatt drain'\n";
+  my ($status, $cmdlines) = &execTestCmd(qw(On DrainBattery));
+
+  printf STDERR "$mp setbatt drain PID is '%s'\n", defined $setbattDrainPID ? $setbattDrainPID : 'undef';
+  return $status;
+}
+
+#***************************************************************************
+#
+#   Subroutine : fetchData
+#       Author : Neil O'Sullivan
+#         Date : 25 Feb 2011
+#
+#  Description : Gathers voltage/current data while in iOS and dis/charging.
+#                charging=0 during discharge, =1 during charge.
+#                Returns status and array ref of output lines.
+#                Status:
+#                -2 Error
+#                -1 Charging timed out
+#                0  Charge complete
+#                1 Charging
+#
+#***************************************************************************
+
+sub fetchData {
+  my ($devh, $sn, $charging) = (@_);
+
+  my $mp = __PACKAGE__ . '::fetchData: ';
+
+  my $ts = timelocal(localtime);
+  my $loggingCycle = $ts >= $devh->{$sn}->{LastLogged} + $clArgs->get('lcycle') ? 1 : 0;
+
+  my @spids = ();
+  @spids = &launchSensorTesters($devh, $sn)
+    if ($clArgs->get('sensors') && $loggingCycle);
+
+  my $retStatus = 1;
+  my $goodResults = 0;
+
+  # result looks something like this:  raw battery voltage:  4162 mV
+
+  my ($status, $cmdResults);        # status and command output
+
+  # if charging, then the display/backlight should be off, but switchboard has other ideas:
+  # we check every cycle that both are off, and if not, we set them off AGAIN
+
+  unless($clArgs->get('ignoreDisplay')) {
+    &verifyBacklightOff()
+      if $charging;  
+  }
+
+  &verifySetbattDrainRunning()
+    unless $charging;
+
+  my @thermhidData = ();
+
+  for my $thing (sort { $a cmp $b } keys %{$thermhidData}) {
+    for my $stabs (1..3) {
+#      printf STDERR "$mp fetching thermid data for %s\n", $thing
+#	if $debug;	# Fix me
+      ($status, $thermhidData->{$thing}->{Current}) = &Utils::getThermhid($thermhidMap{$thing});
+      last if $status;
+    }
+    if ($status) {
+      for my $key (@{$thermhidData->{$thing}->{SortedKeys}}) {
+	if (exists $thermhidData->{$thing}->{Current}->{$key} &&
+	    defined $thermhidData->{$thing}->{Current}->{$key}) {
+	  $thermhidData->{$thing}->{Actual}->{$key} = $thermhidData->{$thing}->{Current}->{$key};
+	  printf STDERR "$mp adding thermhidData key '%s'\n", $thermhidData->{$thing}->{Current}->{$key};
+	  push(@thermhidData, $thermhidData->{$thing}->{Current}->{$key});
+	} else {
+	  $thermhidData->{$thing}->{Actual}->{$key} = 0;
+	  push(@thermhidData, 0);
+	  printf STDERR "$mp ERROR, 'thermhid -t%s' returned missing key '%s'; setting value to 0\n",
+	    $thermhidMap{$thing}, $key;
+	}
+      }
+    } else {
+      printf STDERR "$mp ERROR, 'thermhid -t%s' returned error status, setting all %s values to 0 this cycle\n",
+	$thermhidMap{$thing}, $thing;
+      push(@thermhidData, map { 0 } @{$thermhidData->{$thing}->{SortedKeys}});
+    }
+  }
+
+  my ($selfKeys, $selfValues) = $obj->pmubatLog();
+
+  my $pmumv = &getSetbattRaw($devh, $sn, $charging);
+  $status = 0 if $pmumv == 0;
+  my $cmd;
+
+  my $loops = 0;
+  my $retstat = 1;
+
+  my %hdqh = %{&getHDQTool($devh, $sn, $charging)};
+
+  my $flags = $hdqh{Flags};
+  my $battmv = $hdqh{Voltage};
+  my $avgcurr = $hdqh{AverageCurrent};
+      
+  printf STDOUT "$mp %s charging=%d, StateOfCharge=%d\n", $sn, $charging, $hdqh{StateOfCharge}
+    if $debug;
+
+  unless ($charging) {
+
+    # then we are discharging
+
+    printf STDOUT "$mp %s, state of charge = %s, flags=0x%x, $flags & 0x7 = 0x%x\n", $sn,
+      $hdqh{StateOfCharge}, $flags, ($flags & 0x7)
+	if $debug;
+
+    # kill loads (aside from screen brightness being full ON) if SOC drops below target
+    # ---------------------------------------------------------------------------------
+
+    $devh->{$sn}->{StateOfCharge} = $hdqh{StateOfCharge};
+
+    printf STDOUT "$mp %s charging=%d, StateOfCharge=%d\n", $sn, $charging, $hdqh{StateOfCharge}
+      if $debug;
+
+    if ($hdqh{StateOfCharge} <= (0 + $clArgs->get('drainto')) &&
+	$hdqh{StateOfCharge} != -1 &&		# we actually read a valid value
+	$devh->{$sn}->{KilledLoads} == 0) {
+
+      &killLoads($devh, $sn);		# we need to inspect this function carefully
+      $devh->{$sn}->{KilledLoads} = 1;
+      $charging = 1;			# and we're not discharging anymore
+    }
+
+    # reboot if at critical battery?
+    # ------------------------------
+
+    if (defined $flags &&
+	(7 == ($flags & 0x7)) &&
+	($flags + 0) != -1 &&	# it's not a bad/failed gas gauge read
+	($hdqh{StateOfCharge} + 0) < 5) { # SOC1 = 0, SOCF = 1, DSG = 1
+      # SOC1 . SOCF . DSG
+      my $msg = sprintf "%s, Flags=0x%x, last 3 bits are SOC1, SOCF, DSG, 5->7 indicates critical battery: rebooting to battery trap\n",
+	    $sn, $flags;
+      printf STDERR "$mp %s", $msg;
+      &logErr($devh->{$sn}->{LogFile}, "$mp $msg");
+
+      if ($clArgs->get('HWTest')) {
+        # log that we are rebooting so test rack scripts can ignore it
+        &TestStatusMessage({ 
+          'phase' => "Reboot",
+          'vBatt' => $pmumv,
+          'iter' => $clArgs->get('cycles'),
+          'startTime' => $TimeStamp,
+        });
+      }
+      ($status, $cmdResults) = &runCmd($devh, $sn, 'reboot', 0);
+      exit(0);		# I think we're done here
+    }
+  }
+
+  # it looks like the things we may wish to average per logging cycle are:
+  #  pmumv, @{$selfValues}, %{$hdqh}, $clArgs->get('powerlog') ? $devh->{$sn}->{Current} : ''
+
+  {
+    # selfValues come from the platform object; we assume they are numeric and can be averaged
+
+    my @values = ($pmumv, @{$selfValues}, map { $hdqh{$_} } (&HDQT));
+    push(@values, exists $devh->{$sn}->{Current} &&
+	 defined $devh->{$sn}->{Current} ? $devh->{$sn}->{Current} : 0)
+      if $clArgs->get('powerlog');
+    push(@stackedValues, [ @values ]);
+    printf STDERR "$mp pushing %d items into stackedValues:  %s\n", scalar(@values), join(',', @values)
+      if $debug;
+  }
+
+  if ($loggingCycle ||
+      ($charging &&
+       ($hdqh{StateOfCharge} == 100 ||
+	$hdqh{StateOfCharge} >= $clArgs->get('chargeto')))) {
+
+    unless ($retStatus) {
+      my $msg = sprintf "%s ERROR, command output parsing failed during a log cycle while charging=%d, returning %d\n",
+	$sn, $charging, $charging;
+      &logErr($devh->{$sn}->{LogFile}, "$mp $msg");
+      printf STDERR "$mp $msg";
+      return $charging;
+    }
+
+    # this is where we do our periodic logging to the csv file
+    # --------------------------------------------------------
+
+    my ($sec, $min, $hr, $mday, $mon, $year, $wday, $yday, $isdst) = localtime($ts);
+    my $csvts = sprintf "%04d/%02d/%02d-%02d:%02d:%02d", $year+1900, $mon+1, $mday, $hr, $min, $sec;
+
+    my $fh;
+    my $file = $devh->{$sn}->{CsvFile};
+
+    my $sdata;
+    if ($loggingCycle) {
+      if ($clArgs->get('sensors')) {
+	&getSensorStats($devh, $sn, [@spids]);
+	my $stRow = &getSensorTesterRow($iteration, $stats, $oscarResets);
+
+	printf STDERR "$mp getSensorTesterRow returned array of %s elements\n",
+	  defined $stRow ? (sprintf "%d", scalar(@{$stRow})) : 'NULL';
+
+	if ($debug) {
+	  printf STDERR "$mp sensor data:  %s\n", join(',', @{$stRow});
+	  printf STDERR "$mp thermid Data:  %s\n", join(',', @thermhidData);
+	}
+
+	$sdata = join(',', @{$stRow}, @thermhidData);
+	$iteration++;
+	printf STDERR "$mp logging cycle, sensors selected, adding %d columns of thermhid data\n", scalar(@thermhidData)
+	  if $debug;
+      } else {
+	$sdata = scalar(@thermhidData) ? join(',', @thermhidData) : '';
+	printf STDERR "$mp logging cycle, no sensors selected, adding %d columns of thermhid data\n",
+	  scalar(@thermhidData)
+	    if $debug;
+      }
+    } else {
+      # not a logging cycle, but we're logging anyway
+      $sdata = $clArgs->get('sensors') ? join(',', @{&defaultSensorTesterRow()}, @thermhidData)
+	: scalar(@thermhidData) ? join(',', @thermhidData) : '';
+      printf STDERR "$mp non-logging cycle but logging anyway, adding %d columns of thermhidData\n",
+	scalar(@thermhidData)
+	  if $debug;
+    }
+
+    $csvts = join(',', $sdata, $csvts) unless $sdata =~ m<^\s*$>;
+
+    # it looks like the things we may wish to average per logging cycle are:
+    #  pmumv, @{$selfValues}, %{$hdqh}, $clArgs->get('powerlog') ? $devh->{$sn}->{Current} : ''
+    #
+
+    if (open($fh, ">>$file")) {
+      my @avgValues = ();
+      if (scalar(@stackedValues) == 1) {
+	@avgValues = @{$stackedValues[0]};
+      } else {
+	for my $index (0..scalar(@{$stackedValues[0]})-1) {
+	  my @array = map { $stackedValues[$_]->[$index] } (0..scalar(@stackedValues)-1);
+	  my $amean = &Statistics::mean(@array);
+	  printf "$mp index %d:  values(%s), mean:  %.6lf\n", $index, join(',', @array), $amean
+	    if $debug;
+	  push(@avgValues, $amean);
+	}
+      }
+      printf STDERR "$mp stackedValues:  %s\n", join(',', @avgValues)
+	if $debug;
+
+      @stackedValues = ();
+      printf $fh "%s\n", join(',', @avgValues, $csvts);
+
+#      printf $fh "%s\n", join(',', $pmumv, @{$selfValues}, (map { $hdqh{$_} } (&HDQT)),
+#			      $clArgs->get('powerlog') ? ($devh->{$sn}->{Current}, $csvts)
+#			      : $csvts);
+      close($fh);
+
+      if ($clArgs->get('HWTest')) {
+        # log to console so we can monitor via serial port
+
+        &TestStatusMessage({ 
+          'phase' => $charging ? "charge" : "discharge",
+          'vBatt' => $pmumv,
+          'iter' => $clArgs->get('cycles'),
+          'startTime' => $TimeStamp,
+        });
+      }
+
+    } else {
+      &logErr($devh->{$sn}->{LogFile}, "$mp ERROR, $sn, failed to open '$file' for append\n");
+    }
+
+    # this also logs to STDERR:  we may want a silencer for this at invocation time: -nospew
+    # which could send those strings to the device-specific log file instead
+
+    $status = &getBattStatus($devh, $sn, 1);
+
+    $devh->{$sn}->{Logged} += 1;
+    $devh->{$sn}->{LastLogged} = $devh->{$sn}->{LastLogged} == 0 ? $ts
+      : $devh->{$sn}->{LastLogged} + $clArgs->get('lcycle');
+
+    # we're done when CHG_END is set
+    # ------------------------------
+
+    if ($charging && $hdqh{StateOfCharge} >= (100 - $clArgs->get('socfuzz'))) {
+
+#                Returns:  1, CHG_END is set, no timeout
+#			   0, CHG_END is NOT set
+#			  -1, charging timed out
+#			  -2, ERROR
+      my $status = $obj->isChargingEnded(Device => $devh, Sn => $sn);
+
+      if ($status == -2) {
+	my $msg = sprintf "$mp %s ERROR, read of PMU register STATUS_B returned bad status '%s'\n",
+	  $sn, $status;
+	print STDERR $msg;
+	&logErr($devh->{$sn}->{LogFile}, $msg);
+        $retStatus = -2;
+      } elsif ($status == -1) {
+	my $msg = sprintf "$mp %s ERROR, PMU reports charging timeout, status=%d\n", $sn, $status;
+	print STDERR $msg;
+	&logErr($devh->{$sn}->{LogFile}, $msg);
+        $retStatus = -1;
+      } elsif ($status == 1) {
+	# success
+	# full-on success!
+	$devh->{$sn}->{At100Pct} = 1;
+
+	# we're done with this device:  it's all charged up
+    #
+    # save $pmumv for final status report
+    $vBatt = $pmumv;
+
+	my $msg = sprintf "%s Charge current = %d, PMU VBAT = %.3lf V, Batt = %.3lf V", $sn, 
+	    0 + $avgcurr, $pmumv/1000, $battmv/1000;
+	&logErr($devh->{$sn}->{LogFile}, $msg);
+
+	my $cmdLines;
+
+	($status, $cmdLines) = &execTestCmd(qw(Test SetBright));
+	printf STDERR "$mp ERROR, multiple command to set display to nominal produced bad status '%d'%s\n",
+	  $status, join("\n\t", @{$cmdLines})
+	    unless ($status == 1);
+
+	my $isui = &isUI($devh, $sn);
+
+   printf STDERR "$mp The unit" . ((&isUI($devh, $sn)) ? " is " : " is not ") . "in the UI OS mode.\n";
+   
+	my @cmds = ('MaxInactivity', $isui ? qw(SpringboardSetup BackboarddSetup) : 'SwitchboardSetup');
+
+	($status, $cmdLines) = &execTestCmd('Off', @cmds);
+
+	printf STDERR "$mp ERROR, multiple commands produced bad status '%d'%s\n", $status,
+	  join("\n\t", @{$cmdLines})
+	    unless ($status == 1);
+
+	printf STDERR "$mp finishing:  $msg\n";
+
+	delete $devh->{$sn}; # this is how we tell the caller we're done
+        $retStatus = 0;
+
+        #return 0; # this is how we do it *again*:  we're having trouble enforcing termination
+      } else {
+	# does not appear to have ended charging:  charge END bit not set
+	my $msg = sprintf "%s charging at State Of Charge=%s, charge END is not set",
+	  $sn, $hdqh{StateOfCharge}; 
+	&logErr($devh->{$sn}->{LogFile}, $msg);
+        $retStatus = 1;
+      }
+    } elsif ($charging &&
+	     ($hdqh{StateOfCharge} >= $clArgs->get('chargeto'))) {
+      my $cmdLines;
+      ($status, $cmdLines) = &execTestCmd(qw(Test SetBright));
+      printf STDERR "$mp ERROR, multiple command to set display to nominal produced bad status '%d'%s\n",
+	$status, join("\n\t", @{$cmdLines})
+	  unless ($status == 1);
+
+      my $isui = &isUI($devh, $sn);
+
+      my @cmds = ('MaxInactivity', $isui ? qw(SpringboardSetup BackboarddSetup) : 'SwitchboardSetup');
+
+      ($status, $cmdLines) = &execTestCmd('Off', @cmds);
+      printf STDERR "$mp ERROR, multiple commands produced bad status '%d'%s\n", $status,
+	join("\n\t", @{$cmdLines})
+	  unless ($status == 1);
+
+      my $msg = sprintf "%s Charge current = %d, PMU VBAT = %.3lf V, Batt = %.3lf V",
+	$sn, 
+	  0 + $avgcurr, $pmumv/1000, $battmv/1000;
+      &logErr($devh->{$sn}->{LogFile}, $msg);
+      printf STDERR "$mp finishing:  $msg\n";
+
+      delete $devh->{$sn}; # this is how we tell the caller we're done
+      $retStatus = 0 ; # this is how we do it *again*:  we're having trouble enforcing termination
+    }
+  }
+  return $retStatus;
+}
+
+#***************************************************************************
+#
+#   Subroutine : isRunning, isUI, getFinderPID, checkBright:  helper functions
+#       Author : Neil O'Sullivan
+#         Date : 14 Mar 2011
+#
+#  Description : isRunning returns array ref of PIDs associated with any
+#		 string matches in the output of 'ps auxww'.
+#                Returns array ref.  Could be empty if no matches.
+#
+#		 isUI returns 1 if UI (SpringBoard), else 0.
+#
+#		 getFinderPID returns PID of Spring/SwitchBoard, depending
+#		 on value if isUI (1/0).
+#
+#                checkBright checks brightness returned by 'setbright'
+#                command with a passed-in parameter.  Returns 1 if they're
+#                the same, 0 otherwise.
+#
+#***************************************************************************
+
+sub isUI {
+  my ($devh, $sn) = (@_);
+
+  return ! (-d '/AppleInternal/Applications/SwitchBoard.app');
+}
+
+#Neils-K94-DVT:~ mobile$ setbright
+#Current: 511 [0, 511]
+
+sub checkBright {
+  my ($devh, $sn, $brite) = (@_);
+
+  my ($status, $outp) = &runCmd($devh, $sn, 'setbright', 0);
+  for (@{$outp}) {
+    if ($_ =~ m<^Current\:\s+(\d+\.?\d*)\s+\[(\d+\.?\d*),\s+(\d+\.?\d*)\]\s*$>) {
+      my ($nom, $min, $max) = ($1, $2, $3);
+      $setbright{Min} = $min;
+      $setbright{Max} = $max;
+      $setbright{Nom} = &rnd($min =~ m<^\d+\.\d*> ? 100 : 1, $max / 2);
+      return $nom == $brite ? 1 : 0;
+    }
+  }
+  return 0;
+}
+
+#***************************************************************************
+#
+#   Subroutine : setupForDraining
+#       Author : Neil O'Sullivan
+#         Date : 10 Mar 2011
+#
+#  Description : Set up unit for maximum battery draining.
+#		 Assumes you're already logged in as mobile.
+#
+#                Returns status:  1 for success, 0 otherwise.
+#
+#***************************************************************************
+
+# This applies to SpringBoard--likely DIFFERENT for SwitchBoard (no locking)
+# Unlock display, set brightness full, launch power virus/SpinningiPhoneApp
+# 1.  login as user mobile
+# 2.  interact -uiautomation YES unlock
+# 3.  setbright 511
+# 4.  do defaults
+# defaults write com.apple.springboard SBAutoLockTime -int -1
+# defaults write com.apple.springboard SBAutoDimTime -int -1
+# defaults write com.apple.springboard SBEnableALS -bool NO
+# 5.  killall HUP SpringBoard
+# 5.  /usr/local/bin/profilectl setnum maxInactivity 2147483647
+# 6.  LaunchApp com.apple.SpinningiPhoneApp
+# 7.  2x 'dotpr_s8_24 4096 0 1>/dev/null & 2>&1'
+# 8.  setbatt drain 1>/dev/null & 2>&1
+
+sub setupForDraining {
+  my ($devh, $sn) = (@_);
+  my $mp = __PACKAGE__ . '::setupForDraining: ';
+  my ($status, $outp);
+  my $uberstatus = 1;
+
+  my $isui = &isUI($devh, $sn);
+
+  printf STDERR "$mp isUI = %d\n", $isui if $debug;
+
+  if ($isui) {
+    for my $i (1..5) {
+
+      # 'interact' returns status 127 if run as root on NonUI
+
+      ($status, $outp) = &execTestCmd('Test', 'WakeDisplay'); # a la interact
+      last if grep { /true/ } @{$outp};
+      if ($i == 5) {
+	printf STDERR "$msgp ERROR, failed to get expected results from waking display (true), got:  %s\n",
+	  join("\n\t", @{$outp});
+	&killLoggers();
+	exit(1);      # if we cannot wake display, let's give up early
+      }
+    }
+    $uberstatus &= $status;
+
+    unless ($uberstatus) {
+      printf STDERR "$mp ERROR, unsuccessful status returned, exiting early\n";
+      &killLoggers();
+      exit(1);
+    }
+
+    ($status, $outp) = &execTestCmd('Test', 'UIIsPurpleBuddyRunning');	# via scripter
+    $uberstatus &= $status;
+
+    ($status, $outp) = &execTestCmd('On', 'UIForceNoBuddy')
+      if (grep { /Setup/ } @{$outp});
+    $uberstatus &= $status;
+  }
+
+  unless ($uberstatus) {
+    printf STDERR "$mp ERROR, unsuccessful status returned, exiting early\n";
+    &killLoggers();
+    exit(1);
+  }
+
+  my @cmds = ('MaxInactivity', $isui ? ('SpringboardSetup', 'BackboarddSetup') : 'SwitchboardSetup');
+  ($status, $outp) = &execTestCmd('On', @cmds);
+  $uberstatus &= $status;
+
+  unless ($uberstatus) {
+    printf STDERR "$mp ERROR, unsuccessful status returned, exiting early\n";
+    &killLoggers();
+    exit(1);
+  }
+
+  # after this, all our loads are running
+  # WakeDisplay can only be invoked in NonUI:  got this backwards?
+
+  @cmds = (($isui ? 'UIGPUVirus' :
+	    $clArgs->get('gpuvirus') ? qw(WakeDisplay NonUIGPUVirus) : ()),
+	   qw(DrainBattery SetBright), $clArgs->get('cpuvirus') ? 'CPUStim' : ());
+#  @cmds = (($isui ? ('WakeDisplay', 'UIGPUVirus') : ()),
+#	   qw(DrainBattery SetBright));
+  ($status, $outp) = &execTestCmd('On', @cmds);
+
+  $uberstatus &= $status;
+  printf STDERR "$mp returning status '%d'\n", $uberstatus;
+
+  return $uberstatus;
+}
+
+#***************************************************************************
+#
+#   Subroutine : killLoggers
+#       Author : Neil O'Sullivan
+#         Date : 27 Dec 2013
+#
+#  Description : Kill PIDs associated with any logging processes we launched.
+#
+#                Returns status:  1 for success, 0 otherwise.
+#
+#***************************************************************************
+
+sub killLoggers {
+  my $mp = __PACKAGE__ . '::killLoggers: ';
+
+  for my $pid (@loggingPIDs) {
+    printf STDERR "$mp Waiting on PID %d\n", $pid;
+    kill 9 => -$pid;
+    waitpid($pid, 0);
+  }
+  @loggingPIDs = ( );
+  return 1;
+}
+
+#***************************************************************************
+#
+#   Subroutine : killLoads
+#       Author : Neil O'Sullivan
+#         Date : 13 Dec 2011
+#
+#  Description : Reduce load on CPU/GPU as we get close to battery trap to let
+#		 things adjust before we get into charging mode.
+#
+#                Returns status:  1 for success, 0 otherwise.
+#
+#***************************************************************************
+
+sub killLoads {
+  my ($devh, $sn) = (@_);
+
+  my $mp = __PACKAGE__ . '::killLoads: ';
+  my ($status, $outp);
+
+  printf STDOUT "$mp %s post-battery drain clean-up\n", $sn;
+
+  $devh->{$sn}->{RunningSetbattDrain} = 0;
+
+  my $isui = &isUI($devh, $sn);
+
+  for my $pid (@drainPIDs) {
+    printf STDERR "$mp Waiting on PID %d\n", $pid;
+    kill 9 => -$pid;
+    waitpid($pid, 0);
+  }
+  @drainPIDs = ( );
+
+  ($status, $outp) = &execTestCmd('Off', $isui ? qw(UIGPUVirus) : qw(NonUIGPUVirus));
+  unless ($status) {
+    printf STDERR "$mp ERROR, killing loads resulted in bad status '%s'%s\n", $status,
+      join("\n\t", @{$outp});
+  }
+
+  return $status;
+}
+
+#***************************************************************************
+#
+#   Subroutine : stopDraining
+#       Author : Neil O'Sullivan
+#         Date : 10 Mar 2011
+#
+#  Description : Make sure we undo all we did in setupForDraining.
+#		 Assumes you're already logged in as mobile.
+#
+#                Returns status:  1 for success, 0 otherwise.
+#
+#***************************************************************************
+
+sub stopDraining {
+  my ($devh, $sn, @cmdsIn) = (@_);
+
+  my $mp = __PACKAGE__ . '::stopDraining: ';
+  my ($status, $outp);
+
+  printf STDOUT "$mp %s post-battery drain clean-up\n", $sn;
+
+  $devh->{$sn}->{RunningSetbattDrain} = 0;
+
+  my $isui = &isUI($devh, $sn);
+
+  my $airplaneModeOn;
+  if (exists $obj->{Funcs}->{AirplaneMode} &&
+      defined $obj->{Funcs}->{AirplaneMode} &&
+      exists $obj->{Funcs}->{AirplaneMode}->{On} &&
+      defined $obj->{Funcs}->{AirplaneMode}->{On}) {
+    $airplaneModeOn = $obj->{Funcs}->{AirplaneMode}->{On};
+  } else {
+    printf STDERR "$mp ERROR, missing object -> Funcs -> AirplaneMode -> On\n";
+    &killLoggers();
+    &killLoads($devh, $sn);
+    exit(1);
+  }
+
+  # need to kill backgrounded processes
+
+  for my $pid (@drainPIDs) {
+    printf STDERR "$mp Waiting on PID %d\n", $pid;
+    kill 9 => -$pid;
+    waitpid($pid, 0);
+  }
+  @drainPIDs = ( );
+
+  # remove the setbatt log file, if it exists (rdar://13720945 still outstanding)
+  # fix goes with rdar://16988947
+  unlink(&SETBATT_LOGFILE)
+    if -f &SETBATT_LOGFILE;
+
+  my @cmds;
+  push(@cmds, 'SetBright') unless($clArgs->get('ignoreDisplay'));
+  push(@cmds, qw(DrainBattery maxInactivity));
+  push(@cmds, 'CPUStim', $isui ? qw(SwitchboardSetup UIGPUVirus) : qw(NonUIGPUVirus));
+  push(@cmds, 'SpringboardSetup');
+  $status = &execTestCmd('Off', @cmds);
+
+  $status = &killLoads($devh, $sn);
+
+  # Confirm charger is attached
+
+  {
+    my $sta = $obj->isChargerAttached();
+    if ($sta == -1) {
+      printf STDERR "$msgp ERROR, read of PMU register STATUS_B returned bad status '%s'\n", $sta;
+      return 0;
+    }
+    printf STDOUT "$msgp %s, charger is %sattached\n", $sn, $sta == 1 ? '' : 'NOT ';
+  }
+
+  printf STDOUT "$mp %s returning status %d\n", $sn, $status;
+
+  # we should be logged in as mobile here
+  # Returns status:  1 for success, 0 otherwise.
+
+  return $status;
+}
+
+#***************************************************************************
+#
+#   Subroutine : getBattStatus
+#       Author : Neil O'Sullivan
+#         Date : 09 Mar 2011
+#
+#  Description : Runs powerlog and gathers results:
+#		 BatteryLevel, Current, BatteryTemp, ChargingState.
+#
+#                Returns status:  1 for success, 0 otherwise.
+#
+#***************************************************************************
+
+sub getBattStatus {
+  my ($devh, $sn, $printIt) = (@_);
+
+  my $mp = __PACKAGE__ . '::getBattStatus: ';
+
+  return 0 unless $clArgs->get('powerlog');
+
+  map { $devh->{$sn}->{$_} = 0 } qw(BatteryLevel Current BatteryTemp);	# initialize
+  $devh->{$sn}->{ChargingState} = 'Unknown';
+  my $ii = 0;
+
+  # we want:  BatteryLevel, Current, BatteryTemp, ChargingState
+
+  printf STDERR "$mp invoking '%s'\n", &POWERLOG if $debug;
+
+  my $h = &Utils::powerlog();
+
+  $devh->{$sn}->{BatteryLevel} = $h->{RawLevel}
+    if exists $h->{RawLevel} && defined $h->{RawLevel};
+  $devh->{$sn}->{Current} = $h->{InstantAmperage}
+    if exists $h->{InstantAmperage} && defined $h->{InstantAmperage};
+  $devh->{$sn}->{BatteryTemp} = $h->{Temperature}
+    if exists $h->{Temperature} && defined $h->{Temperature};
+  $devh->{$sn}->{ChargingState} = $h->{IsCharging}
+    if exists $h->{IsCharging} && defined $h->{IsCharging};
+
+  if ($printIt) {
+    my $msg = sprintf "$sn:  Draining %d, Battery Level %lf, Temp %s, Current %s, Charging State %s",
+      map { $devh->{$sn}->{$_} } qw(RunningSetbattDrain BatteryLevel
+				    BatteryTemp Current ChargingState);
+    if ($clArgs->get('spew')) {
+      printf STDERR "$mp %s %s\n", (scalar localtime), $msg;
+    } else {
+      &logErr($devh->{$sn}->{LogFile}, $msg);
+    }
+  }
+  return 1;
+}
+
+#***************************************************************************
+#
+#   Subroutine : rmSysPlist
+#       Author : Neil O'Sullivan
+#         Date : 21 May 2014
+#
+#  Description : Removes system plist because we did not reboot.
+#
+#                Returns status:  1 for success, 0 otherwise.
+#
+#***************************************************************************
+
+sub rmSysPlist {
+  my $mp = __PACKAGE__ . '::.rmSysPlist: ';
+
+  my @filesToRm = ((sprintf "/usr/libexec/%s", $program), &SYS_PLIST_FILE);
+
+  printf STDERR "$mp removing files %s because we did not go through battery trap\n",
+    join(', ', map { sprintf "'%s'", $_ } @filesToRm);
+
+  my $success = 1;
+
+  for my $ftr (@filesToRm) {
+    next unless -f $ftr;	# if it doesn't exist, nothing to do
+    my $un = unlink($ftr);
+    next if ($un == 1 && (! -f $ftr));
+    printf STDERR "$mp ERROR, failed to remove %s using unlink, trying 'rm -f'\n", $ftr;
+    my $status = &Execer::execer(sprintf("rm -f %s", $ftr),
+			      sub {
+				my ($lineNo, $line) = (@_);
+				print STDERR $line;
+				return 0;
+			      });
+    unless ($status && (! -f $ftr)) {
+      printf STDERR "$mp ERROR, failed to remove file '%s':  please remove by hand\n", $ftr;
+      $success = 0;
+    }
+  }
+  return $success;
+}
+
+#***************************************************************************
+#
+#   Subroutine : drainTo
+#       Author : Neil O'Sullivan
+#         Date : 28 Feb 2011
+#
+#  Description : Drain all devices to specified battery percentage.
+#
+#                Returns status:  1 for success, 0 otherwise.
+#
+#***************************************************************************
+
+sub drainTo {
+  my ($devh, $sn, $drainto) = (@_);
+
+  my $mp = __PACKAGE__ . '::drainTo: ';
+
+  # get initial battery percent charge and charging state
+
+  my ($status, $outp);
+
+  printf STDERR "$mp in drainTo...\n" if $debug;
+
+  $status = &getBattStatus($devh, $sn, 0);
+  unless ($status == 1 || (! $clArgs->get('powerlog'))) {
+    printf STDERR "$mp ERROR, %s '%s' returned bad status '$status'\n", $sn, &POWERLOG;
+    &killLoggers();
+    &killLoads($devh, $sn);
+    exit(1);
+  }
+
+  my $ts = timelocal(localtime);
+  if ($obj->can('chargeOff')) {
+    $status = $obj->chargeOff();
+    printf STDERR "$mp ERROR, call to %d's chargeOff method returned status %d, expected 1\n",
+      ref($obj), $status
+      unless ($status == 1);
+  }
+
+  $status = &setupForDraining($devh, $sn);
+  printf STDERR "$mp %s ERROR, setupForDraining() returned %s status '%d'\n", $sn, ($status == 1 ? 'good' : 'bad'),
+    $status
+    if $status != 1;
+  $devh->{$sn}->{RunningSetbattDrain} = 1;
+
+  unless ($status == 1) {
+    &killLoggers();
+    &killLoads($devh, $sn);
+    exit(1);
+  }
+
+  # Confirm charger is attached, then reset the PMU charging timeout timer in register 0x43 (initial value set in 0x42)
+
+  {
+    printf STDERR "$mp checking whether charger is attached\n" if $debug;
+
+    my $sta = $obj->isChargerAttached();
+    if ($sta == -1) {
+      printf STDERR "$msgp ERROR, read of PMU register returned bad status '%s'\n", $sta;
+      return 0;
+    }
+    printf STDOUT "$msgp %s, charger is %sattached\n", $sn, $sta == 1 ? '' : 'NOT ';
+
+    $sta = $obj->clearChargeTimeout();
+  }
+
+  my $sequentialFailures = 0;
+  my $loopcount = 0;
+
+  if ($drainto < 2) {
+    if($clArgs->get('wakeup')) {
+      $status = &genSysPlistAndSave($clArgs->get('chargeto'), $clArgs->get('cycles') - 1);
+      unless ($status == 1) {
+        &killLoggers();
+        &killLoads($devh, $sn);
+        exit($status);
+      }
+    }
+  }
+
+  # one more stab at turning the lights on full
+  $status = &execTestCmd('On', 'SetBright');
+  my $bright = &checkBright($devh, $sn, 1.0);
+  if ($bright != 1) {
+    printf STDERR "$mp ERROR, setting display brightness to 1.0 produced display brightness '%s'\n",
+      $setbright{Nom};
+    &killLoggers();
+    &killLoads($devh, $sn);
+    exit(1);
+  }
+
+  my $powerlog = $clArgs->get('powerlog');
+
+  while (1) {
+    printf STDERR "$mp %s, state=%s, iteration %d\n", $sn, $devh->{$sn}->{State} || 'undef', $loopcount
+      if (0 == ++$loopcount % 100) || ($debug);
+
+    my ($status, $outp);
+    printf STDERR "$mp calling getBattStatus...\n" if $debug;
+    $status = &getBattStatus($devh, $sn, 0);   # update battery level every tcycle with 'powerlog -Bq'
+    printf STDERR "$mp getBattStatus returned status %d\n", $status
+      if $debug;
+
+    if ($status == 1) {
+      $sequentialFailures = 0;
+    } else {
+      $sequentialFailures = $powerlog ? $sequentialFailures+1 : 0;
+    }
+
+    if ($sequentialFailures > 10) {
+
+      # haven't heard from unit in over 10 cycles
+
+      printf STDERR "$mp ERROR, %s %d sequential failures\n", $sn, $sequentialFailures;
+    }
+
+    printf STDERR "$mp calling fetchData()...\n" if $debug;
+    $status = &fetchData($devh, $sn, 0); # 0 -> we're discharging
+    printf STDERR "$mp fetchData() returned status %d\n", $status if $debug;
+
+    if ((exists $devh->{$sn}->{StateOfCharge} &&
+	 defined $devh->{$sn}->{StateOfCharge} &&
+	 $devh->{$sn}->{StateOfCharge} != -1 &&
+	 $devh->{$sn}->{StateOfCharge} <= $drainto)) {
+      printf STDERR "$mp finished draining, SOC <= drainto (%.2lf <= %.2lf)\n",
+	$devh->{$sn}->{StateOfCharge}, $drainto;
+      if ($drainto <= &BATTERYTRAP_REBOOT_STATEOFCHARGE) {
+        if($clArgs->get('wakeup')) {
+	      &rmSysPlist();
+	    }
+      } else {
+        if($clArgs->get('wakeup')) {
+          printf STDERR "$mp drainto target %.2lf exceeded, but it is not below battery trap reboot state of charge (%.2lf), so we should not have written '%s'\n",
+            &SYS_PLIST_FILE;
+          if (-f &SYS_PLIST_FILE) {
+            printf STDERR "$mp ERROR, did not expect to see file '%s':  drainto target is %.2lf\n",
+               &SYS_PLIST_FILE, $drainto;
+            &rmSysPlist();
+          }
+        }
+      }
+    }
+
+
+    if ($powerlog &&
+	exists $devh->{$sn}->{BatteryLevel} &&
+	defined $devh->{$sn}->{BatteryLevel} &&
+	$devh->{$sn}->{BatteryLevel} != -1 &&
+	$devh->{$sn}->{BatteryLevel} < $drainto) {
+      printf STDERR "$mp finished draining, BatteryLevel < drainto (%.2lf <= %.2lf)\n",
+	$devh->{$sn}->{BatteryLevel}, $drainto;
+      if($clArgs->get('wakeup')) {
+        &rmSysPlist()
+          if $drainto <= &BATTERYTRAP_REBOOT_STATEOFCHARGE;
+      }
+    }
+
+    last if ((exists $devh->{$sn}->{StateOfCharge} &&
+	      defined $devh->{$sn}->{StateOfCharge} &&
+	      $devh->{$sn}->{StateOfCharge} != -1 &&
+	      $devh->{$sn}->{StateOfCharge} <= $drainto) ||	# SOC < drainTo?
+	     ($powerlog &&
+	      exists $devh->{$sn}->{BatteryLevel} &&
+	      defined $devh->{$sn}->{BatteryLevel} &&
+	      $devh->{$sn}->{BatteryLevel} != -1 &&
+	      $devh->{$sn}->{BatteryLevel} < $drainto));	# BatteryLevel < drainTo?
+
+    my $cts = timelocal(localtime);
+    my $sleept = $ts + $clArgs->get('tcycle') - $cts;
+    printf STDERR "$mp sleeping %d seconds\n", $sleept
+      if $sleept != 0;
+
+    sleep($sleept)
+      if $sleept > 0;
+    $ts = timelocal(localtime);
+  }
+
+  printf STDERR "$mp returning status %d\n", scalar(keys %{$devh}) > 0 ? 1 : 0;
+  return scalar(keys %{$devh}) > 0 ? 1 : 0;
+}
+
+#***************************************************************************
+#
+#   Subroutine : genSysPlistAndSave
+#       Author : Neil O'Sullivan
+#         Date : 12 Jul 2012
+#
+#  Description : Generate plist file and save in /System/Library/LaunchDaemons/.
+#
+#                Returns:  status:  1=success, otherwise:
+#				CANNOT_OPEN_PLIST
+#
+#***************************************************************************
+
+sub genSysPlistAndSave {
+  my ($chargeTo, $cycles) = (@_);
+  my $mp = __PACKAGE__ . '::genSysPlistAndSave: ';
+
+  my $haltFor = $clArgs->get('haltFor');
+  my $plist;
+
+  my $drainTo = $clArgs->get('drainto');
+  $drainTo = <<"ENDSHERE";
+		<string>-drainto</string>
+		<string>$drainTo</string>
+ENDSHERE
+
+  # add any chargecmd's back to command-line in plist
+  if (defined $clArgs->get('chargecmd')) {
+    for my $ccmd (@{$clArgs->get('chargecmd')}) {
+      $drainTo .= sprintf "\t\t<string>-chargecmd</string>\n\t\t<string>$ccmd</string>\n", $ccmd
+	if $ccmd !~ m<^\s*$>;
+    }
+  }
+
+  $drainTo .= "\t\t<string>-sensors</string>\n"
+    . sprintf("\t\t<string>-ai</string>\n\t\t<string>%lf</string>\n", $clArgs->get('ai'))
+      . sprintf("\t\t<string>-ci</string>\n\t\t<string>%lf</string>\n", $clArgs->get('ci'))
+	. sprintf("\t\t<string>-gi</string>\n\t\t<string>%lf</string>\n", $clArgs->get('gi'))
+	  if ($clArgs->get('sensors'));
+
+  $drainTo .= "\t\t<string>-voltages</string>\n" if $clArgs->get('voltages');
+  $drainTo .= "\t\t<string>-currents</string>\n" if $clArgs->get('currents');
+  $drainTo .= "\t\t<string>-thermistors</string>\n" if $clArgs->get('thermistors');
+
+  $drainTo .= "\t\t<string>-processLog</string>\n"
+    . sprintf("\t\t<string>%s</string>\n", $clArgs->get('processLog'))
+      . sprintf("\t\t<string>-logInterval</string>\n")
+	. sprintf("\t\t<string>%d</string>\n", $clArgs->get('logInterval'))
+	  if (defined $clArgs->get('processLog'));
+
+  $drainTo .= "\t\t<string>-HWTest</string>\n" if $clArgs->get('HWTest');
+
+  if ($haltFor > 0) {
+    $plist = <<"ENDSHERE";
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.apple.${program}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/libexec/$program</string>
+		<string>-chargeto</string>
+		<string>$chargeTo</string>
+$drainTo		<string>-cycles</string>
+		<string>$cycles</string>
+		<string>-atboot</string>
+		<string>-haltFor</string>
+		<string>$haltFor</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<false/>
+	<key>UserName</key>
+	<string>root</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>USER</key>
+		<string>root</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>/var/root/</string>
+	<key>StandardOutPath</key>
+	<string>/private/var/tmp/com.apple.${program}.root.stdout.txt</string>
+	<key>StandardErrorPath</key>
+	<string>/private/var/tmp/com.apple.${program}.root.stderr.txt</string>
+</dict>
+</plist>
+ENDSHERE
+  } else {
+    $plist = <<"ENDSHERE";
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.apple.${program}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/libexec/$program</string>
+		<string>-chargeto</string>
+		<string>$chargeTo</string>
+$drainTo		<string>-cycles</string>
+		<string>$cycles</string>
+		<string>-atboot</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<false/>
+	<key>UserName</key>
+	<string>root</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>USER</key>
+		<string>root</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>/var/root/</string>
+	<key>StandardOutPath</key>
+	<string>/private/var/tmp/com.apple.${program}.root.stdout.txt</string>
+	<key>StandardErrorPath</key>
+	<string>/private/var/tmp/com.apple.${program}.root.stderr.txt</string>
+</dict>
+</plist>
+ENDSHERE
+  }
+  
+  my $fh;
+  if (open($fh, (sprintf ">%s", &SYS_PLIST_FILE))) {
+    print $fh $plist;
+    close($fh);
+    for my $cmd ((sprintf "cp %s%s /usr/libexec/", $pPath, $program),
+		 (sprintf "chown root:wheel /usr/libexec/%s %s", $program, &SYS_PLIST_FILE)) {
+      my $status = &execer($cmd,
+			   sub {
+			     my ($lineNo, $line) = (@_);
+			     print $line;
+			     return 0;
+			   });
+      printf STDERR "$mp ERROR, command '%s' returned status %s:  $!\n", $cmd, $status
+	unless $status;
+    }
+  } else {
+    printf STDERR "$mp ERROR, failed to open file '%s' for write\n", &SYS_PLIST_FILE;
+    return &CANNOT_OPEN_SYS_PLIST;
+  }
+
+  return 1;
+}
+
+#***************************************************************************
+#
+#   Subroutine : etc:  low-level Exec Test Command
+#       Author : Neil O'Sullivan
+#         Date : 07 Mar 2013
+#
+#  Description : Either executes the mode/test directly or, if user defined,
+#		 executes user/mode/test as defined in $obj->{Tests}->{$program}.
+#
+#                Returns:  status:  1=success, otherwise 0.
+#
+#***************************************************************************
+
+sub etc {
+  my ($cmdName, $user, $mode, $cmdStrings, $lines) = (@_);
+  my $mp = __PACKAGE__ . '::etc: ';
+
+  my $status = 1;
+
+  # cp = command prefix
+  my $cp = (defined $user &&
+	    exists $obj->{CmdPrefix} && defined $obj->{CmdPrefix} &&
+	    exists $obj->{CmdPrefix}->{$user} && defined $obj->{CmdPrefix}->{$user})
+	    ? $obj->{CmdPrefix}->{$user} : '';
+
+  for my $cs (@{$cmdStrings}) {
+    printf STDERR "$mp cmdName='%s', cmdString='%s'\n", $cmdName, $cs if $debug;
+    if ($cs =~ m<^\s*SpawnMon\:\s*>) {
+      my $csthing = $cs;
+      $csthing =~ s<^\s*SpawnMon\:\s*><>;
+      my $smpid = SpawnMon->new(Command => $csthing,
+				LogFile => $csthing =~ m<setbatt\s+drain>
+				? &SETBATT_LOGFILE : '/dev/null',
+				Duration => 0);
+      if (exists $smpid->{PID} && defined $smpid->{PID}) {
+	printf STDERR "$mp launched '%s' in background, PID %d\n", $cs, $smpid->{PID};
+	push(@drainPIDs, $smpid->{PID});
+	$setbattDrainPID = $smpid->{PID}
+	  if $cs =~ m<setbatt\s+drain>;
+      } else {
+	$status = 0;	# launch failed
+	printf STDERR "mp ERROR, failed to luanch stimulus '%s'\n", $cs;
+      }
+    } else {
+      my $cpcs = sprintf "%s%s", $cp, $cs;	# construct the command-line with prefix
+
+      printf STDERR "$mp invoking '%s'\n", $cpcs if $debug;
+
+      my $sts = &execer($cpcs,
+			sub {
+			  my ($lineNo, $line, $lines) = (@_);
+			  print STDERR $line if $debug;
+			  push(@{$lines}, $line) if $mode eq 'Test';
+			}, $lines);
+      printf STDERR "$mp Warning, command '%s' returned status '%d', expected 1\n", $cpcs, $sts
+	unless $sts == 1;
+
+      $status &= $sts;
+    }
+  }
+
+  return $status;
+}
+  
+#***************************************************************************
+#
+#   Subroutine : execTestCmd
+#       Author : Neil O'Sullivan
+#         Date : 07 Mar 2013
+#
+#  Description : Given a mode and command, this iterates over the device object
+#		 checking whether the command is user-specific, in which case
+#		 we execute them in the order mobile-cmds, then root-cmds.
+#
+#                Returns:  status:  1=success, otherwise 0.
+#		 If mode is 'Test', we also return array ref of command outputs.
+#
+#***************************************************************************
+
+sub execTestCmd {
+  my ($mode, @cmds) = (@_);
+  my $mp = __PACKAGE__ . '::execTestCmd: ';
+
+  my $status = 1;
+  my $lines = [ ];
+
+  for my $cmd (@cmds) {
+    if (exists $obj->{Tests}->{$program}->{$cmd} && defined $obj->{Tests}->{$program}->{$cmd}) {
+      if (exists $obj->{Tests}->{$program}->{$cmd}->{$mode}) {
+	$status = &etc($cmd, undef, $mode, $obj->{Tests}->{$program}->{$cmd}->{$mode}, $lines);
+	printf STDERR "$mp ERROR, command '%s' returned status '%d'\n", $cmd, $status
+	  unless $status == 1;
+      } else {
+	my $status = 1;
+	for my $user (qw(mobile root)) {
+	  $status &= &etc($cmd, $user, $mode, $obj->{Tests}->{$program}->{$cmd}->{$user}->{$mode}, $lines)
+	    if exists $obj->{Tests}->{$program}->{$cmd}->{$user}->{$mode} &&
+	      defined $obj->{Tests}->{$program}->{$cmd}->{$user}->{$mode};
+	  printf STDERR "$mp ERROR, command '%s' returned status '%d'\n", $cmd, $status
+	    unless $status == 1;
+	}
+      }
+    } else {
+      $status = 0;
+      printf STDERR "$mp ERROR, failed to identify %s Test '%s' for %s\n", $mode, $cmd, ref($obj);
+    }
+  }
+
+  return ($status, $lines);
+}
+
+#***************************************************************************
+#
+#   Subroutine : ckForRedundantProcesses
+#       Author : Neil O'Sullivan
+#         Date : 16 Apr 2013
+#
+#  Description : Verify there is only one instance of me running.
+#
+#                Returns:  status:  1=success, otherwise 0.
+#
+#***************************************************************************
+
+sub ckForRedundantProcesses {
+  my $mp = __PACKAGE__ . '::ckForRedundantProcesses: ';
+
+  my $pid = $$;
+
+  my $lines = [ ];
+
+  # tentative fix for rdar://18209791
+
+  my $re = sprintf "/usr/libexec/%s%s.*%s\-atboot", $program, '\s+', '\s+';
+  $re = qr<$re>;
+
+  #USER             PID  %CPU %MEM      VSZ    RSS   TT  STAT STARTED      TIME COMMAND
+
+  my $status = &Execer::execer('ps auxww',
+			       sub {
+				 my ($lineNo, $line) = (@_);
+				 unless ($lineNo == 0) {
+				   chomp $line;
+				   my @fields = split(/\s+/, $line);
+				   unless ($fields[1] == $pid or $fields[1] == getppid()) {
+				     if ($line =~ $re) {
+				       printf STDERR "$mp ERROR, found match for %s:  '%s'\n",
+					 $program, $line;
+				       push(@{$lines}, $line);
+				     }
+				   }
+				 }
+				 return 0;
+			       });
+  return scalar(@{$lines}) == 0 ? 1 : 0;
+}
+
+######
+# main
+######
+
+printf STDERR "$msgp command-line:  %s %s\n", $0, join(' ', @ARGV);
+
+&registerOpts($clArgs);		# register options
+
+my $errors = 0;
+
+unless($clArgs->process([@ARGV])) { # process command-line
+  print STDERR "$msgp WARNING, error processing command-line\n";
+  $errors++;
+}
+
+print STDERR "$0 args: ", join(" ", @ARGV), "\n";
+
+if (scalar(@{$clArgs->Unknown}) > 0) {
+  printf STDERR "$msgp ERROR, unrecognized command-line tokens:  %s\n", join("\n\t", @{$clArgs->Unknown});
+  exit(&UNRECOGNIZED_CMD_LINE_TOKENS);
+}
+
+# verify that there is only one instance of me running
+# ----------------------------------------------------
+
+unless (&ckForRedundantProcesses()) {
+  printf STDERR "$msgp ERROR, more than one instance of '%s' running, exiting\n", $program;
+  exit(&MULTIPLE_INSTANCES_OF_ME);
+}
+
+# verify that required boot-args are set
+# --------------------------------------
+
+unless ($clArgs->get('ignoreBootArgs')) {
+  my ($ckbastatus, $keysArray) = &Utils::checkBootArgs([ &REQUIRED_BOOT_ARGS ]);
+  unless ($ckbastatus) {
+    printf STDERR "$msgp ERROR, required boot-args '%s' not set\n", join(' ', @{$keysArray});
+    exit(&MISSING_REQUIRED_BOOT_ARGS);
+  }
+}
+
+my @thermhidColumns = ();
+unless ($clArgs->get('atboot')) {
+  for my $thing (sort { $a cmp $b } qw(voltages currents thermistors)) {
+    if ($clArgs->get($thing)) {
+      my $status;
+
+      ($status, $thermhidData->{$thing}->{First}) = &Utils::getThermhid($thermhidMap{$thing});
+
+      if ($status) {
+
+	# insert any 'extras'
+	if (exists $thermhidExtras->{$thing} && defined $thermhidExtras->{$thing}) {
+	  printf STDERR "$msgp found Extras for '%s'; adding them to thermhidData\n", $thing;
+	  for my $key (keys %{$thermhidExtras->{$thing}}) {
+	    if (exists $thermhidData->{$thing}->{$key} && defined $thermhidData->{$thing}->{$key}) {
+	      printf STDERR "$msgp NOT adding '$key' for '$thing' because it already exists\n";
+	    } else {
+	      printf STDERR "$msgp adding '$key' for '$thing'\n";
+	      $thermhidData->{$thing}->{$key} = $thermhidExtras->{$thing}->{$key};
+	    }
+	  }
+	}
+
+	# success:  save the keys in sorted order
+	$thermhidData->{$thing}->{SortedKeys} = [ sort { $a cmp $b } (keys %{$thermhidData->{$thing}->{First}}) ];
+	push(@thermhidColumns, @{$thermhidData->{$thing}->{SortedKeys}});
+      } else {
+	# failure:  we won't be logging these
+	$clArgs->store($thing, 0);
+	delete $thermhidData->{$thing};
+      }
+    }
+  }
+
+  printf STDERR "thermhidColumns:  %s\n", join(',', @thermhidColumns);
+}
+
+sleep($clArgs->get('delay'))
+  if $clArgs->get('delay');
+
+# we won't necessarily use these unless user specifies -sensors, but it doesn't hurt to be prepared
+
+%intervalMap = ('accel' => $clArgs->get('ai'),
+		'compass' => $clArgs->get('ci'),
+		'gyro' => $clArgs->get('gi'));
+
+unless (exists $ENV{USER} &&
+	defined $ENV{USER}) {
+  printf STDERR "$msgp ERROR, cannot determine username from environment:  USER is not set\n";
+  printf STDERR "Environment Variables:\n%s\n", join("\n", map { sprintf "%s:  %s", $_, $ENV{$_} } keys %ENV);
+  my $login = getpwuid($>);
+  printf STDERR "$msgp getpwuid() for EUID returned '%s'\n", $login;
+  if (defined $login) {
+    if ($login eq 'root' ||
+	$login eq 'mobile') {
+      $ENV{USER} = 'root';
+      printf STDERR "$msgp setting USER to 'root'\n";
+    } else {
+      printf STDERR "$msgp ERROR, getlogin() returned '%s', expecting 'root' or 'mobile'\n", $login;
+      $ENV{USER} = 'root'
+	if ($login =~ m<_securityd>);
+    }
+  } else {
+    printf STDERR "$msgp ERROR, getlog() returned undef\n";
+  }
+  exit(&NO_USER) unless exists $ENV{USER} && defined $ENV{USER};
+}
+
+if (!($ENV{USER} eq 'root' || $ENV{USER} eq 'mobile')) {
+  if ($clArgs->get('root')) {
+    printf STDERR "$msgp ERROR, unrecognized user '%s'; must be run as 'root'\n", $ENV{USER};
+    exit(&UNRECOGNIZED_USER);
+  }
+}
+
+# otherwise we are 'root'
+
+if ($clArgs->get('root')) {
+  if ($ENV{USER} ne 'root') {
+    printf STDERR "$msgp ERROR, $program must be run as user 'root'\n";
+    exit(&MUST_BE_RUN_AS_ROOT);
+  }
+}
+
+{
+  my $chargeto = $clArgs->get('chargeto');
+  if (defined $clArgs->get('drainto')) {
+    my $drainto = $clArgs->get('drainto');
+    if ($drainto < 0 || $drainto > 100) {
+      printf STDERR "$msgp ERROR, valid drainto range 0 <= drainto <= 100, you specified '$drainto'\n";
+      exit(&ILLEGAL_DRAINTO);
+    }
+    $clArgs->store('drainto', 0)
+      if ($drainto > 0 && $drainto <= &BATTERYTRAP_REBOOT_STATEOFCHARGE);
+    if ($chargeto <= $drainto) {
+      printf STDERR "$msgp ERROR, -chargeto value must be greater than -drainto value (%s !> %s)\n", $chargeto, $drainto;
+      exit(&ILLEGAL_DRAIN_CHARGE_COMBO);
+    }
+  }
+  unless ($chargeto > 2 && $chargeto <= 100) {
+    printf STDERR "$msgp ERROR, -chargeto %s out of range 2 < chargeto <= 100\n", $chargeto;
+    exit(&CHARGETO_OUT_OF_RANGE);
+  }
+}
+
+{
+  my $status = &execer('mount -uw /',
+		       sub {
+			 my ($lineNo, $line) = (@_);
+			 print $line;
+			 return 0;
+		       });
+    printf STDERR "$msgp ERROR, bad status returned by 'mount -uw /':  %s:  $!\n", $status
+      unless $status;
+}
+
+$clArgs->store('cycles', 1)
+  if $clArgs->get('cycles') < 1;
+
+my $charger;
+
+if ($clArgs->get('processLog')) {
+  my ($sts, $ppid) = &Utils::processLog($clArgs->get('processLog'), $clArgs->get('logInterval'));
+  if ($sts == 1) {
+    push(@loggingPIDs, $ppid);
+    printf STDERR "$msgp launched process logger to log every %d seconds to '%s'\n", $clArgs->get('logInterval'),
+      $clArgs->get('processLog');
+  } else {
+    printf STDERR "$msgp ERROR, failed to launch process table logger\n";
+  }
+}
+
+for my $uberCycle (1..$clArgs->get('cycles')) {
+  printf STDERR "$msgp cycle %d for this boot\n", $uberCycle;
+
+  for my $f (&PLIST_FILE, &SYS_PLIST_FILE) {
+    if (-f $f) {
+      my $status = unlink($f);
+      unless ($status) {
+	printf STDERR "$msgp ERROR, failed to remove file '%s'\n", $f;
+	$status = &execer((sprintf "rm -f %s", $f),
+			  sub {
+			    my ($lineNo, $line) = (@_);
+			    print $line;
+			    return 0;
+			  });
+	if ($status) {
+	  if (! -f $f) {
+	    printf STDERR "$msgp INFO, 'rm -f %s' appears to have worked\n", $f;
+	    next;
+	  } else {
+	    printf STDERR "$msgp ERROR, 'rm -f %s' failed\n", $f;
+	  }
+	}
+	exit(&FAILED_TO_REMOVE_COOKIE);
+      }
+    }
+  }
+  my $devh = {};
+
+  my $sn = &lockdownGet('SerialNumber');
+  unless (defined $sn) {
+    printf STDERR "$msgp ERROR, failed to get a SerialNumber from the device:  undefined\n";
+    exit(&NO_SERIAL_NUMBER);
+  }
+
+  $devh->{$sn}->{HardwareModel} = &lockdownGet('HardwareModel');
+  $devh->{$sn}->{HardwareModel} =~ s<AP$><>;
+
+  unless (defined $devh->{$sn}->{HardwareModel}) {
+    printf STDERR "$msgp ERROR, failed to get a HardwareModel from the device:  undefined\n";
+    exit(&NO_HARDWARE_MODEL);
+  }
+
+  # verify we can find our platform-specific package using the @INC array (and PERL5LIB, if set)
+  {
+    my @places = (@INC, split(':', $ENV{PERL5LIB}));
+    my $pkg = join('.', $devh->{$sn}->{HardwareModel}, 'pm');
+
+    my $exists = 0;
+    for my $loc (@places) {
+      #  printf STDERR "checking %s\n", join('/', $loc, $pkg);
+      next unless -f join('/', $loc, $pkg);
+      $exists = 1;
+      last;
+    }
+    unless ($exists) {
+      printf STDERR "$msgp ERROR, cannot locate base object to load '%s'\n", $pkg;
+      &killLoggers();
+      exit(1);
+    }
+    require $pkg;
+  }
+
+  # create the object
+  # -----------------
+
+  $obj = $devh->{$sn}->{HardwareModel}->new(Warnings => 1, Debug => $debug, Verbose => $verbose);
+
+  # the motion sensors
+  @sensors = grep { $_ =~ m<accel|compass|gyro> } keys %{$obj->{SensorMap}};
+  $logfile = { map { $_ => &MotionSensors::lfname($sn, $_) } (@sensors) };
+
+  # verify it has expected Tests implemented
+  my $errs = 0;
+  for my $test (qw(WakeDisplay UIIsPurpleBuddyRunning SetBright DrainBattery UIForceNoBuddy
+		  SpringboardSetup SwitchboardSetup BackboarddSetup MaxInactivity
+		  UIGPUVirus NonUIGPUVirus CPUStim)) {
+    unless (exists $obj->{Tests}->{$program}->{$test} && defined $obj->{Tests}->{$program}->{$test}) {
+      printf STDERR "$msgp ERROR, object '%s' missing %s Test '%s'\n", ref($obj), $program, $test;
+      $errs++;
+    }
+  }
+
+  unless ($errs == 0) {
+    printf STDERR "msgp ERROR, failed to locate expected package-specific Test function definitions\n";
+    &killLoggers();
+    exit(1);
+  }
+
+  $devh->{$sn}->{IAm} = $ENV{USER};
+  my $csvFilePath = (defined $clArgs->get('csvpath')) ? $clArgs->get('csvpath') : "";
+  my $logFilePath = (defined $clArgs->get('logpath')) ? $clArgs->get('logpath') : "";
+  $devh->{$sn}->{CsvFile} = join('', $csvFilePath, 'pmut_', $sn, '_', $devh->{$sn}->{HardwareModel}, '.csv');
+  $devh->{$sn}->{LogFile} = join('', $logFilePath, 'pmut_', $sn, '_', $devh->{$sn}->{HardwareModel}, '.log');
+
+  my %files = (Csv => $devh->{$sn}->{CsvFile},
+	       Log => $devh->{$sn}->{LogFile});
+
+  $devh->{$sn}->{RunningSetbattDrain} =
+    $devh->{$sn}->{BatteryLevel} =
+      $devh->{$sn}->{Current} =
+	$devh->{$sn}->{LastLogged} = 0;
+  $devh->{$sn}->{ChargingState} = ''; # active, inactive, unknown
+  $devh->{$sn}->{BatteryTemp} = '';
+  $devh->{$sn}->{State} = 'iOSloggedIn';
+  $devh->{$sn}->{At100Pct} = 0;
+  $devh->{$sn}->{KilledLoads} = 0;
+
+  printf STDERR "$msgp PMU is %s\n", $obj->{PMU};
+
+  # create one output csv file per device
+  # -------------------------------------
+
+  my $file = $devh->{$sn}->{CsvFile};
+
+  my $fh;
+  if ($uberCycle == 1) {
+    my $sta;
+    # We ALWAYS create the file from scratch on our first iteration
+    if ($clArgs->get('atboot')) {
+
+      printf STDERR "$msgp -atboot IS SET\n" if $debug;
+
+      if ($clArgs->get('voltages') ||
+	  $clArgs->get('currents') ||
+	  $clArgs->get('thermistors')) {
+
+	printf STDERR "$msgp either -v or -t or -i IS SET\n";
+
+	if (open($fh, "<$file")) {
+	  my $firstLine = <$fh>;
+	  close($fh);
+	  unless (defined $firstLine) {
+	    printf STDERR "$msgp ERROR, csv file '%s' returned an empty first line\n", $file;
+	    exit(1);
+	  }
+	  chomp $firstLine;
+	  my @firstLine = split(/,/, $firstLine);
+	  @thermhidColumns = ();
+	  my %inverseThermhidMap = ( i => 'currents',
+				     v => 'voltages',
+				     t => 'thermistors',
+				   );
+	  for my $field (@firstLine) {
+	    if ($field =~ m<^thermhid\s+\-t([itv])\:\s+>) {
+	      my $type = $1;
+	      my $mtype = $inverseThermhidMap{$type};
+	      $thermhidData->{$mtype}->{Current}->{$field} = 0;
+	      push(@thermhidColumns, $field);
+	      printf STDERR "$msgp matched $field\n" if $debug;
+	    } else {
+	      printf STDERR "$msgp no thermid match for '%s'\n", $field if $debug;
+	    }
+	  }
+	  for my $thing (qw(currents voltages thermistors)) {
+	    my @keys = keys %{$thermhidData->{$thing}->{Current}};
+	    $thermhidData->{$thing}->{SortedKeys} = [ sort { $a cmp $b } @keys ];
+	    printf STDERR "$msgp SortedKeys:  %s:  %s\n", $thing, join(',', @{$thermhidData->{$thing}->{SortedKeys}})
+	      if $debug;
+	  }
+	} else {
+	  printf STDERR "$msgp ERROR, failed to open csv file '%s' for read\n", $file;
+	  exit(1);
+	}
+
+      }
+
+#      exit(99);		# Fix me
+
+    } else {
+      # then create and populate with first line
+      my @things = ();
+      @sensorTesterColumns = &sensorTesterColumns();
+      push(@things, @sensorTesterColumns) if $clArgs->get('sensors');
+      push(@things, @thermhidColumns);
+
+      my $stc = scalar(@things) ? join(',', @things) . ',' : '';
+      if (open($fh, ">$file")) {
+
+	my ($selfKeys, $selfValues) = $obj->pmubatLog();
+	printf $fh join(',', 'PMU VBATT mV', @{$selfKeys}, sprintf "%s,%s%sTimeStamp\n",
+			join(',', (&HDQT)),
+			($clArgs->get('powerlog') ? 'Battery Current,' : ''),
+			$stc);
+
+	close($fh);
+      } else {
+	printf STDERR "$msgp ERROR, failed to open file '$file' for write\n";
+	&killLoggers();
+	exit(&FAILED_TO_OPEN_FILE);
+      }
+    }
+    if ($clArgs->get('clearlogs')) {
+      $file = $devh->{$sn}->{LogFile};
+      my $fh;
+      if (open($fh, ">$file")) {
+	close($fh);
+      } else {
+	printf STDERR "$msgp ERROR, failed to open file '$file' for write\n";
+	&killLoggers();
+	exit(&FAILED_TO_OPEN_FILE);
+      }
+    }
+  }
+
+  if (defined $clArgs->get('drainto') &&
+     (! $clArgs->get('atboot'))) {
+     
+    if($clArgs->get('wakeup')) {
+      printf STDOUT "$msgp Wakeup will be scheduled.\n";
+    }
+    else {
+      printf STDOUT "$msgp Wakeup will NOT be scheduled.\n";
+    }
+
+    my $drainto = $clArgs->get('drainto');
+    my $status = &drainTo($devh, $sn, $drainto);
+    printf STDERR "$msgp %s 'drainTo' finished with status '$status'\n", $sn;
+    unless ($status == 1) {
+      printf STDERR "$msgp %s exiting because drainTo returned status '$status'\n", $sn;
+      &killLoggers();
+      exit(&FAILURE_WHILE_DRAINING);
+    }
+
+    $status = &stopDraining($devh, $sn);
+
+    $status = $obj->chargeOn()
+      if $obj->can('chargeOn');
+
+    my $shutdownTime = $clArgs->get('haltFor');
+    if ($shutdownTime > 0) {
+
+      # generate our wake-up plist
+      if($clArgs->get('wakeup')) {
+        $status = &genSysPlistAndSave($clArgs->get('chargeto'), $clArgs->get('cycles') - 1);
+        unless ($status == 1) {
+	      &killLoggers();
+          exit($status);
+      }
+
+        # generate wake event
+        my $cmd = sprintf "%s '%s'", &SCHEDULEWAKE, 
+      &pmsetCanonicalTime(&timelocal(localtime) + &rnd(1, 60 * $shutdownTime));
+        printf STDOUT "$cmd\n";
+
+        for my $ccmd ($cmd, 'halt') {
+          $status = &execer($ccmd,
+                sub {
+                  my ($lineNo, $line) = (@_);
+                  print $line;
+                  return 0;
+                });
+        }
+        exit(0);    # we should never return from 'halt'
+      }
+    }
+    printf STDERR "$msgp ERROR, %s stopDraining returned finished status '$status'\n", $sn;
+  }
+
+  $clArgs->store('atboot', 0);
+
+  my $ts = timelocal(localtime);
+  my $lastLogTime = 0;
+
+  $charger = $obj->getAdapterDetails() || 'unknown'
+    unless (defined $charger);
+
+  $charger =~ s<\s><\->g;
+
+  # invoke any charge commands before we start the charging phase
+  # -------------------------------------------------------------
+
+  if (defined $clArgs->get('chargecmd')) {
+    for my $ccmd (@{$clArgs->get('chargecmd')}) {
+      my $status = &execer($ccmd,
+			   sub {
+			     my ($lineNo, $line) = (@_);
+			     printf STDERR $line
+			       if $debug;
+			     return 0;
+			   });
+      printf STDERR "$msgp command '%s' returned status %d\n", $ccmd, $status
+	if $debug || $status != 1;
+    }
+  }
+
+  if($clArgs->get('ignoreDisplay')) {
+    &setBrightness(&DEFAULT_CHARGE_DISPLAY_LEVEL);
+  }
+  else {
+    my ($status, $outp) = &execTestCmd(qw(Off SetBright DrainBattery));
+    unless ($status) {
+      printf STDERR "$msgp ERROR, turning off LCD returned bad status %d\n%s\n", $status,
+	join("\t\n", @{$outp});
+    }
+  }
+
+  $obj->chargeOn()		# just in case
+    if $obj->can('chargeOn');
+
+ Charging:
+  while (1) {
+    #printf STDOUT "$msgp The unit" . ((&isUI($devh, $sn)) ? " is " : " is not ") . "in the UI OS mode.\n";
+
+    my $status = &fetchData($devh, $sn, 1); # 1 -> we're charging
+    unless ($status == 1) {
+      printf STDERR "$msgp %s fetchData returned status '$status'\n", $sn;
+      last Charging;
+    }
+
+    my $cts = timelocal(localtime);
+    my $sleept = $ts + $clArgs->get('tcycle') - $cts;
+    sleep($sleept)
+      if $sleept > 0;
+    $ts = timelocal(localtime);
+    my @sns = keys %{$devh};
+    last Charging
+      if scalar(@sns) < 1;
+  }
+
+  if ($uberCycle == $clArgs->get('cycles')) {
+
+    # include charger in file names after-the-fact
+
+    my $pattern = '_' . $charger . '\.csv';
+    $pattern = qr<$pattern>;
+    if ($files{Csv} !~ $pattern) {
+      my $oldcsv = $files{Csv};
+      my $newcsv = $oldcsv;
+      $newcsv =~ s<\.csv$><_${charger}.csv>;
+      unlink($newcsv) if -f $newcsv;
+      mv($oldcsv, $newcsv);
+
+      my $oldlog = $files{Log};
+      my $newlog = $oldlog;
+      $newlog =~ s<\.log$><_${charger}.log>;
+      unlink($newlog) if -f $newlog;
+      mv($oldlog, $newlog);
+    }
+  }
+}
+
+if ($clArgs->get('HWTest')) {
+
+  &TestStatusMessage({ 
+    'phase' => "TestCompleted",
+    'vBatt' => $vBatt,
+    'iter' => $clArgs->get('cycles'),
+    'startTime' => $TimeStamp,
+   });
+}
+
+&setBrightness(&DEFAULT_BRIGHTNESS);
+&killLoggers();
+
+1;

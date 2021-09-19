@@ -1,0 +1,96 @@
+#! /usr/sbin/dtrace -s
+
+/* On iOS, you need to add "dtrace_dof_mode=1" to nvram boot-args for these to work. */
+
+/* #pragma D option quiet */
+
+:UserActivity::UAUserActivityCreated
+{
+	printf("%Y %s: Created UAUserActivity uuid=%s\n", walltimestamp, copyinstr(arg0), copyinstr(arg1) );
+}
+
+:UserActivity::UAUserActivityInvalidated
+{
+	printf("%Y %s: UAUserActivity -invalidated uuid=%s\n", walltimestamp, copyinstr(arg0), copyinstr(arg1) );
+}
+
+:UserActivity::UAUserActivityBecomeCurrent {
+	printf("%Y %s: UAUserActivity -becomeCurrent, %s uuid=%s\n", walltimestamp, copyinstr(arg0), arg2 ? "and needs-save " : "", copyinstr(arg1) );
+}
+
+:UserActivity::UAUserActivityResignCurrent {
+	printf("%Y %s: UAUserActivity -resignCurrent, %s uuid=%s wasCurrent=%s\n", walltimestamp, copyinstr(arg0), arg2 ? "and needs-save " : "", copyinstr(arg1), arg2 ? "YES" : "NO" );
+}
+
+:UserActivity::UAUserActivitySetNeedsSave {
+	printf("%Y %s: UAUserActivity -setNeedsSave=%s uuid=%s %s\n", walltimestamp, copyinstr(arg0), arg2 ? "YES" : "NO", copyinstr(arg1), arg2 ? "(was needsSave=YES)" : "" );
+}
+
+:UserActivity::UAUserActivitySetDirty {
+	printf("%Y %s: UAUserActivity -setDirty=%s uuid=%s %s\n", walltimestamp, copyinstr(arg0), arg2 ? "YES" : "NO", copyinstr(arg1), arg2 ? "(was wasDirty)" : "" );
+}
+
+:UserActivity::UAUserActivityNeedsSaveCleared {
+	printf("%Y %s: UAUserActivity -setNeedsSave=NO (cleared) uuid=%s\n", walltimestamp, copyinstr(arg0), copyinstr(arg1) );
+}
+
+:UserActivity::UAUserActivitySentToServer {
+	printf("%Y %s: UAUserActivity, sent to server%s, uuid=%s\n", walltimestamp, copyinstr(arg0), arg2 ? " and making current" : "", copyinstr(arg1) );
+}
+
+:UserActivity::UAUserActivitySendToServerScheduled {
+	printf("%Y %s: UAUserActivity, send to server scheduled in %d ms, uuid=%s\n",  walltimestamp, copyinstr(arg0), arg2, copyinstr(arg1) );
+}
+
+:UserActivity::UAUserActivityServerAskingClientToSave {
+	printf("%Y %s: UAUserActivity, server asking client to willSave, uuid=%s\n",  walltimestamp, copyinstr(arg0), copyinstr(arg1) );
+}
+
+:UserActivity::UAUserActivityWillSave {
+	printf("%Y %s: UAUserActivity, --->> willSynchronizeActivity delegate callback, uuid=%s\n",  walltimestamp, copyinstr(arg0), copyinstr(arg1) );
+}
+
+:UserActivity::UAUserActivityWillSaveCompleted {
+	printf("%Y %s: UAUserActivity, <<--- willSynchronizeActivity delegate callback, uuid=%s\n",  walltimestamp, copyinstr(arg0), copyinstr(arg1) );
+}
+
+:UserActivity::UAUserActivityWasResumed {
+	printf("%Y %s: UAUserActivity, --->> wasResumed delegate callback, uuid=%s\n",  walltimestamp, copyinstr(arg0), copyinstr(arg1) );
+}
+
+:UserActivity::UAUserActivityWasResumedCompleted {
+	printf("%Y %s: UAUserActivity, <<--- wasResumed delegate callback, uuid=%s\n",  walltimestamp, copyinstr(arg0), copyinstr(arg1) );
+}
+
+:UserActivity::UAUserActivityFetchUUID {
+	printf("%Y %s: UAUserActivity, fetchUUID %s\n",  walltimestamp, copyinstr(arg0), copyinstr(arg1) );
+}
+
+:UserActivity::UAUserActivityFetchUUIDCompleted {
+	printf("%Y %s: UAUserActivity, fetchUUID %s success=%s error=%s\n",  walltimestamp, copyinstr(arg0), copyinstr(arg1), arg2 ? "YES" : "NO", arg3 ? copyinstr(arg3) : "-" );
+}
+
+:UserActivity::UAUserActivityDeprecatedRoutineCalled {
+	printf("%Y %s: Deprecated or discouraged function %s called, with this backtrace\n",  walltimestamp, copyinstr(arg0), copyinstr(arg1) );
+	ustack();
+}
+
+:UserActivity::UAUserActivityConnectionCreated
+{
+	printf("%Y %s: ConnectionCreated, created connection to server from process %d\n",  walltimestamp, copyinstr(arg0), pid );
+}
+
+:UserActivity::UAUserActivityConnectionInterrupted
+{
+	printf("%Y %s: ConnectionInterrupted, created connection to server from process %d\n",  walltimestamp, copyinstr(arg0), pid );
+}
+
+:UserActivity::UAUserActivityConnectionInvalidated
+{
+	printf("%Y %s: ConnectionInvalidated, created connection to server from process %d\n",  walltimestamp, copyinstr(arg0), pid );
+}
+
+:UserActivity::UAUserActivityPayloadSizeInfo
+{
+	printf("%Y %s: UserInfo payload, uuid=%s type=%s %ld vs %ld\n", walltimestamp, copyinstr(arg0), copyinstr(arg1), copyinstr(arg2), arg3, arg4 );
+}

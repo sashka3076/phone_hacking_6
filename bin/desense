@@ -1,0 +1,1730 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use constant PERL5LIB => ('/var/root/Packages', '/AppleInternal/Library/PerlModules');
+use constant VERSION => 'deviceval-2.10.2';
+
+use constant DEFAULTPATH => '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/Developer/usr/bin';
+
+BEGIN {
+  if (exists $ENV{PERL5LIB} && defined $ENV{PERL5LIB}) {
+    for my $thing (&PERL5LIB) {
+      my @matches = grep { $thing eq $_ } split(/:/, $ENV{PERL5LIB});
+      unless (scalar(@matches) > 0) {
+	$ENV{PERL5LIB} .= $thing;
+	push(@INC, $thing);
+      }
+    }
+  } else {
+    $ENV{PERL5LIB} = join(':', &PERL5LIB);
+    push(@INC, &PERL5LIB);
+  }
+
+  # if we're launched by Inferno, we don't have a path
+
+  if (exists $ENV{PATH} &&
+      defined $ENV{PATH}) {
+    my %pparts = map { $_ => 1 } split(/:/, $ENV{PATH});
+    my $missing = 0;
+    for my $ppart (split(/:/, &DEFAULTPATH)) {
+      $missing++
+	unless exists $pparts{$ppart} && defined $pparts{$ppart};
+    }
+    $ENV{PATH} = &DEFAULTPATH
+      unless $missing == 0;
+  } else {
+    $ENV{PATH} = &DEFAULTPATH;
+  }
+}
+
+use POSIX;
+use Time::Local;
+
+use Time::HiRes qw(usleep gettimeofday tv_interval);
+#use Errno qw(EAGAIN);
+
+use ClArgs;
+use ClArgsCb qw(Scalar Aref Bool ToNextOpt);
+use Utils qw(rnd getTsMsString lockdownGet);
+use SpawnMon;
+use Execer qw(execer);
+use PowerCtrl;
+use BB;
+
+use constant UNSET_STATE => -1;
+use constant DISCHARGING => 0;
+use constant CHARGING => 1;
+
+use constant THERMHID => 'thermhid';
+use constant HDQTOOL => 'hdqtool';
+use constant SETBATTRAW => 'setbatt raw';
+use constant POWERLOG => 'sqlite3 -header /var/mobile/Library/Logs/CurrentPowerlog.PLSQL "select * from PLBatteryAgent_EventBackward_Battery where oid = (select max(oid) from PLBatteryAgent_EventBackward_Battery);"';
+
+use constant DRAIN => 'setbatt drain';
+use constant DRAIN_OFF => 'setbatt on';
+
+# using WirelessTester
+#use constant AIRPLANEMODE_ON => 'WirelessTester -c "os.setAirplaneModeEnabled:" -bool YES -o /dev/null';
+#use constant AIRPLANEMODE_OFF => 'WirelessTester -c "os.setAirplaneModeEnabled:" -bool NO -o /dev/null';
+#use constant AIRPLANEMODE_TEST => 'WirelessTester -c "os.isAirplaneModeEnabled" -o /dev/null';
+
+# using coreautomationd:  WirelessTester deprecated soon
+use constant AIRPLANEMODE_ON => 'coreautomationd -command \'networking.setAirplaneModeEnabled:\' -bool YES -o /dev/null';
+use constant AIRPLANEMODE_OFF => 'coreautomationd -command \'networking.setAirplaneModeEnabled:\' -bool NO -o /dev/null';
+use constant AIRPLANEMODE_TEST => 'coreautomationd -command networking.isAirplaneModeEnabled -o /dev/null';
+
+use constant DEFAULTCSV => '/var/logs/Inferno/$program/$program.csv';
+
+use constant ERROR_CODE_SETBRIGHT => 80;
+
+use constant ETLTOOL => 'ETLTool nopoweron raw';
+
+my ($pPath, $program) = $0 =~ m<^(.*/|)(.*),?(.*)$>;
+my $msgp = __PACKAGE__ . "::$program:";
+
+my $clArgs = ClArgs->new(Verbose => 0);
+my ($debug, $verbose, $bbverbose) = (0, 0, 1);
+my ($sn, $hwm);
+my $startTime;
+
+# memtest arg1 arg2 arg3 arg4
+#   arg1 = amount of memory to test (if omitted, all is assumed, but all can be explicit as well)
+#   arg2 = number of test passes to run, valid values 1..255
+#   arg3 = -l or -L, which causes ./memtest.log to be written
+#   arg4 = specifies whether to run in quick mode; if quick not present in command-line, full set of tests are run
+
+# dotpr_s8_24 [ -h | -v | [-s] [<length> [<iterations>]] ]
+# dotpr_s8_24_withDutyCycle [ -h | -v | [-s] [<length> [<iterations> [<idle time ratio> [<duty cycles>]]]] ]
+# GLES2PowerVirus_NonUI [ -n <iterations> ] -- specifying -n 100 runs it for about 1 second
+# nand -> iozone:  need to send payload executable to device
+# audio sweep:  need to send payload audio file to device
+# backlight:  setbright 0, 25, 50, 75, 100 -- cycle (need to know how long to stay at any setting)
+# battery dis/charge -- need to specify either lower/upper %charge or dis/charge times
+# figplayAV [ -volume <0.0-1.0> ] /path/to/audio/file
+# thermalSwiftSynthetic -n 0
+# thermalSwiftSyntheticDutyCycle -l 2048 -n 1000000 -i 50 -c 10
+# thermalA9DotprS824DutyCycle -i 30 -l 500 -n 25000 -c 0
+# thermalA9DotprS824DutyCycle [-h | -v | [-s] [-f] [-l <length>] [-n <iterations>] [-i <idle time ratio>] [-c <duty cycles>] ]
+# pmsleep [-s <time In Microseconds>]
+
+#***************************************************************************
+#
+#   Subroutine : registerOpts
+#       Author : Neil O'Sullivan
+#         Date : 08 Aug 2011
+#
+#  Description : register command-line options with callbacks
+#
+#***************************************************************************
+
+# Tested:
+#  dotpr, dotprwdc, gpupv, backlight, battcy %d %d, sensor 'compass/accel/gyro/pressure', duration, relaunchInterval
+# To Do:
+#  iozone, battcy %d%% %d%% (cycling battery from low of x% to high of y%)
+# N.B.
+#  iozone requires a payload since it does not normally exist on the device
+#  memtest command-line args are problematic, and do we want any output logged from this?
+#  audiostim requires a payload audio file to play
+
+sub registerOpts {
+  my $clargs = shift;
+
+  for(['dotpr',		      [ ],	['-dotpr'],		\&ToNextOpt	],
+      # dotpr_s8_24 [ -h | -v | [-s] [<length> [<iterations>]] ]
+      ['dotprwdc',	      [ ],	['-dotprwdc'],		\&ToNextOpt	],
+      # dotpr_s8_24_withDutyCycle [ -h | -v | [-s] [<length> [<iterations> [<idle time ratio> [<duty cycles>]]]] ]
+      ['memtest',	      [ ],	['-memtest'],		\&ToNextOpt	],
+      #  memtest arg1 arg2 arg3 arg4 # -l | -L, quick
+      ['gpupv',		      [ ],	['-gpupv'],		\&ToNextOpt	],
+      ['cpupv',		      [ ],	['-cpupv'],		\&ToNextOpt	],
+      # GLES2PowerVirus_NonUI [ -n <iterations> ]
+      ['iorw',		      [ ],	['-iorw'],		\&ToNextOpt	],
+      ['iozone',	      [ ],	['-iozone'],		\&ToNextOpt	],
+      ['backlight',	      [ ],	['-backlight'],		\&ToNextOpt	],
+      # backlight  <cycle time in seconds>
+      ['battcy',	      [ ],	['-battcy'],		\&ToNextOpt	],
+      # battcy [ <low%> <high%> ] | [ <dischargeTimeInSecs> <chargeTimeInSecs> ]
+      ['drain',			0,	['-drain'],		\&Bool		],
+      ['backlightOff',		0,	[qw(-backlightOff
+					    -blOff)],		\&Bool		],
+      ['airplaneMode',		0,	[qw(-airplaneMode
+					    -apm)],		\&Bool		],
+      ['pmic',	            undef,	['-pmic'],		\&Scalar	],	# am, qm or sqm; P106-7 only
+      ['wcdma',	            undef,	['-wcdma'],		\&Scalar	],	# 1 1LP 2 2LP 5 5LP 8 8LP
+      ['gsm',		    undef,	['-gsm'],		\&Scalar	],	# 850 850LP 1800 1800LP
+      ['lte',		    undef,	['-lte'],		\&Scalar	],	# 4 4LP 17 17LP 3 13 25
+      ['cpudvc',	    undef,	['-cpudvc'],		\&Scalar	],
+      ['socdvc',	    undef,	['-socdvc'],		\&Scalar	],
+      ['lcmoff',	        0,	['-lcmoff'],		\&Bool		],
+      ['bbverbose',	        1,	[qw(-bbverbose
+					    -nobbverbose)],	\&Bool		],
+      ['buck0',		    undef,	['-buck0'],		\&Scalar	],	# PWM, PFM, Auto, P105-7 only
+      ['buck5',		    undef,	['-buck5'],		\&Scalar	],
+      ['delay',			0,	['-delay'],		\&Scalar	],
+      ['audiostim',	      [ ],	['-audiostim'],		\&ToNextOpt	],
+      ['thermswift',	      [ ],	['-thermswift'],	\&ToNextOpt	],
+      ['thermswiftDC',	      [ ],	['-thermswiftDC'],	\&ToNextOpt	],
+      ['thermcyclone',	      [ ],	['-thermcyclone'],	\&ToNextOpt	],
+      ['thermcycloneDC',      [ ],	['-thermcycloneDC'],	\&ToNextOpt	],
+      ['thermA9DotprS824DC',  [ ],	['-thermA9DotprS824DC'], \&ToNextOpt	],
+      ['pmsleep',	      [ ],	['-pmsleep'],		\&ToNextOpt	],
+      # figplayAV  /path/to/audiofile  -volume [ 0 .. 1.0 ]
+      ['sensor',	      [ ],	['-sensor'],		\&Aref  	],
+      ['sensorLogPrefix',      '',	[qw(-sensorLogPrefix
+					    -slp)],		\&Scalar  	],
+      ['duration',	      600,	['-duration'],		\&Scalar	],
+      ['relaunchInterval',      1,      [qw(-relaunchInterval
+					    -rli)],             \&Scalar        ],
+      ['logging',		0,	[qw(-log -nolog
+					    -logging
+					    -nologging)],	\&Bool		],
+      ['logInterval',		5,	[qw(-logInterval -li)],	\&Scalar	],
+      ['csv',	      &DEFAULTCSV,	['-csv'],		\&Scalar	],
+      ['Usage',                 0,      [qw(-h -help)],         sub { &printUsage(0); } ],
+      ['debug',                 0,      ['-debug'],             sub { $debug = 1; }],
+      ['version',        &VERSION,	[qw(-v --version 
+				    -version)],	sub { printf "%s\n", &VERSION;
+								      exit(0); }],     ) {
+    $clargs->add(@{$_});
+  }
+  return 1;
+}
+
+#***************************************************************************
+#
+#   Subroutine : printUsage
+#       Author : Neil O'Sullivan
+#         Date : 01 Aug 2011
+#
+#  Description : Usage function.
+#
+#***************************************************************************
+
+sub printUsage {
+  my ($exitCode) = @_;
+
+  print <<ENDSHERE;
+
+$program <args> [-h | -help |-h] <file specs>
+
+where <args> are any combination of:
+
+	-h | -help
+	  Prints this 'help' output and exits.
+
+	-debug
+	  This specifies debug mode, generating verbose output.
+
+	-verbose | -noverbose
+	  turns on/off verbose mode.  Verbose mode is normally off.
+
+	-delay <secs>
+	  specifies the time to wait, in seconds, before launching the primary stimulus.  The default is 0 so
+	  by default there is no delay between launching logging applications and the stimulus.  If a non-zero
+	  delay is specified, the entire run still only lasts for the duration specified with -duration, so if
+	  your intention is to run for 10 seconds while logging but doing nothing else otherwise, and then to
+	  run the primary stimulus for 30 seconds, specify a -duration of 40 seconds.
+
+	-duration <secs>
+	  specifies the total elapsed time, in seconds, for the test to run.  Default is 600 seconds (10 minutes).
+
+	-[no]logging | -[no]log
+	  specifies that thermhid, hdqtool and 'powerlog -Bq' logging to a csv file should be done.  Default is
+	  -nologging.
+
+	-logInterval <secs> | -li <secs>
+	  specifies the number of seconds to elapse between csv logging events.  Default is 5 seconds.
+
+	-logRoot </path/to> | -log </path/to>
+	  specifies the rooted directory where the log file ($program.log) is written.  Default is
+	  /var/logs/Inferno/$program.  Depending on behavior, there may be no log file generated.
+
+	-csv </path/to/output.csv>
+	  specifies the filespec of the output csv file, defaults to /var/logs/Inferno/$program/$program.csv
+	  if none specified.  csv is written only if -logging specified.  The csv file will contain thermhid
+	  and hdqtool output combined.
+
+	-audiostim </path/to/waveFile.wav>
+	  plays a wave file through figplayAV.  If you wish to specify a volume, do so with:
+	  -audiostim /path/to/file.wav -volume 0.8
+
+	-pmic am | qm | sqm
+	  explicitly sets the PMIC mode.  Only applies to P106-7, and must be implemented in conjunction with AirplaneMode.
+
+	-cpudvc 0 | 1
+	-socdvc 0 | 1
+	  specifies whether to turn ON or OFF DVC for the CPU/SOC.
+
+	-wcdma <band> |
+	-gsm <band> |
+	-lte <band>
+	  specifies which cellular technology and band to test.  These are very platform-dependent.
+
+	-dotpr [ [-s] [<length> [<iterations>]] ]
+	  runs dotpr_s8_24 with supplied arguments.  If no arguments supplied, runs with application defaults
+	  which is multi-core, a vector length of 4096, and 1e6 iterations.
+
+	-dotprwdc [ [-s] [<length> [<iterations> [<idle time ratio> [<duty cycles>]]]] ]
+	  runs dotpr_s8_24_withDutyCycle with supplied arguments.  If no argument supplied, runs with application
+	  defaults:  vector length of 4096, iterations of 1e6, idle time ration of 50 and duty cyclese of 10.
+
+	-thermswift [ [-s] [-f] [-l <length>] [-n <iterations>] [-i <idle time ratio>]]
+	  runs thermalSwift (no duty cycle) which by default runs with a length of 2048 1e6 times followed by
+	  an idle time.  0 iterations means run forever.
+
+	-thermswiftDC [ [-s] [-f] [-l <length>] [-n <iterations>] [-i <idle time ratio>] [-c <duty cycles>]]
+	  runs thermalSwiftSyntheticDutyCycle which by default runs with a length of 2048 1e6 times followed by
+	  an idle time, with 50% of time spent in idle time for 10 cycles (-c 10).  0 iterations means run forever.
+
+	-thermcyclone [ [-s] [-f] [-l <length>] [-n <iterations>]]
+	  runs thermalCycloneSynthetic (no duty cycle) which by default runs with a length of 4096 1e6 times.
+	  0 iterations means run forever.
+
+	-thermalcycloneDC [ [-s] [-f] [-l <length>] [-n <iterations>] [-i <idle time ratio>] [-c <duty cycles>]]
+	  runs thermalCycloneSyntheticDutyCycle which by default runs with a length of 4096 1e6 times followed by
+	  an idle time, with 50% of time spent in idle time for 10 duty cycles (-c 10, by default).  0 iterations
+	  means run forever.
+
+	-thermA9DotprS824DC [ [-s] [-f] [-l <length>] [-n <iterations>] [-i <idle time ratio>] [-c <duty cycles>] ]
+	  runs thermalA9DotprS824DutyCycle single threaded (-s), forced (-f), of vector length <length> (default 4096),
+	  for <iterations> iterations (default 1e6) with <idle time ration> idle time, in percent (0-99, default 50),
+	  for <duty cycles> optional cycles that utilization+idle sequence is executed (default 10, if 0 then runs
+	  indefinitely).
+
+	-pmsleep <sleep Time In Microseconds>
+	  does sleeps in microseconds to try to trigger singing caps.  Requires that the compiled binary 'pmsleep'
+	  be installed on the device (not currently part of iOS).
+
+	-sensor <sensor> where <sensor> is one of compass | gyro | accel | pressure
+	  specifies which sensor tester to run in the background, checking for sensitivity.  There is no default.
+	  Output written to /private/var/tmp/<sensor>_Tester.txt.  Multiple sensors may be specified on the command
+	  line with:  -sensor accel -sensor -gyro -sensor compass -sensor pressure
+
+	-sensorLogPrefix <prefix> | -slp <prefix>
+	  where prefix is an ASCII string.  It may include \$sn and/or \$hwm where \$sn is the device Serial Number
+	  and \$hwm is the Hardware Model.  If either of \$sn or \$hwm are part of <prefix> then the ASCII string must
+	  be single-quoted, such as:  -slp '\$hwm_\$sn_', which will prefix each of the sensor logs with the hardware
+	  model and serial number, separated by an underscore and with a trailing underscore, producing a prefix such
+	  as:  J2AP_DLXHJ00BF49G_, and if the command-line specified '-sensor compass', then the compass_Tester log
+	  file name would look like this:  /private/var/tmp/J2AP_DLXHJ00BF49G_compass_Tester.txt.
+
+	-memtest arg1 arg2 arg3 arg4
+	  where arg1, the first numeric argument, is the amount of memory to be tested in megabytes; if omitted
+	  (or 'all' given) it defaults to 'all' which tests all available free memory.  arg2 is the number of
+	  passes to run, valid values are 1 to 255; if omitted, 1 is assumed.  arg3 can be -l or -L, and if
+	  specified will cause a memtest.log to be written in the current working directory.  arg4, if specified,
+	  should be 'quick', which will cause an abbreviated set of tests to be run.  If 'quick' is not specified,
+	  the full set of memory tests will be run.
+
+	-gpupv [ -n <iterations> ]
+	  runs GLES2PowerVirus_NonUI with the supplied arguments, if any.
+
+	-cpupv [ -n <iterations> ]
+	  runs the CPU thermal virus specified in the platform config file with the supplied arguments, if any.
+
+	-iozone <args>
+	  placeholder for now.  Not yet implemented.
+
+	-iorw
+	  does a ~15 second write of a file using 'dd' generating a 1GB file in /var/root, followed by 2 sets of
+	  ~8 second reads of the generated file.  The intermediate file generated is /var/root/f1g, and it is
+	  removed when the test completes.
+
+	-backlight [ <cycle time in seconds> ]
+	  cycles the backlight through 0%, 25%, 50%, 75%, 100% and back to 0%, in <cycle time in seconds>.  If no
+	  cycle time is specified, 30 seconds is used.  There are 8 transitions, so the backlight stays in the
+	  setting for <cycle time in seconds> / 8 seconds.  The cycle time must be > 0 but can be < 1.
+
+	-backlightOff | blOff
+	  turns the backlight off for the duration of the test and restores it to its previous state before exiting.
+
+	-airplaneMode | -apm
+	  puts the unit in Airplane mode for the duration of the test, restoring its previous state before exiting.
+
+	-drain
+	  disconnects the unit from USB power during test, restoring previous state before exiting.
+
+	-battcy [ <low%> <high%> ] | [ <dischargeTimeInSecs> <chargeTimeInSecs> ]
+	  specifies whether to discharge/charge the batter from a low of low% to a high of high%, or to discharge
+	  for a discharge-Time-In-Seconds and charge for a charge-Time-In-Seconds
+
+	-relaunchInterval <secs> | -rli <secs>
+	  specifies the number of seconds to elapse bewteen relaunching stimulus that finishes early.  Default is 1 second.
+
+$program runs specified stimuli for the specified period of time (see -testTime above), possibly sampling sensor
+readings in parallel.  If logging of thermal/hdqtool/'powerlog -Bq' data to a csv file is required, use -logging.
+
+ENDSHERE
+  exit($exitCode);
+}
+
+#***************************************************************************
+#
+#   Subroutine : stateToTxt
+#       Author : Neil O'Sullivan
+#         Date : 01 Aug 2011
+#
+#  Description : Translates a state variable into a human readable text string.
+#
+#                Returns:  text string
+#
+#***************************************************************************
+
+use constant SEEKING_THERMHID => 0;
+use constant IN_THERMHID => 1;
+use constant SEEKING_HDQTOOL => 2;
+use constant IN_HDQTOOL => 3;
+use constant SEEKING_SETBATT => 4;
+use constant IN_SETBATT => 5;
+use constant SEEKING_POWERLOG => 6;
+use constant IN_POWERLOG => 7;
+
+use constant STATE_PROGRESSION => (SEEKING_THERMHID, IN_THERMHID,
+				   SEEKING_HDQTOOL, IN_HDQTOOL,
+				   SEEKING_SETBATT, IN_SETBATT,
+				   SEEKING_POWERLOG, IN_POWERLOG,
+				  );
+
+sub stateToTxt {
+  my ($state) = (@_);
+
+  return $state == SEEKING_THERMHID ? 'SEEKING THERMHID'
+    : $state == IN_THERMHID ? 'IN THERMHID'
+      : $state == SEEKING_HDQTOOL ? 'SEEKING HDQTOOL'
+	: $state == IN_HDQTOOL ? 'IN HDQTOOL'
+	  : $state == SEEKING_SETBATT ? 'SEEKING SETBATT'
+	    : $state == IN_SETBATT ? 'IN SETBATT'
+	      : $state == SEEKING_POWERLOG ? 'SEEKING POWERLOG'
+		: $state == IN_POWERLOG ? 'IN POWERLOG'
+		  : 'unknown';
+}
+
+#***************************************************************************
+#
+#   Subroutine : mythdqCb
+#       Author : Neil O'Sullivan
+#         Date : 01 Aug 2011
+#
+#  Description : User-side implementation of SpawnMon callback to parse/merge
+#		 output of both thermhid and hdqtool sensibly into a csv
+#
+#                Returns:  text string
+#
+#***************************************************************************
+
+#iPad:~ root# setbatt raw
+#raw battery voltage:  3826 mV
+#iPad:~ root# powerlog -Bq
+#03/06/12 12:26:46 [Battery] level=23.39%; voltage=3789 mV; current=<unknown>; max_capacity=<unknown>; charging_state=Active; charging_current=2100 mA; battery_temp=35.70 C; adapter_info=4000; connected_status=1; usage=<unknown>; standby=<unknown>;
+
+sub mythdqCb {
+  my ($lineno, $line, $thing) = @_;
+  my $mp = __PACKAGE__ . '::mythdqCb: ';
+
+  my $root = $thing->{CallBackState};
+
+  my $stateIn = &stateToTxt($thing->{CallBackState}->{StateVar});
+
+  $thing->{State}->{Matched} = 0;
+  if ($root->{StateVar} == SEEKING_THERMHID ||
+      $root->{StateVar} == IN_THERMHID) {
+    my $status = \&SpawnMon::thermhidCb($lineno, $line, $thing);
+    if ($root->{StateVar} == SEEKING_THERMHID) {
+      $root->{StateVar} = IN_THERMHID
+	if $root->{Matched};
+    } else {
+      $root->{StateVar} = SEEKING_HDQTOOL
+	unless $root->{Matched};
+    }
+  }
+  if ($root->{StateVar} == SEEKING_HDQTOOL ||
+      $root->{StateVar} == IN_HDQTOOL) {
+    my $status = \&SpawnMon::hdqtoolCb($lineno, $line, $thing);
+    if ($root->{StateVar} == SEEKING_HDQTOOL) {
+      $root->{StateVar} = IN_HDQTOOL
+	if $root->{Matched};
+    } elsif ($root->{Matched} == 0) {
+      $root->{StateVar} = SEEKING_SETBATT;
+    }
+  }
+  if ($root->{StateVar} == SEEKING_SETBATT ||
+      $root->{StateVar} == IN_SETBATT) {
+    my $status = \&SpawnMon::setbattrawCb($lineno, $line, $thing);
+    if ($root->{StateVar} == SEEKING_SETBATT) {
+      $root->{StateVar} = IN_SETBATT
+	if $root->{Matched};
+    } elsif ($root->{Matched} == 0) {
+      $root->{StateVar} = SEEKING_POWERLOG;
+    }
+  }
+  if ($root->{StateVar} == SEEKING_POWERLOG ||
+      $root->{StateVar} == IN_POWERLOG) {
+    my $status = \&SpawnMon::powerlogCb($lineno, $line, $thing);
+    if ($root->{StateVar} == SEEKING_POWERLOG) {
+      $root->{StateVar} = IN_POWERLOG
+	if $root->{Matched};
+    } elsif ($root->{Matched} == 0) {
+      $root->{StateVar} = SEEKING_THERMHID;
+    }
+  }
+
+  my $stateOut = &stateToTxt($root->{StateVar});
+
+  printf STDOUT "$mp state in:  %s, matched %d, state out:  %s, line:  %s", $stateIn,
+    $root->{Matched}, $stateOut, $line
+      if $debug;
+
+  return 0;
+}
+
+#***************************************************************************
+#
+#   Subroutine : getBattLevel
+#       Author : Neil O'Sullivan
+#         Date : 19 Aug 2011
+#
+#  Description : Usage function.
+#
+#***************************************************************************
+
+sub getBattLevel {
+  my $level;
+
+  my $h = &Utils::powerlog();
+  return defined $h && exists $h->{RawLevel} && defined $h->{RawLevel} ? $h->{RawLevel} : undef;
+#  my $status = &execer('powerlog -Bq',
+#		       sub {
+#			 my ($lineNo, $line) = (@_);
+#			 if ($line =~ m<\[Battery\]\s+level=(\d+\.?\d*)%>) {
+#			   $level = $1;
+#			 }
+#			 return 0;
+#		       });
+#  return $level;
+}
+
+#***************************************************************************
+#
+#   Subroutine : getTsMs
+#       Author : Neil O'Sullivan
+#         Date : 21 Apr 2011
+#
+#  Description : gets timestamp in seconds and microseconds from HiRes timer.
+#                It returns a standard timestamp with milliseconds tacked on
+#		 to the seconds field following the decimal.
+#
+#		 Note that if a hash ref is passed in with a populated Time
+#		 field, that is taken as the time where we should also output
+#		 the back camera temperature following the timestamp.
+#
+#                Returns:  timestamp string on success, empty string on failure.
+#
+#***************************************************************************
+
+sub getTsMs {
+  my ($s, $us) = gettimeofday();
+  my $ms = &rnd(1, $us / 1000);
+  if ($ms > 999) {    # increment seconds if $ms > 999 (can be 1000--I've seen it)
+    $s++;
+    $ms = $ms - 1000;
+  }
+  my @s = split(/\s+/, scalar localtime($s));
+  $s[3] .= sprintf ".%03d", $ms;		# append ms to seconds field
+#  print join(' ', @s) . "\n";
+  return join(' ', @s) . "\n";
+}
+
+#***************************************************************************
+#
+#   Subroutine : myexec
+#       Author : Neil O'Sullivan
+#         Date : 03 Jul 2012
+#
+#  Description : This wrapper around Execer::exec() to optionally print
+#                command to STDERR before executing it.
+#
+#                Returns:  status from Execer::exec().
+#
+#***************************************************************************
+
+sub myexec {
+  my ($printIt, @args) = (@_);
+#  my $ts = &Utils::getTsMsString();
+#  chomp $ts;
+#  printf STDERR "%s %s\n", $ts, $args[0]
+  printf STDERR "%6d %s\n", timelocal(localtime) - $startTime, $args[0]
+    if $printIt;
+  return &Execer::execer(@args);
+#  return 1;
+}
+
+#***************************************************************************
+#
+#   Subroutine : outputMatches
+#       Author : Neil O'Sullivan
+#         Date : 11 Feb 2014
+#
+#  Description : Execute command, check output for matching regex.
+#
+#                Returns:  1 for success, 0 otherwise.
+#
+#***************************************************************************
+
+sub outputMatches {
+  my ($cmd, $regex) = (@_);
+  my $mp = __PACKAGE__ . '::outputMatches: ';
+
+  my $match = 0;
+  my $status = &Execer::execer($cmd,
+			       sub {
+				 my ($lineNo, $line) = (@_);
+				 $match = 1
+				   if $line =~ $regex;
+				 return 0;
+			       });
+  return $match;
+}
+
+# main
+
+&registerOpts($clArgs);
+
+my $errors = 0;
+
+unless ($clArgs->process([@ARGV])) { # process command-line
+  print STDERR "$msgp WARNING, error processing command-line\n";
+  $errors++;
+}
+
+if (scalar(@{$clArgs->Unknown}) > 0) {
+  my @unk = grep { $_ !~ m<^\s*$> } @{$clArgs->Unknown};
+  if (scalar(@unk) > 0) {
+    printf STDERR "$msgp ERROR, unrecognized tokens on command-line:  %s\n",
+      join(', ', map { sprintf "'%s'", $_ } @unk);
+    $errors++;
+  }
+}
+
+$bbverbose = $clArgs->get('bbverbose');
+
+$hwm = &lockdownGet('HardwareModel');    #  || 'J85'
+if (defined $hwm) {
+  $hwm =~ s<AP$><>;
+  $hwm =~ s<DEV$><>;
+} else {
+  $errors++;
+  printf STDERR "$msgp ERROR, undefined HardwareModel\n";
+}
+
+exit(1)
+  if $errors;
+
+use constant STDERR2STDOUT => '1>/dev/null & 2>&1';
+
+#### Require hw-specific package
+{
+  my $exists = 0;
+  my $pkg = join('.', $hwm, 'pm');
+  for my $loc (@INC, split(':', $ENV{PERL5LIB})) {
+    #  printf STDERR "checking %s\n", join('/', $loc, $pkg);
+    next unless -f join('/', $loc, $pkg);
+    $exists = 1;
+    last;
+  }
+  unless ($exists) {
+    exec(sprintf "desense_1_14 %s", join(' ', map { sprintf "'%s'", $_ } @ARGV));
+#    printf STDERR "$msgp ERROR, cannot locate base object to load '%s'\n", $pkg;
+#    exit(1);
+  }
+}
+
+require $hwm . '.pm';
+
+my $device = $hwm->new;
+my @deviceBandsGSMTx = ();
+my @deviceBandsLTETx = ();
+my @deviceBandsWCDMATx = ();
+
+if (exists $device->{TX} && defined $device->{TX}) {
+
+  @deviceBandsGSMTx = @{ $device->{'TX'}->{'GSM'}->{'Bands'} }
+    if (exists $device->{TX}->{GSM} && defined $device->{TX}->{GSM} && exists $device->{TX}->{GSM}->{Bands} && defined $device->{TX}->{GSM}->{Bands});
+   
+  @deviceBandsLTETx = @{ $device->{'TX'}->{'LTE'}->{'Bands'} }
+    if (exists $device->{TX}->{LTE} && defined $device->{TX}->{LTE} && exists $device->{TX}->{LTE}->{Bands} && defined $device->{TX}->{LTE}->{Bands}); 
+
+  @deviceBandsWCDMATx = @{ $device->{'TX'}->{'WCDMA'}->{'Bands'} }
+    if (exists $device->{TX}->{WCDMA} && defined $device->{TX}->{WCDMA} && exists $device->{TX}->{WCDMA}->{Bands} && defined $device->{TX}->{WCDMA}->{Bands});
+
+}
+
+if ($debug) {
+  printf STDERR "$msgp Device Bands GSM TX: %s\n", join(',', @deviceBandsGSMTx);
+  printf STDERR "$msgp Device Bands LTE TX: %s\n", join(',', @deviceBandsLTETx);
+  printf STDERR "$msgp Device Bands WCDMA TX: %s\n", join(',', @deviceBandsWCDMATx);
+}
+
+my $pc;
+my $dvcState = { };
+my $buckState = { };
+my $legalBuckStates = { Buck0 => { PWM => 1,
+				   PFM => 1,
+				   Auto => 1,
+				 },
+			Buck5 => { PWM => 1,
+				   PFM => 1,
+				   Auto => 1,
+				 },
+		      };
+my $legalLcmStates = { Off => 1, On => 1 };
+
+if ($clArgs->get('wcdma') ||
+    $clArgs->get('gsm') ||
+    $clArgs->get('lte')) {
+  my ($cpudvc, $socdvc, $buck0, $buck5, $pmic, $wcdma, $gsm, $lte) = map { $clArgs->get($_) } qw(cpudvc socdvc buck0 buck5 pmic wcdma gsm lte);
+  my @modes = ( );
+  my @txmodes = ( );
+  my $mode;
+  if ($clArgs->get('lcmoff')) {
+    if (!($hwm =~ m<P10[5-7]> || $hwm =~ m<J7[5-7]>)) {
+      $errors++;
+      printf STDERR "$msgp ERROR, cannot turn off LCM and LED Boost on platform %s\n", $hwm;
+    } else {
+      $clArgs->store('backlightOff', 1);		# LCM and wLED boost OFF implies -bloff
+    }
+  }
+  if (defined $buck0 || defined $buck5) {
+    if ($hwm =~ m<P10[5-7]> || $hwm =~ m<J7[5-7]>) {
+      if (defined $buck0) {
+	if (exists $legalBuckStates->{Buck0}->{$buck0} &&
+	    defined $legalBuckStates->{Buck0}->{$buck0} &&
+	    $legalBuckStates->{Buck0}->{$buck0}) {
+	  printf STDERR "$msgp setting Buck0 to %s\n", $buck0;
+	  $buckState->{Buck0} = $buck0;
+	} else {
+	  $errors++;
+	  printf STDERR "$msgp ERROR, illegal buck0 state specified '%s'; allowed values:  %s\n", $buck0,
+	    join(', ', keys %{$legalBuckStates->{Buck0}});
+	}
+      }
+      if (defined $buck5) {
+	if (exists $legalBuckStates->{Buck5}->{$buck5} &&
+	    defined $legalBuckStates->{Buck5}->{$buck5} &&
+	    $legalBuckStates->{Buck0}->{$buck5}) {
+	  printf STDERR "$msgp setting Buck5 to %s\n", $buck5;
+	  $buckState->{Buck5} = $buck5;
+	} else {
+	  $errors++;
+	  printf STDERR "$msgp ERROR, illegal buck5 state specified '%s'; allowed values:  %s\n", $buck5,
+	    join(', ', keys %{$legalBuckStates->{Buck5}});
+	}
+      }
+    } else {
+      $errors++;
+      printf STDERR "$msgp ERROR, cannot set buck0 or buck5 states on platform %s\n", $hwm;
+    }
+  }
+  if (defined $cpudvc) {
+    if ($cpudvc == 0 || $cpudvc == 1) {
+      $dvcState->{'Factor1'} = 0;
+    } else {
+      $errors++;
+      printf STDERR "$msgp ERROR, illegal cpudvc value specified '%d'; allowed values:  0, 1\n", $cpudvc;
+    }
+  }
+  if (defined $socdvc) {
+    if ($socdvc == 0 || $socdvc == 1) {
+      $dvcState->{'Factor0'} = 0;
+    } else {
+      $errors++;
+      printf STDERR "$msgp ERROR, illegal socdvc value specified '%d'; allowed values:  0, 1\n", $cpudvc;
+    }
+  }
+  if (defined $pmic) {
+    my $ucpmic = uc $pmic;
+    unless (exists $BB::modes->{'PMIC'}->{$ucpmic} &&
+	    defined $BB::modes->{'PMIC'}->{$ucpmic}) {
+      $errors++;
+      printf STDERR "$msgp ERROR, unrecognized PMIC mode selected '%s', allowed modes are:  %s\n", $pmic,
+	join(', ', grep { $_ !~ m<Off>i } sort { $a cmp $b } map { lc $_ } keys %{$BB::modes->{'PMIC'}});
+    }
+  }
+  if (defined $wcdma) {
+    push(@modes, sprintf "wcdma %s", ($mode = $wcdma));
+    push(@txmodes, 'WCDMA');
+    unless ( grep( /^$wcdma$/, @deviceBandsWCDMATx) ) {
+      $errors++;
+      printf STDERR "$msgp ERROR, unrecognized WCDMA mode selected '%s', allowed modes are:  %s\n", $wcdma,
+	join(', ', grep { $_ !~ m<Off>i } sort { $a cmp $b } @deviceBandsWCDMATx );
+    }
+  }
+  if (defined $gsm) {
+    push(@modes, sprintf "gsm %s", ($mode = $gsm));
+    push(@txmodes, 'GSM');
+    unless ( grep( /^$gsm$/, @deviceBandsGSMTx) ) {
+      $errors++;
+      printf STDERR "$msgp ERROR, unrecognized GSM mode selected '%s', allowed modes are:  %s\n", $gsm,
+	join(', ', grep { $_ !~ m<Off>i } sort { $a cmp $b } @deviceBandsGSMTx );
+    }
+  }
+  if (defined $lte) {
+    push(@modes, sprintf "lte %s", ($mode = $lte));
+    push(@txmodes, 'LTE');
+    unless ( grep( /^$lte$/, @deviceBandsLTETx) ) {
+      $errors++;
+      printf STDERR "$msgp ERROR, unrecognized LTE mode selected '%s', allowed modes are:  %s\n", $lte,
+	join(', ', grep { $_ !~ m<Off>i } sort { $a cmp $b } @deviceBandsLTETx );
+    }
+  }
+  
+  my $modecnt = scalar(@modes);
+  if ($modecnt > 1) {
+    printf STDERR "$msgp ERROR, cannot specify more than one BB TX mode:  these modes were specified:  %s\n",
+      join(', ', @modes);
+    $errors++;
+  } elsif ($modecnt == 1) {
+    if (exists $device->{TX}->{$txmodes[0]}->{Bands} && defined $device->{TX}->{$txmodes[0]}->{Bands}) {
+      unless (grep { $mode eq $_ } @{$device->{TX}->{$txmodes[0]}->{Bands}}) {
+	    printf STDERR "$msgp ERROR, illegal value specified for BB mode %s, allowed are:  %s\n", $modes[0],
+	     join(', ', @{$device->{TX}->{$txmodes[0]}});
+	    $errors++;
+      }
+    } else {
+      printf STDERR "$msgp ERROR, platform %s does not support %s mode %s\n", $hwm, $txmodes[0], $mode;
+      $errors++;
+    }
+  } else {
+    printf STDERR "$msgp ERROR, no BB TX mode specified\n";
+    $errors++;
+  }
+
+}
+
+exit(1)
+  if $errors;
+
+if (scalar keys %{$dvcState}) {
+  $pc = PowerCtrl->new(Verbose => 1);
+  map { $pc->pushSetting($_, $dvcState->{$_}) } keys %{$dvcState};
+}
+
+# ArgsRe validates the arguments are of the correct form
+# ArgsCheck optionally checks the argument values against any known limitations of the app being invoked
+
+my %h = ('dotpr' => { Cmd => 'dotpr_s8_24',
+		      ArgsRe => [  qr<^(\-s)?$>,
+				   qr<^\-s\s+\d+$>,
+				   qr<^\-s\s+(?:\d+(\s+\d+){0,1})$>,
+				   qr<^\d+(\s+\d+){0,1}$>,
+				],
+		      ArgsCheck => sub { return 1; },
+		    },
+	 'dotprwdc' => { Cmd => 'dotpr_s8_24_withDutyCycle',
+			 ArgsRe => [ qr<^(\-s)?$>,
+				     qr<^\-s\s+\d+$>,
+				     qr<^\-s\s+(?:\d+(\s+\d+){0,3})$>,
+				     qr<^\d+(\s+\d+){0,3}$>,
+				   ],
+			 ArgsCheck => sub { return 1; },
+		       },
+	 'thermswift' => { Cmd => 'thermalSwiftSynthetic',
+			   ArgsRe => [ qr<^(\-[fs]{1})?$>,
+				       qr<^\-[fs]{1}\s+\-[fs]{1}>,
+				       qr<^(\-[fs]|)(\s+(\-[fs])|)>,
+				       qr<^(\-[fs]|)(\s+(\-[fs])|)(\-[lnic]{1}\s+\d+(\s+\-[lnic]{1}\s+\d+){0,3}|)$>,
+				       qr<^(\-[lni]{1}\s+\d+(\-[lni]{1}\s+\d+){0,3}|)$>,
+				     ],
+			   ArgsCheck => sub { return 1; },
+			 },
+	 'thermswiftDC' => { Cmd => 'thermalSwiftSyntheticDutyCycle',
+			   ArgsRe => [ qr<^(\-[fs]{1})?$>,
+				       qr<^\-[fs]{1}\s+\-[fs]{1}>,
+				       qr<^(\-[fs]|)(\s+(\-[fs])|)>,
+				       qr<^(\-[fs]|)(\s+(\-[fs])|)(\-[lnic]{1}\s+\d+(\s+\-[lnic]{1}\s+\d+){0,3}|)$>,
+				       qr<^(\-[lnic]{1}\s+\d+(\-[lnic]{1}\s+\d+){0,3}|)$>,
+				     ],
+			   ArgsCheck => sub { return 1; },
+			 },
+	 'thermcyclone' => { Cmd => 'thermalCycloneSynthetic',
+			   ArgsRe => [ qr<^(\-[fs]{1})?$>,
+				       qr<^\-[fs]{1}\s+\-[fs]{1}>,
+				       qr<^(\-[fs]|)(\s+(\-[fs])|)>,
+				       qr<^(\-[fs]|)(\s+(\-[fs])|)(\-[ln]{1}\s+\d+(\s+\-[ln]{1}\s+\d+){0,1}|)$>,
+				       qr<^(\-[ln]{1}\s+\d+(\-[ln]{1}\s+\d+){0,1}|)$>,
+				     ],
+			   ArgsCheck => sub { return 1; },
+			 },
+	 'thermcycloneDC' => { Cmd => 'thermalCycloneSyntheticDutyCycle',
+			   ArgsRe => [ qr<^(\-[fs]{1})?$>,
+				       qr<^\-[fs]{1}\s+\-[fs]{1}>,
+				       qr<^(\-[fs]|)(\s+(\-[fs])|)>,
+				       qr<^(\-[fs]|)(\s+(\-[fs])|)(\-[lnic]{1}\s+\d+(\s+\-[lnic]{1}\s+\d+){0,3}|)$>,
+				       qr<^(\-[lnic]{1}\s+\d+(\-[lnic]{1}\s+\d+){0,3}|)$>,
+				     ],
+			   ArgsCheck => sub { return 1; },
+			 },
+	 'thermA9DotprS824DC' => { Cmd => 'thermalA9DotprS824DutyCycle',
+				   ArgsRe => [ qr<^(\-[fs]{1})?$>,
+				       qr<^\-[fs]{1}\s+\-[fs]{1}>,
+				       qr<^(\-[fs]|)(\s+(\-[fs])|)>,
+				       qr<^(\-[fs]|)(\s+(\-[fs])|)(\-[lnic]{1}\s+\d+(\s+\-[lnic]{1}\s+\d+){0,3}|)$>,
+				       qr<^(\-[lnic]{1}\s+\d+(\-[lnic]{1}\s+\d+){0,3}|)$>,
+				     ],
+			   ArgsCheck => sub { return 1; },
+			 },
+	 'pmsleep' => { Cmd => 'pmsleep',
+			ArgsRe => qr<^(\-s\s+\d+|)$>,
+			ArgsCheck => sub { return 1; },
+		      },
+	 'gpupv' => { Cmd => 'GLES2PowerVirus_NonUI',
+		      ArgsRe => [ qr<^(\-s)?$>,
+				  qr<^\-s\s+\-n\s+(\d+)>,
+				  qr<^\-n\s+(\d+)>,
+				  qr<^\-forceIterations\s+(\d+)>,
+				],
+		      ArgsCheck => sub { return 1; },
+		    },
+
+	 'cpupv' => { Cmd => 'this_should_not_matter',
+		      ArgsRe => [ qr<^(\-s)?$>, qr<^\-s\s+\-n\s+(\d+)>, qr<^\-n\s+(\d+)>, qr<^\-forceIterations\s+(\d+)>, ],
+          #ArgsRe => [ qr<.+> ],
+		      ArgsCheck => sub { return 1; },
+		    },
+
+
+
+	 'iorw' => { Cmd => 'dd if=/dev/urandom of=/var/root/f1g bs=1m count=1k ; dd if=/var/root/f1g of=/dev/null bs=64k ; dd if=/var/root/f1g of=/dev/null bs=64k ; rm -f /var/root/f1g',
+		     ArgsRe => qr<^\s*$>,
+		     ArgsCheck => sub { return 1; },
+		   },
+	 'accel' => { Cmd => 'accelTester -interval 0.005',	# I'll bet this will break at some point, too
+		      ArgsRe => qr<^\s*$>,
+		      ArgsCheck => sub { return 1; },
+		    },
+#	 'gyro' => { Cmd => 'gyroTester -interval 0.001',	# rdar://10896051
+	 'gyro' => { Cmd => 'gyroTester -interval 0.005',	# are we good with this yet?
+		     ArgsRe => qr<^\s*$>,
+		     ArgsCheck => sub { return 1; },
+		   },
+#	 'compass' => { Cmd => 'compassTester -interval 0.001',	# rdar://11657260
+	 'compass' => { Cmd => 'compassTester -interval 0.01',
+			ArgsRe => qr<^\s*$>,
+			ArgsCheck => sub { return 1; },
+		      },
+	 'pressure' => { Cmd => 'pressureTester -interval 0.01 --printTemperature',
+			 ArgsRe => qr<^\s*$>,
+			 ArgsCheck => sub { return 1; },
+		      },
+	 'memtest' => { Cmd => 'memtest',
+			ArgsRe => qr<.*>, # probably not worth the effort
+			ArgsCheck => sub { return 1; },
+		      },
+	 'audiostim' => { Cmd => 'figplayAV',
+			   ArgsRe => [ qr<\S+>,
+				       qr<\-volume\s+\d+\.\d*\s+\S+>,
+				     ],
+			   ArgsCheck => sub { return 1; },
+			 },
+	 'iozone' => { Cmd => 'iozone',
+		       ArgsRe => qr<.*>,
+		       ArgsCheck => sub { return 1; },
+		     },
+	 'backlight' => { Cmd => "setbright", # 0..511 -- or maybe 0.00..1.00
+			  ArgsRe => qr<^(\d+\.?\d*)?$>,
+			  ArgsCheck => sub { return 1; },
+			},
+	 'battcy' => { Cmd => 'setbatt drain',
+		       ArgsRe => [ qr<^((\d+%\s+\d+%)|)$>,
+				   qr<^\d+\s+\d+$>,
+				 ],
+		       ArgsCheck => sub { return 1; },
+		     },
+	);
+
+# syntax checking command-lines
+# -----------------------------
+
+for my $clarg (qw(dotpr dotprwdc gpupv iorw thermswift thermswiftDC thermcyclone thermcycloneDC
+		  thermA9DotprS824DC pmsleep memtest iozone backlight battcy audiostim)) {
+  my $args = $clArgs->get($clarg);
+  if (scalar(@{$args}) > 0) {
+    for my $args (@{$args}) {
+      my $argstring = join (' ', @{$args});
+      my $argsOK = ref($h{$clarg}->{ArgsRe}) =~ m<ARRAY>
+	? (grep { $argstring =~ $_ } @{$h{$clarg}->{ArgsRe}})
+	  : $argstring =~ $h{$clarg}->{ArgsRe};
+      $errors++
+	unless $argsOK;
+      printf "args for %s '%s' %s regex\n", $h{$clarg}->{Cmd}, $argstring,
+	$argsOK ? 'matches' : 'does not match'
+	  if $debug || (! $argsOK);
+
+      printf "%s %s\n", $h{$clarg}->{Cmd}, $argstring
+	if $debug;
+    }
+  }
+}
+
+my $sensorLogPrefix = $clArgs->get('sensorLogPrefix');
+
+$sn = &lockdownGet('SerialNumber');
+
+if (scalar(@{$clArgs->get('sensor')})) {
+  if ($sensorLogPrefix =~ m<\$sn> || $sensorLogPrefix =~ m<\$hwm>) {
+    $sensorLogPrefix =~ s<\$sn><$sn>g;
+    $sensorLogPrefix =~ s<\$hwm><$hwm>g;
+  }
+}
+
+my $blpid;
+if (scalar(@{$clArgs->get('backlight')}) > 0) {
+ ForkBacklight:
+  if ($blpid = fork) {
+    # parent here
+    print "Parent here $$\n";
+  } elsif (defined $blpid) {
+    # child here
+    print "Child here $$\n";
+    my @pcts = (0..4, 3, 2, 1);		# x 25%
+    my $initialBacklight;
+    my $status = &execer('setbright',
+			 sub {
+			   my ($lineNo, $line) = (@_);
+			   if ($line =~ m<Current\:\s*(\d+\.?\d*)\s+\[(\d+\.?\d*),\s*(\d+\.?\d*)\]>) {
+			     $initialBacklight->{Current} = $1;
+			     $initialBacklight->{Min} = $2;
+			     $initialBacklight->{Max} = $3;
+			   }
+			   push(@{$initialBacklight->{Output}}, $line);
+			   print $line
+			     if $debug;
+			   return 0;
+			 });
+    if (exists $initialBacklight->{Max} && defined $initialBacklight->{Max}) {
+      printf STDERR "$msgp Initial backlight setting:  %s, min/max:  %s/%s\n",
+	map { $initialBacklight->{$_} } qw(Current Min Max)
+	  if $debug;
+      my $blstartTime = timelocal(localtime);
+      my $endTime = $blstartTime + $clArgs->get('duration');
+
+      my $roundTo = $initialBacklight->{Max} =~ m<^\d+$> ? 1 : 100;
+      my @blvals = map { &rnd($roundTo, 0.25 * $initialBacklight->{Max} * $_) } @pcts;
+      my $cycleTime = 1_000_000 * $clArgs->get('backlight')->[0]->[0] / scalar(@pcts);	# to get microseconds
+
+      printf STDERR "$msgp cycletime:  %.3lf microseconds\n", $cycleTime
+	if $debug;
+      while (1) {
+	for my $blv (@blvals) {
+	  printf STDERR "$msgp setting brightness to:  %s\n", $blv
+	    if $debug;
+	  $status = &execer((sprintf "setbright %s", $blv),
+			    sub { return 0; });
+	  last
+	    if timelocal(localtime) >= $endTime;
+	  printf STDERR "$msgp sleeping %d microseconds\n", $cycleTime
+	    if $debug;
+	  usleep($cycleTime);
+	}
+	last
+	  if timelocal(localtime) >= $endTime;
+      }
+
+      # restore original backlight setting before exiting
+      printf STDERR "$msgp restoring original backlight setting:  %d\n", $initialBacklight->{Current}
+	if $debug;
+      $status = &execer((sprintf "setbright %s", $initialBacklight->{Current}),
+			sub { return 0; });
+      exit(0);
+    } else {
+      printf STDERR "$msgp ERROR, failed to get initial backlight setting:\n";
+      map { printf "\t%s", $_ } @{$initialBacklight->{Output}};
+      exit(1);
+    }
+  } elsif ($! == &EAGAIN) {
+    sleep 3;
+    redo ForkBacklight;
+  } else {
+    # weird fork error
+    printf STDERR "$msgp ERROR, fork failed:  $!\n";
+    exit(1);
+  }
+}
+
+my $battcypid;
+if (scalar(@{$clArgs->get('battcy')}) > 0) {
+ ForkBattCy:
+  if ($battcypid = fork) {
+    # parent here
+  } elsif (defined $battcypid) {
+    # child here
+    my $battstartTime = timelocal(localtime);
+    my $endTime = $battstartTime + $clArgs->get('duration');
+
+    my $args = join(' ', @{$clArgs->get('battcy')->[0]});
+    my $state = UNSET_STATE;     # we start out discharging
+
+    my $dispid;    # SpawnMon object for 'setbatt drain' process
+
+    if ($args =~ m<(\d+\.?\d*)\%\s+(\d+\.?\d*)\%>) {
+      my $pcts = { Min => $1, Max => $2 };
+      while (1) {
+	my $battLevel = &getBattLevel();
+	printf "$msgp Battery level:  %.2lf, state = %s\n", $battLevel,
+	  $state == UNSET_STATE ? 'UNSET' : $state == CHARGING ? 'CHARGING' : 'DISCHARGING'
+	    if $debug;
+	if ($state == UNSET_STATE) {
+	  # if above minimum battery level, go to discharging
+	  if ($battLevel > $pcts->{Min}) {
+	    printf "$msgp Battery level:  %.2lf%s > min. pct threshold %.2lf%s, UNSET_STATE -> DISCHARGING\n",
+	      $battLevel, '%', $pcts->{Min}, '%'
+		if $debug;
+	    $state = DISCHARGING;
+	    $dispid = SpawnMon->new(Command => 'setbatt drain',
+				    Duration => $clArgs->get('duration'),
+				    LogFile => '/dev/null',
+				    Debug => $debug,
+				   );     # pid of discharge process
+	    printf STDERR "$msgp ERROR, failed to spawn a 'setbatt drain' process\n"
+	      unless defined $dispid;
+
+	  } else {
+	    printf "$msgp Battery Level:  %.2lf%s <= min. pct threshold %.2lf%s, UNSET_STATE -> CHARGING\n",
+	      $battLevel, '%', $pcts->{Min}, '%'
+		if $debug;
+	    $state = CHARGING;
+	    my $status = &execer('setbatt on',
+				 sub {
+				   my ($lineNo, $line) = (@_);
+				   print STDERR $line
+				     if $debug;
+				   return 0;
+				 });
+	  }
+	}
+	if ($state == DISCHARGING) {
+	  if ($battLevel < $pcts->{Min}) {
+	    printf "$msgp Battery level = %.2lf%s < min. pct threshold %.2lf%s, DISCHARGING -> CHARGING\n",
+	      $battLevel, '%', $pcts->{Min}, '%'
+		if $debug;
+	    $state = CHARGING;
+	    if (defined $dispid) {
+	      printf STDERR "$msgp Killing PID %d, the 'setbatt drain' process\n", $dispid->{PID}
+		if $debug;
+	      kill 'HUP', -$dispid->{PID};
+	      waitpid($dispid->{PID}, 0);
+	      $dispid = undef;
+	    }
+	    printf STDERR "msgp turning on charging with 'setbatt on'\n"
+	      if $debug;
+	    my $status = &execer('setbatt on',
+				 sub {
+				   my ($lineNo, $line) = (@_);
+				   print STDERR $line
+				     if $debug;
+				   return 0;
+				 });
+	  }
+	} else {	# it's charging:  see if we've exceeded our upper charge threshold yet
+	  if ($battLevel > $pcts->{Max}) {
+	    $state = DISCHARGING;
+	    printf STDERR "$msgp Battery level = %.2lf > %.2lf, CHARGING -> DISCHARGING\n", $battLevel, $pcts->{Max}
+	      if $debug;
+
+	    $dispid = SpawnMon->new(Command => 'setbatt drain',
+				    Duration => $clArgs->get('duration'),
+				    LogFile => '/dev/null',
+				    Debug => $debug,
+				   );
+	  }
+	}
+	if (timelocal(localtime) + 60 >= $endTime) {
+	  # we will exceed our end time before this cycle finishes, so set up for charging before we exit
+	  if (defined $dispid) {
+	    printf STDERR "$msgp Killing PID %d, the 'setbatt drain' process\n", $dispid->{PID}
+	      if $debug;
+	    kill 'HUP', -$dispid->{PID};
+	    waitpid($dispid->{PID}, 0);
+	  }
+	  printf STDERR "$msgp turning on charging with 'setbatt on'\n"
+	    if $debug;
+	  my $status = &execer('setbatt on',
+			       sub {
+				 my ($lineNo, $line) = (@_);
+				 print STDERR $line
+				   if $debug;
+				 return 0;
+			       });
+	  my $sleepTime = $endTime - timelocal(localtime);
+	  sleep($sleepTime)
+	    if $sleepTime > 0;
+	  exit(0);
+	}
+	sleep(60);    # wait 60 seconds before updating battery level and checking against limits
+      }
+    } elsif ($args =~ m<(\d+)\s+(\d+)>) {
+      my ($dis, $chg) = ($1, $2);
+      while (1) {
+	last
+	  if timelocal(localtime) >= $endTime;
+	if ($state == CHARGING) {
+	  printf STDERR "$msgp charging\n" if $debug;
+	  my $sleepUntil = timelocal(localtime) + $chg;
+	  $sleepUntil = $endTime
+	    if $endTime < $sleepUntil;
+	  printf STDERR "$msgp sleeping for %d seconds while charging\n", $sleepUntil - timelocal(localtime)
+	    if $debug;
+	  sleep($sleepUntil - timelocal(localtime));
+	  $state = DISCHARGING;
+	} else {
+	  printf STDERR "$msgp discharging\n" if $debug;
+	  $dispid =  SpawnMon->new(Command => 'setbatt drain',
+				   Duration => $clArgs->get('duration'),
+				   LogFile => '/dev/null',
+				   Debug => $debug,
+				  )
+	    unless defined $dispid;
+	  my $sleepUntil = timelocal(localtime) + $dis;
+	  $sleepUntil = $endTime
+	    if $endTime < $sleepUntil;
+	  printf STDERR "$msgp sleeping for %d seconds while discharging\n", $sleepUntil - timelocal(localtime)
+	    if $debug;
+	  sleep($sleepUntil - timelocal(localtime));
+	  $state = CHARGING;
+	  if (defined $dispid) {
+	    kill 'HUP', -$dispid->{PID};
+	    waitpid($dispid->{PID}, 0);
+	    $dispid = undef;
+	  }
+	  my $status = &execer('setbatt on',
+			       sub {
+				 my ($lineNo, $line) = (@_);
+				 print $line
+				   if $debug;
+				 return 0;
+			       });
+	}
+      }
+      if (defined $dispid) {
+	kill 'HUP', -$dispid->{PID};
+	waitpid($dispid->{PID}, 0);
+	$dispid = undef;
+	my $status = &execer('setbatt on',
+			     sub {
+			       my ($lineNo, $line) = (@_);
+			       print $line
+				 if $debug;
+			       return 0;
+			     });
+      }
+    } else {
+      printf STDERR "$msgp ERROR, invalid args supplied with -battcy '%s'\n", $args;
+      exit(1);
+    }
+    exit(0);
+  } elsif ($! == &EAGAIN) {
+    sleep 3;
+    redo ForkBattCy;
+  } else {
+    # weird fork error
+    printf STDERR "$msgp ERROR, fork failed:  $!\n";
+    exit(1);
+  }
+}
+
+my %pids = ( );
+
+my @thingsToDo = qw(dotpr dotprwdc gpupv cpupv iorw thermswift thermswiftDC thermcyclone thermcycloneDC thermA9DotprS824DC pmsleep memtest iozone audiostim);
+push(@thingsToDo, qw(pmic wcdma gsm lte));
+
+my %sensors = (compass => 0, gyro => 0, accel => 0, pressure => 0);
+{
+  my $args = $clArgs->get('sensor');
+  for my $arg (@{$args}) {
+    $sensors{$arg} = 1
+      if (exists $sensors{$arg} && defined $sensors{$arg});
+  }
+}
+
+for my $sensr (keys %sensors) {
+  push(@thingsToDo, $sensr)
+    if $sensors{$sensr};
+}
+
+# set up environment:
+#  1.  check whether backlightOff is specified, and if so,
+#     a.  save current backlight setting
+#     b.  set backlight off
+#     c.  remember to reset current setting before quitting
+#  2.  check whether drain is specified, and if so,
+#     a.  launch 'setbatt drain' in background
+#     b.  remember to 'setbatt on' before exiting
+#  3.  check whether AirplaneMode is specified, and if so,
+#     a.  read/save current mode
+#     b.  turn on AirplaneMode
+#     c.  remember to restore initial mode, if it was off initially
+
+my $initialState = { };
+$startTime = timelocal(localtime);
+
+if ($clArgs->get('backlightOff')) {
+  my $initialBacklight;
+  my $status = &execer('setbright',
+		       sub {
+			 my ($lineNo, $line) = (@_);
+			 if ($line =~ m<Current\:\s*(\d+\.?\d*)\s+\[(\d+\.?\d*),\s*(\d+\.?\d*)\]>) {
+			   $initialBacklight->{Current} = $1;
+			   $initialBacklight->{Min} = $2;
+			   $initialBacklight->{Max} = $3;
+			 }
+			 push(@{$initialBacklight->{Output}}, $line);
+			 print $line
+			   if $debug;
+			 return 0;
+		       });
+  unless (exists $initialBacklight->{Current} &&
+	  defined $initialBacklight->{Current} &&
+	  exists $initialBacklight->{Min} &&
+	  defined $initialBacklight->{Min} &&
+	  exists $initialBacklight->{Max} &&
+	  defined $initialBacklight->{Max}) {
+    printf STDERR "$msgp ERROR, failed to get brightness settings from 'setbright' command, got:  %s\n",
+      join(', ', @{$initialBacklight->{Output}});
+    exit(&ERROR_CODE_SETBRIGHT);
+  }
+  $initialState->{Backlight}->{Value} = $initialBacklight->{Current};
+
+  # diagstool probably won't work on UI builds
+  # we should check whether it exists in PATH before trying to invoke it
+  # we should also be abstracting these calls to the PadDevice per-device-family package
+  #   the same way audiosnoop does
+
+  {
+    my @cmds = ((sprintf "setbright %s", $initialBacklight->{Min}), 'powerswitch lcd off');
+
+    push(@cmds, 'diagstool hwmisc --displayPower=0')
+      if &Utils::existsAndExeLocal('diagstool') &&
+      &outputMatches('diagstool hwmisc --help', qr<\s+\-\-displayPower>);
+
+    for my $cmd (@cmds) {
+      $status = &myexec($debug, $cmd,
+			sub { 
+			  my ($lineNo, $line) = @_;
+			  printf $line;
+			  return 0;
+			});
+      printf STDERR "$msgp ERROR, command '%s' returned bad status %d:  $!\n", $cmd, $status
+	unless $status == 1;
+    }
+  }
+}
+
+if ($clArgs->get('drain')) {
+  my $smpid = SpawnMon->new(Command => &DRAIN,
+			    Duration => $clArgs->get('duration'),
+			    LogFile => '/dev/null',
+			    Debug => $debug,
+			   );
+  $initialState->{Drain}->{PID} = $smpid->{PID};
+}
+
+if ($clArgs->get('airplaneMode')) {
+  my $apmode;
+  my $status = &execer(&AIRPLANEMODE_TEST,
+		       sub {
+			 my ($LineNo, $line) = (@_);
+			 $apmode = $1
+			   if ($line =~ m<^(\d+)$>);
+			 print "AirplaneMode:  $line\n"
+			   if defined $apmode;
+			 return 0;
+		       });
+  if (defined $apmode && $apmode == 0) {
+    $initialState->{AirplaneMode}->{Value} = $apmode;
+#    $status = &execer(&AIRPLANEMODE_ON, sub { return 0 });
+    $status = &myexec($debug, &AIRPLANEMODE_ON,
+		      sub { 
+			my ($lineNo, $line) = @_;
+			printf $line;
+			return 0 });
+  }
+}
+
+push(@thingsToDo, &THERMHID)
+  if $clArgs->get('logging');
+
+my @cmds = ( );
+
+for my $fn (@thingsToDo) {
+  if (exists $sensors{$fn} && defined $sensors{$fn}) {
+
+    printf STDERR "$msgp launching '%s' for %d seconds\n", $h{$fn}->{Cmd}, $clArgs->get('duration')
+      if $debug;
+
+    my $smpid = SpawnMon->new(Command => $h{$fn}->{Cmd},
+			      Duration => $clArgs->get('duration'),
+			      LogFile => (sprintf "/private/var/tmp/%s%s_Tester.txt", $sensorLogPrefix, $fn),
+			      Annotator => \&Utils::getTsMsString,
+			      Debug => $debug,
+			     );
+
+    printf STDERR "$msgp PID is %d\n", $smpid->{PID}
+      if $debug;
+
+    push(@{$pids{$fn}}, $smpid->{PID});
+  } elsif ($fn eq &THERMHID) {
+    my $csv = $clArgs->get('csv');
+    $csv =~ s<\$program/\$program><$program/${sn}_desense>
+      if $csv eq &DEFAULTCSV;
+    my $csvdir = $csv;
+    $csvdir = $1
+      if $csvdir =~ m<^(.*)/>;
+
+    # make the destination directory if it does not exist
+
+    if (defined $csvdir && (! -d $csvdir)) {
+      # we'll just hope this works....
+#      my $status = &Execer::execer("mkdir -p $csvdir",
+#				   sub { return 0; });
+      my $status = &myexec($debug, "mkdir -p $csvdir",
+			   sub { 
+			     my ($lineNo, $line) = @_;
+			     printf $line;
+			     return 0; });
+    }
+    my $smpid = SpawnMon->new(Command => join(' ; ', &THERMHID, &HDQTOOL, &SETBATTRAW, &Utils::powerlogCmd()),
+			      InvFreq => $clArgs->get('logInterval'),
+			      Duration => $clArgs->get('duration'),
+			      LogFile => $csv,
+			      CallBack => \&mythdqCb,
+			      CallBackState => {StateVar => SEEKING_THERMHID,
+						DataHash => { },
+					       });
+    push(@{$pids{$fn}}, $smpid->{PID});
+  } elsif ($fn eq 'pmic' || $fn eq 'wcdma' || $fn eq 'gsm' || $fn eq 'lte') {
+    push(@cmds, [$fn, undef])
+      if defined $clArgs->get($fn);
+  } else {
+    my $args = $clArgs->get($fn);
+    for my $argset (@{$args}) {
+      my $cmd;
+      if (exists $device->{Tests}->{$program}->{$fn}->{On} &&
+	  defined $device->{Tests}->{$program}->{$fn}->{On}) {
+	my $croot = $device->{Tests}->{$program}->{$fn}->{On}->[0];
+	$croot =~ s<SpawnMon\:\s*><>;
+	$cmd = join(' ', $croot, @{$argset});
+	$cmd .= ' >/dev/null';
+      } else {
+	$cmd = join(' ', $h{$fn}->{Cmd}, @{$argset});
+#	$cmd .= ' 2>&1'
+#	  if $fn eq 'audiostim';
+      }
+      push(@cmds, [$fn, $cmd]);
+    }
+  }
+}
+
+if (my $delay = $clArgs->get('delay')) {
+  printf STDERR "$msgp delaying %d seconds\n", $delay if $debug;
+  sleep $delay;
+}
+
+my $ccUnloaded = 0;
+
+for my $ccmd (@cmds) {
+  my ($fn, $cmd) = @{$ccmd};
+  if ($fn eq 'pmic' || $fn eq 'wcdma' || $fn eq 'gsm' || $fn eq 'lte') {
+    my $mode = $clArgs->get($fn); # band
+    next unless defined $mode;
+    my $fN = uc $fn;
+    unless (exists $device->{'TX'}->{$fN}->{'Modes'}->{$mode} &&
+	    defined $device->{'TX'}->{$fN}->{'Modes'}->{$mode}) {
+      printf STDERR "$msgp ERROR, missing TX %s %s, skipping\n", $fn, $mode;
+      next;
+    }
+    unless ($ccUnloaded) {
+      my @c = ('launchctl unload /System/Library/LaunchDaemons/com.apple.CommCenter.plist',
+#               'BBUpdaterSupreme uf -a -w -d "-l 0xffff -H"',
+                'BBUpdaterSupreme bu -d "-H"',
+               'ETLTool UART 115200 ping',
+	       'sleep 5');
+      for my $cmd (@c) {
+	if ($cmd =~ m<^sleep>) {
+	  my $sleepTo40 = 40 - (timelocal(localtime) - $startTime);
+	  $cmd =~ s<5><$sleepTo40>;
+	}
+	my $status = &myexec($debug, $cmd,
+			     sub {
+			       my ($lineNo, $line) = (@_);
+			       print STDERR $line if $bbverbose;
+			       return 0;
+			     });
+      }
+      $ccUnloaded = 1;
+
+      if ($clArgs->get('lcmoff')) {
+    	for my $cmd (@{$BB::lcm->{$device->{PMU}}->{Off}}) {
+	  my $status = &myexec($debug, $cmd,
+			       sub {
+				 my ($lineNo, $line) = @_;
+				 print STDERR $line if $bbverbose;
+				 return 0;
+			       });
+	}
+      }
+    }
+
+    my $cmdprefix = &ETLTOOL;
+    printf STDERR "$msgp looking up commands for %s %s\n", $fN, $mode; # band
+    my $sendFailures = 0;
+    my $cmdcnt = 0;
+    my $bbStartTime = timelocal(localtime);
+    my $endTime = $bbStartTime + $clArgs->get('duration') - 40;
+
+    my @codes = @{ $device->{'TX'}->{$fN}->{'Modes'}->{$mode} };
+    printf STDERR "$msgp commands for %s %s are: %s\n", $fN, $mode, join(' ', @codes);
+
+    for my $rawcmd (@codes) {
+      my $cmd = join(' ', $cmdprefix, $rawcmd);
+      my $receivedResponse = 0;
+      my $sendingCommand = 0;
+      for my $stab (1..3) {
+	printf STDERR "$msgp WARNING resending command due to lack of 'Received Response' in output\n"
+	  unless $stab == 1;
+        my $status = &myexec($debug, $cmd,
+			     sub {
+			       my ($lineNo, $line) = (@_);
+			       $sendingCommand = 1
+				 if $line =~ m<Sending\s+Command>;
+			       print STDERR $line
+				 if $bbverbose && $sendingCommand && $line !~ m<^\s*$>;
+			       $receivedResponse = 1
+				 if $line =~ m<Received\s+Response.*Payload>;
+			       return 0;
+			     });
+	sleep 1 if $cmdcnt++ == 0; # sleep 1 second only after sending first command
+	last
+	  if $receivedResponse || $sendFailures > 3;
+	$sendFailures++;
+      }
+    }
+ 
+    #
+    # Wait until our stop time...
+    #
+    {
+      my $iter = 0;
+      while (1) {
+	printf STDERR "Current Time: %s vs EndTime: %s\n", scalar(localtime(time)), scalar(localtime($endTime))
+	  unless $iter++ % 5;
+	last if timelocal(localtime) >= $endTime;
+	sleep(1);
+      }
+    }
+
+    #
+    # Stop Transmit for the given Function
+    #	  
+    @codes = @{ $device->{'TX'}->{$fN}->{'Modes'}->{'Off'} };
+    for my $rawcmd (@codes) {
+      my $cmd = join(' ', $cmdprefix, $rawcmd);
+      my $receivedResponse = 0;
+      my $sendingCommand = 0;
+      for my $stab (1..3) {
+	printf STDERR "$msgp WARNING resending command due to lack of 'Received Response' in output\n"
+	  unless $stab == 1;
+        my $status = &myexec($debug, $cmd,
+			     sub {
+			       my ($lineNo, $line) = (@_);
+			       $sendingCommand = 1
+				 if $line =~ m<Sending\s+Command>;
+			       print STDERR $line
+				 if $bbverbose && $sendingCommand && $line !~ m<^\s*$>;
+			       $receivedResponse = 1
+				 if $line =~ m<Received\s+Response.*Payload>;
+			       return 0;
+			     });
+	sleep 1 if $cmdcnt++ == 0; # sleep 1 second only after sending first command
+	last if $receivedResponse || $sendFailures > 3;
+	$sendFailures++;
+	printf STDERR "Current Time: %s vs EndTime: %s\n", scalar(localtime(time)), scalar(localtime($endTime));
+      }
+    }
+    printf STDERR "$msgp ERROR, encountered %d command send failures with baseband\n", $sendFailures if $sendFailures;
+  } else {
+
+    printf STDERR "$msgp launching command '%s' for %d seconds\n", $cmd,
+      $clArgs->get('duration') - $clArgs->get('delay')
+	if $debug;
+
+    my $smpid = SpawnMon->new(Command => $cmd,
+			      Duration => $clArgs->get('duration') - $clArgs->get('delay'),
+			      InvFreq => $clArgs->get('relaunchInterval'),
+			      LogFile => $fn eq 'memtest' ? './memtest.log' : '/dev/null',
+			      Debug => $debug,
+			     );
+    if (defined $smpid) {
+      push(@{$pids{$fn}}, $smpid->{PID});
+    } else {
+        printf STDERR "$msgp ERROR, launch of '%s' failed\n", $cmd;
+    }
+  }
+}
+
+for my $pkey (keys %pids) {
+  for my $pid (@{$pids{$pkey}}) {
+    if (defined $pid) {
+#      printf "Waiting on %s PID %d\n", $h{$pkey}, $pid
+      printf "Waiting on %s PID %d\n", $pkey, $pid
+	if $debug;
+      waitpid($pid, 0);
+    }
+  }
+}
+
+if (grep { /iorw/ } @thingsToDo) {
+  unlink('/var/root/f1g');
+}
+
+if (defined $battcypid) {
+  printf "Waiting on battery cycling PID %d\n", $battcypid;
+  waitpid($battcypid, 0);
+
+  # make sure we leave the unit in a charging state
+
+  my $status = &execer('setbatt on',
+		       sub {
+			 my ($lineNo, $line) = (@_);
+			 print $line
+			   if $debug;
+			 return 0;
+		       });
+}
+
+if (defined $blpid) {
+  printf "Waiting on backlight PID %d\n", $blpid;
+  waitpid($blpid, 0);
+}
+  
+#                   <total test time>       -        <elapsed so far>
+my $timeToFinish = $clArgs->get('duration') - (timelocal(localtime) - $startTime);
+sleep($timeToFinish)
+  if $timeToFinish > 0;
+
+# undo prep work, if any
+
+for my $buck (keys %{$buckState}) {
+  next
+    if $buckState->{$buck} eq 'Auto';
+  my $prgm = $BB::pmu->{$device->{PMU}}->{$buck}->{Auto};
+  for my $cmd (@{$prgm}) {
+    my $status = &myexec($debug, $cmd,
+			 sub {
+			   my ($lineNo, $line) = @_;
+			   print STDERR $line if $bbverbose;
+			   return 0;
+			 });
+  }
+}
+
+if ($clArgs->get('lcmoff')) {
+  for my $cmd (@{$BB::lcm->{$device->{PMU}}->{On}}) {
+    my $status = &myexec($debug, $cmd,
+			 sub {
+			   my ($lineNo, $line) = @_;
+			   print STDERR $line if $bbverbose;
+			   return 0;
+			 });
+  }
+}
+
+if (scalar keys %{$dvcState}) {
+  map { $pc->popSetting($_) } keys %{$dvcState};
+}
+
+if ($clArgs->get('backlightOff')) {
+  # we really should be getting this stuff from the platform-specific object, ala audiosnoop
+  {
+    my @cmds = ();
+
+    push(@cmds, 'diagstool hwmisc --displayPower=1')
+      if &Utils::existsAndExeLocal('diagstool') &&
+      &outputMatches('diagstool hwmisc --help', qr<\s+\-\-displayPower>);
+
+    push(@cmds, 'powerswitch lcd on',
+	 # restore original brightness
+	 sprintf "setbright %s", $initialState->{Backlight}->{Value});
+    for my $cmd (@cmds) {
+      my $status = &myexec($debug, $cmd,
+			   sub { 
+			     my ($lineNo, $line) = @_;
+			     printf $line;
+			     return 0;
+			   });
+    }
+  }
+}
+
+if ($clArgs->get('drain')) {
+  waitpid($initialState->{Drain}->{PID}, 0);
+  my $status = &execer(&DRAIN_OFF, sub { return 0; });
+}
+
+{
+  my $pmic = $clArgs->get('pmic');
+  if (defined $pmic && $pmic ne 'AM') {
+    my $cmdprefix = &ETLTOOL;
+    my @c = map { join(' ', $cmdprefix, $_) } @{$BB::modes->{'PMIC'}->{'AM'}};		# put back in auto mode
+    printf STDERR "$msgp restoring PMIC AM\n";
+    for my $cmd (@c) {
+      my $status = &myexec($debug, $cmd,
+			   sub {
+			     my ($lineNo, $line) = @_;
+			     printf STDERR $line if $bbverbose;
+			     return 0;
+			   });
+    }
+  }
+}
+
+# TX off if we turned it on
+for my $ccmd (@cmds) {
+  my ($fn, $cmd) = @{$ccmd};
+  if ($fn eq 'wcdma' || $fn eq 'gsm' || $fn eq 'lte') {
+    my $mode = $clArgs->get($fn);
+    next unless defined $mode;
+    my $fN = uc $fn;
+    my @codes = @{ $device->{'TX'}->{$fN}->{'Modes'}->{'Off'} };
+    my $cmdprefix = &ETLTOOL;
+    # TX off
+    my @c = map { join(' ', $cmdprefix, $_) } @codes ;
+    push(@c, 'launchctl load -w /System/Library/LaunchDaemons/com.apple.CommCenter.plist');
+    for my $cmd (@c) {
+      my $status = &myexec($debug, $cmd,
+			   sub {
+			     my ($lineNo, $line) = @_;
+			     printf STDERR $line if $bbverbose;
+			     return 0;
+			   });
+    }
+  }
+}
+
+if ($clArgs->get('airplaneMode')) {
+  if (exists $initialState->{AirplaneMode} &&
+      exists $initialState->{AirplaneMode}->{Value} &&
+      defined $initialState->{AirplaneMode}->{Value} &&
+      # if we turned on airplane mode and it was initially off, turn it off before we exit
+      $initialState->{AirplaneMode}->{Value} == 0) {
+#    my $status = &execer(&AIRPLANEMODE_OFF, sub { return 0 });
+    my $status = &myexec($debug, &AIRPLANEMODE_OFF,
+			 sub {
+			   my ($lineNo, $line) = @_;
+			   printf $line;
+			   return 0;
+			 });
+  }
+}
+
+exit(0);

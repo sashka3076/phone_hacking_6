@@ -1,0 +1,134 @@
+#!/bin/sh
+# timeTabSwitch
+# PerformanceTools
+#
+# Times tab switching in a UITabBarController
+#
+# timeTabSwitch was heavily inspired by the timeEvents script.
+# Copyright 2012 Apple Inc. All rights reserved.
+#
+
+#
+# For the curious, here is an example trace of what happens
+# when the user switches tabs. We are timing from the entry of
+# -[UITabBarController _tabBarItemClicked:] to the return of
+# the second -[UIViewController _executeAfterAppearanceBlock].
+# The goal is to determine how much time is spent in
+# view*Appear and view*Disappear methods.
+#
+#	>>> UITabBarController	-_tabBarItemClicked:
+#	UINavigationController	-viewWillAppear:
+#	UIViewController	-viewWillAppear:
+#	UIMoreListController	-viewWillAppear:
+#	UIViewController	-viewWillAppear:
+#	UINavigationController	-viewWillDisappear:
+#	UIViewController	-viewWillDisappear:
+#	IUGeniusMixViewController	-viewWillDisappear:
+#	IUiPodViewController	-viewWillDisappear:
+#	UIViewController	-viewWillDisappear:
+#	<<< UITabBarController	-_tabBarItemClicked:
+#	>>> UIViewController	-_executeAfterAppearanceBlock
+#	UINavigationController	-viewDidDisappear:
+#	UIViewController	-viewDidDisappear:
+#	IUGeniusMixViewController	-viewDidDisappear:
+#	IUiPodViewController	-viewDidDisappear:
+#	UIViewController	-viewDidDisappear:
+#	<<< UIViewController	-_executeAfterAppearanceBlock
+#	>>> UIViewController	-_executeAfterAppearanceBlock
+#	UINavigationController	-viewDidAppear:
+#	UIViewController	-viewDidAppear:
+#	UIViewController	-viewDidAppear:
+#	<<< UIViewController	-_executeAfterAppearanceBlock
+#
+
+me=`basename $0`
+
+if (($# == 0)); then
+	echo "usage: $me [options] ProcessName <additional args to dtrace>"
+	echo ""
+	echo "       Options: -u       Use microseconds (us) rather than milliseconds (ms)"
+
+	exit 1
+fi
+
+while getopts ":u" opt; do
+	case $opt in
+		u)  us=1 ;;
+		\?) echo "Invalid option -$OPTARG" >&2 ; exit 1 ;;
+		:)  echo "Option -$OPTARG requires an argument." >&2 ; exit 1 ;;
+	esac
+done
+
+shift $(($OPTIND-1))
+
+if (($# < 1)); then
+	echo "Please specify a process name to time events." >&2
+	exit 1
+fi
+
+if [ $us ]; then
+	unit_label="us"
+	unit_scale="1000"
+	unit_buffer="10"
+else
+	unit_label="ms"
+	unit_scale="1000000"
+	unit_buffer="5"
+fi
+
+pname="$1"
+pid=`pgrep -x ""$pname""`
+
+
+### Define Probes
+
+probes='
+objc$target::-_tabBarItemClicked?:entry
+{
+	self->startTime = timestamp;
+	self->executeAfterCount = 0;
+}
+
+objc$target::-_executeAfterAppearanceBlock:return
+{
+	self->executeAfterCount++;
+}
+
+objc$target::-_executeAfterAppearanceBlock:return
+/ self->executeAfterCount == 2 /
+{
+	self->endTime = timestamp;
+	self->totalTime = self->endTime - self->startTime;
+	printf("switch time %'$unit_buffer'd '$unit_label' %s\n", self->totalTime / '$unit_scale', self->loaded_views?"loaded views":"");
+	self->loaded_views = 0;
+}
+
+objc$target::-viewDidLoad:entry
+{
+	self->loaded_views = 1;
+}
+'
+
+dtrace='
+#pragma D option quiet
+BEGIN
+{
+	printf("Ready to time tab switching.\n");
+	self->loaded_views = 0;
+}
+'$probes'
+END
+{
+	printf("Done measuring.\n");
+}
+'
+
+
+### Run DTrace
+
+echo "Starting up dtrace..."
+if ((${#pid} > 0)); then
+	dtrace -p $pid -n "$dtrace" $3
+else
+	dtrace-wait -quiet "$pname" -n "$dtrace" $3
+fi

@@ -1,0 +1,158 @@
+#!/bin/sh
+
+# location option for ioavtool; either "-internal" or null (default)
+LOC=
+
+# IOMFB display: 0 = internal CLCD; 1 = external display (default)
+DISPLAY=1
+
+# process options
+while [ $# -gt 0 ]; do
+    case $1 in
+        -internal|-edp)
+            LOC="-internal"
+            DISPLAY=0
+            ;;
+        *)
+            echo "unknown option: $1" 1>&2
+            echo "usage: ioavtool [-internal]" 1>&2
+        exit 1
+            ;;
+    esac
+    shift
+done
+
+echo -------------------------------
+echo *********SYSTEM INFO***********
+echo -------------------------------
+ioavtool -sysinfo
+
+echo -------------------------------
+echo *********IOREG INFO************
+echo -------------------------------
+ioreg -c IOAVController -w 0 -rd 10 -l
+
+echo -------------------------------
+echo ***********AV LINK*************
+echo -------------------------------
+# print DP link training info, if applicable
+if type -t displayPort > /dev/null; then
+    displayPort ${LOC:+-edp} -ct
+fi
+ioavtool ${LOC} -cl
+
+# external only
+if [ ${DISPLAY} -eq 1 ]; then
+    echo -------------------------------
+    echo *********AV SINK INFO***********
+    echo -------------------------------
+    ioavtool -info
+fi
+
+echo -------------------------------
+echo *********AV ELEMENTS***********
+echo -------------------------------
+ioavtool ${LOC} -ls
+
+# external only
+if [ ${DISPLAY} -eq 1 ]; then
+    if type -t bluesteel > /dev/null; then
+        echo -------------------------------
+        echo *******BLUESTEEL INFO**********
+        echo -------------------------------
+        echo "Firmware Mode:  `bluesteel -mode`"
+        echo -------------------------------
+        echo *******BLUESTEEL LINK**********
+        echo -------------------------------
+        bluesteel -cl
+    fi
+
+    if type -t snowwhite > /dev/null; then
+        echo -------------------------------
+        echo *******SNOWWHITE INFO**********
+        echo -------------------------------
+        snowwhite -info
+    fi
+
+    if type -t hoover > /dev/null; then
+        echo -------------------------------
+        echo *******HOOVER INFO**********
+        echo -------------------------------
+        hoover -info
+        echo
+    fi
+fi
+
+if type -t IOMFBDebug > /dev/null; then
+    echo -------------------------------
+    echo *********IOMFB INFO************
+    echo -------------------------------
+    IOMFBDebug -d ${DISPLAY}
+fi
+
+if type -t CADebug > /dev/null; then
+    echo -------------------------------
+    echo ********CADebug INFO***********
+    echo -------------------------------
+    CADebug --displays
+    echo
+fi
+
+echo -------------------------------
+echo ***AV CONTROLLER REGISTERS*****
+echo -------------------------------
+ioavtool ${LOC} -rall IOAVController
+
+# eDP only
+if [ ${DISPLAY} -eq 0 ]; then
+    echo -------------------------------
+    echo ***DPTX PHY REGISTERS*****
+    echo -------------------------------
+    ioavtool ${LOC} -rall AppleDPTXPHY
+fi
+
+echo -------------------------------
+echo *****AV DEVICE REGISTERS*******
+echo -------------------------------
+ioavtool ${LOC} -rall IOAVDevice
+
+echo -------------------------------
+echo *****AV SERVICE REGISTERS******
+echo -------------------------------
+ioavtool ${LOC} -rall IOAVService
+
+echo -------------------------------
+echo ***AV CONTROLLER EVENT LOG*****
+echo -------------------------------
+ioavtool ${LOC} -history IOAVController -events IOAVController
+
+echo -------------------------------
+echo *****AV DEVICE EVENT LOG*******
+echo -------------------------------
+ioavtool ${LOC} -history IOAVDevice -events IOAVDevice
+
+echo -------------------------------
+echo *****AV SERVICE EVENT LOG******
+echo -------------------------------
+ioavtool ${LOC} -history IOAVService -events IOAVService
+
+# external only
+if [ ${DISPLAY} -eq 1 ]; then
+    echo -------------------------------
+    echo ****AUDIO DRIVER EVENT LOG*****
+    echo -------------------------------
+    ioavtool -history IOAVAudioDriver -events IOAVAudioDriver
+fi
+
+if type -t syslog > /dev/null; then
+    echo -------------------------------
+    echo ***********SYSLOG**************
+    echo -------------------------------
+    syslog
+fi
+
+echo -------------------------------
+echo *******LOGGING COMPLETE********
+echo -------------------------------
+
+echo Please copy all the data above into a text file and attach it to your bug

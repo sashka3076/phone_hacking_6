@@ -1,0 +1,1322 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Carp;
+
+use Time::HiRes qw(usleep gettimeofday tv_interval);
+use POSIX;
+use Time::Local;
+
+use constant PERL5LIB => ('/var/root/Packages', '/AppleInternal/Library/PerlModules');
+use constant DEFAULTPATH => '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin';
+
+BEGIN {
+  if (exists $ENV{PERL5LIB} && defined $ENV{PERL5LIB}) {
+    for my $thing (&PERL5LIB) {
+      my @matches = grep { $thing eq $_ } split(/:/, $ENV{PERL5LIB});
+      unless (scalar(@matches) > 0) {
+	$ENV{PERL5LIB} .= ':' . $thing;
+	push(@INC, $thing);
+      }
+    }
+  } else {
+    $ENV{PERL5LIB} = join(':', &PERL5LIB);
+    push(@INC, &PERL5LIB);
+  }
+  my @pathIn = exists $ENV{PATH} && defined $ENV{PATH} ? split(/:/, $ENV{PATH}) : ();
+  for my $dpath (split(':', &DEFAULTPATH)) {
+    my @matches = grep { $dpath eq $_ } @pathIn;
+    unless (scalar(@matches) > 0) {
+      push(@pathIn, $dpath);
+    }
+  }
+  $ENV{PATH} = join(':', @pathIn);
+}
+
+use Execer qw(execer);
+use SpawnMon;
+use Utils qw(rnd existsAndExeLocal lockdownGet);
+use ClArgs;
+use ClArgsCb qw(Scalar Aref Bool);
+use Statistics;
+use StressRack;
+use Data::Dumper;
+use MotionSensors;
+use Oscar;
+
+use constant DURATION => 10;
+use constant SLEEPDURATION => 10;
+use constant ITERATIONS => 1000;
+
+use constant POWERSTATLOG => '/private/var/tmp/powerstat-log.txt';
+
+use constant AXES => qw(X Y Z);
+
+use constant CPUVIRUS => 'thermalCycloneSyntheticDutyCycle -i 10 -c 0 2>&1';
+
+use constant TIMESTAMPRE => '(\S{3})\s+(\S{3})\s+(\d+)\s+(\d+)\:(\d+)\:(\d+)\.(\d+)\s+(\d{4})';
+use constant MOMAP => qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+
+use constant MIN_BATTERY_LEVEL => 5;	# stop discharging if battery level drops to this or lower
+
+use constant MIN_DURATION => 0.1;
+
+use constant VERSION => 'deviceval-2.10.2';
+
+
+# Global declarations and command-line parsing.
+# Real code lies below subroutine definitions.
+# ---------------------------------------------
+my ($pPath, $program) = $0 =~ m<^(.*/|)(.*),?(.*)$>;
+my $msgp = __PACKAGE__ . "::$program:";
+# for HWTest logging to console
+my $TimeStamp = time;
+my $clArgs = ClArgs->new(Verbose => 0);
+my ($debug, $verbose) = (0, 0);
+my ($pobj, $oobj);		# platform object, oscar object
+my @sensors = ();
+my $sensorData;
+my $hasPhosphorous;
+my $tsre = &TIMESTAMPRE;
+$tsre = qr<$tsre>;
+
+my %months = map { (&MOMAP)[$_] => $_ } (0..11);
+
+my $srelKeys = { };
+
+#***************************************************************************
+#
+#   Subroutine : printUsage
+#       Author : Neil O'Sullivan
+#         Date : 04 Dec 2012
+#
+#  Description : Usage function.
+#
+#***************************************************************************
+
+sub printUsage {
+  my ($exitCode) = @_;
+  my $mp = __PACKAGE__ . '::printUsage: ';
+
+  print <<ENDSHERE1;
+
+$program <args> [-h | -help |-h]
+
+where <args> are any combination of:
+
+	-debug
+	  This specifies debug mode, generating verbose output.
+
+	-h | -help
+	  Prints this 'help' output and exits.
+
+	-verbose | -noverbose
+	  turns on/off verbose mode.  Verbose mode is normally off.
+
+	-version
+	  writes the software version to STDOUT and exits.
+
+	-delay <seconds>
+	  specifies the number of seconds to delay the start of the test, giving you time to disconnect
+	  the device from a Kong cable and plug in power and put in a fixed location.  Default is 60.
+
+	-duration <seconds>
+	  specifies the number of seconds to sample the sensors (default is 10)
+
+	-sleep <seconds>
+	  specifies the number of seconds to sleep after each sensor reading iteration (default is 10)
+
+	-cmdLine <commandInvocation>
+	  specifies a command-line to run before each cycle.  It will be invoked with a single token
+	  added to the command-line, which is the cycle number (starting with 1).  For example:
+	      -cmdLine /var/root/srelsetup
+	  will invoke:
+	      /var/root/srelsetup 1
+	  before the first set of sensor samples, then
+	      /var/root/srelsetup 2
+	  before the second set of sensor samples are taken, etc.
+
+	-cycles <ncycles>
+	  specifies the number of iterations to run the sensor tester applications and count readings
+
+	-[no]ps
+	  specifies whether powerstat should be run in parallel with sensor tester applications, and
+	  its output added to the output csv as columns.  Default is -nops; if you want it on, use
+	  -ps on the command-line for Domain0 and Domain1 bins reporting percentages.
+
+	-[no]pl
+	  specifies whether 'powerlog -Bq' should be run after sensor tester applications, and
+	  its output added to the output csv as columns.  Default is -nopl; if you want it on, use
+	  -pl on the command-line for battery temp, state of charge, current, etc.
+
+	-drain <seconds>
+	  specifies the number of seconds to turn off charging.  Unit will cycle through discharging
+	  for <seconds>, then charging for <seconds> then discharging, etc., until the number of
+	  cycles is finished.
+
+	-[no]cpuvirus
+	  specifies that, if -drain <seconds> is set above, that a CPU virus will run coincident with
+	  battery draining, and the CPU virus will be killed when draining stops and charging begins.
+	  The default is -nocpuvirus, so use -cpuvirus if you want it run during draining.  (Note this
+	  requires that '-drain <seconds>' be specified or no CPU virus will ever be run.)
+
+	-[no]resetOnFailure
+	  specifies that Oscar should be reset if an Oscar failure is detected (sensor fails to
+	  produce output, for example).  If -noresetOnFailure is set, then $program will exit if
+	  an Oscar failure is detected; otherwise it will attempt to reset Oscar and continue.
+	  The default is -resetOnFailure, so if you do not want Oscar reset when a failure is
+	  detected, specify -noresetOnFailure on the command-line.
+
+	-ai <accelInterval>
+	  specifies the accel sensor sample interval, defaults to 0.005 seconds (200Hz).
+
+	-ci <compassInterval>
+	  specifies the compass sensor sample interval, defaults to 0.01 seconds (100Hz).
+
+	-gi <gyroInterval>
+	  specifies the gyro sensor sample interval, defaults to 0.005 seconds (200Hz).
+
+	-pi <pressureInterval>
+	  specifies the pressure sensor sample interval, defaults to 0.05 seconds (20Hz).
+
+	-pa | -nopa
+	  specifies whether pressure should be reported as Pascals or kPa.  Default is Pascals;
+	  if you wish units of kPa, specify -nopa.
+
+	-gyroDrop <timeInSecs> | -gd <timeInSecs>
+	  specifies the number of seconds (or fraction thereof) of gyro readings to ignore at
+	  the beginning of a gyro read session; default is 0.25 seconds.
+
+	-o <csvFile> | -ocsv <csvFile>
+	  specifies the name of the output csv file (used STDOUT otherwise).
+
+	-HWTest 
+	  enables printing messages to system console for monitoring test status
+	  in the Stress rack
+
+ENDSHERE1
+
+  if (defined $pobj &&
+      exists $pobj->{Usage} &&
+      defined $pobj->{Usage}) {
+    unless (ref($pobj->{Usage}) =~ m<ARRAY>) {
+      printf STDERR "$mp ERROR, platform object Usage key is not ARRAY, but '%s'\n",
+	ref($pobj->{Usage});
+    } else {
+      printf STDOUT "%s\n", join("\n", @{$pobj->{Usage}});
+    }
+  }
+
+  print <<ENDSHERE2;
+$program iteratively runs the sensor tester applications, counts the number of sensor readings
+for each sensor and compares that with the expected number of readings.  If insufficient readings
+are found for any one sensor, oscar is reset.  After each sensor tester cycle, the application
+sleeps for the specified number of seconds and another iteration is begun.
+
+ENDSHERE2
+  exit($exitCode);
+}
+
+#***************************************************************************
+#
+#   Subroutine : registerOpts
+#       Author : Neil O'Sullivan
+#         Date : 04 Dec 2012
+#
+#  Description : register command-line options with callbacks
+#
+#***************************************************************************
+
+sub registerOpts {
+  my $clargs = shift;
+
+  for (['usage',    undef,	[qw(-h -help)],		sub { printUsage(0); }	],
+       ['debug',	0,	['-debug'],		sub {$debug = 1;}	],
+       ['verbose',	0,	['-verbose'],		sub {$verbose = 1;}	],
+       ['version',	0,	['-version'],		sub {printf "%s\n", &VERSION; exit(0);}],
+       ['ps',		0,	[qw(-ps -nops)],	\&Bool			],
+       ['pl',		0,	[qw(-pl -nopl)],	\&Bool			],
+       ['drain',	0,	[qw(-drain)],		\&Scalar		],
+       ['cpuvirus',	0,	[qw(-cpuvirus
+				    -nocpuvirus)],	\&Bool			],
+       ['resetOnFailure', 1,	[qw(-noresetOnFailure
+				    -resetOnFailure)],	\&Bool			],
+       ['delay',       60,	['-delay'],		\&Scalar		],
+       ['duration',
+	        &DURATION,	['-duration'],		\&Scalar		],
+       ['sleep',
+	   &SLEEPDURATION,	['-sleep'],		\&Scalar		],
+       ['cycles',
+	      &ITERATIONS,	['-cycles'],		\&Scalar		],
+       ['cmdline',  undef,	['-cmdLine'],		\&Scalar		],
+       ['csv',	    undef,	['-o', '-ocsv'],	\&Scalar		],
+       ['ai',	    0.005,	['-ai'],		\&Scalar		],
+       ['ci',	    0.010,	['-ci'],		\&Scalar		],
+       ['gi',	    0.005,	['-gi'],		\&Scalar		],
+       ['pi',	    0.050,	['-pi'],		\&Scalar		],
+       ['pressure',	1,	[qw(-pressure
+				    -nopressure)],	\&Bool			],
+       ['pa',		1,	[qw(-pa -nopa)],	\&Bool			],
+       ['gyroDrop', 0.250,	['-gyroDrop', '-gd'],	\&Scalar		],
+       ['HWTest',	0,	[qw(-HWTest
+				    -noHWTest)],	\&Bool			],
+      ) {
+    $clargs->add(@{$_});
+  }
+  1;
+}
+
+sub getTs {
+  my ($thing) = (@_);
+  my ($s, $us) = gettimeofday();
+  return $s;
+}
+
+sub getGmtTs {
+  my (@gmtTimeArr) = gmtime(time);
+  my $secondsFEinGMT = timelocal(@gmtTimeArr);
+
+  return $secondsFEinGMT;
+}
+
+sub srelGetTsMs {
+  my ($thing) = (@_);
+  my ($s, $us) = gettimeofday();
+  my $ms = &rnd(1, $us / 1000);
+  if ($ms > 999) {
+
+    # since ms are rounded up from us, ms can be >= 1000
+
+    $s++;
+    $ms -= 1000;
+  }
+  my $t = scalar localtime($s);
+  #  $t =~ s/\s+/ /g;
+  my @s = split(/\s+/, $t);
+  my $msstr = sprintf ".%03d", $ms; # append ms to seconds field
+  $s[3] .= $msstr;
+
+  if (defined $thing &&
+      ref($thing) =~ m<hash>i &&
+      exists $thing->{Time} &&
+      defined $thing->{Time}) {
+    unless ($thing->{Time} < ($s + ($ms / 1000))) {
+      push(@s, &getBackCamTemp()); # append back camera temp.
+      $thing->{Time} += 1;
+    }
+  }
+  return join(' ', @s) . "\n";
+}
+
+sub getTsMsPair {
+  my ($thing) = (@_);
+  my ($s, $us) = gettimeofday();
+  my $ms = &rnd(1, $us / 1000);
+  if ($ms > 999) {
+
+    # since ms are rounded up from us, ms can be >= 1000
+
+    $s++;
+    $ms -= 1000;
+  }
+  my $t = scalar localtime($s);
+  #  $t =~ s/\s+/ /g;
+  my @s = split(/\s+/, $t);
+  my $msstr = sprintf ".%03d", $ms; # append ms to seconds field
+  $s[3] .= $msstr;
+  my $sstr = join('', "$s", $msstr);
+  if (defined $thing &&
+      ref($thing) =~ m<hash>i &&
+      exists $thing->{Time} &&
+      defined $thing->{Time}) {
+    unless ($thing->{Time} < ($s + ($ms / 1000))) {
+      push(@s, &getBackCamTemp()); # append back camera temp.
+      $thing->{Time} += 1;
+    }
+  }
+  return ($sstr, (join(' ', @s) . "\n"));
+}
+
+sub lfname {
+  my ($sn, $sensor) = (@_);
+
+  return (defined $sn &&
+	  defined $sensor) ? sprintf("/private/var/tmp/%s_%sTester.txt", $sn, $sensor) : undef;
+}
+
+sub getSensorInfo {
+  my $retstatus;
+  my $mp = __PACKAGE__ . '::getSensorInfo: ';
+
+  my $sensorInfo;
+
+  my ($status, $results) = $oobj->oexec(Cmd => 'ListSensors');
+  if ($status == 1) {
+    for my $sensor (@{$results}) {
+      ($status, $results) = $oobj->oexec(Cmd => [ 'SensorInfo', $sensor ]);
+      if ($status == 1) {
+	for my $result (@{$results}) {
+	  my @parts = split(/:/, $result);
+	  if (scalar(@parts) != 2) {
+	    printf STDERR "$mp ERROR, expected 2 results after splitting '%s' on ':', got %d\n",
+	      $result, scalar(@parts);
+	    return undef;
+	  } else {
+	    map { s/\s*$// } @parts;
+	    my $parts1 = $parts[1];
+	    $parts1 =~ s<^\s*><>;
+	    $sensorInfo->{$sensor}->{$parts[0]} = $parts1;
+	  }
+	}
+      } else {
+	printf STDERR "$mp ERROR, 'oscarctl sensorinfo %s' returned status %d, expected 1\n",
+	  $sensor, $status;
+      }
+    }
+  }
+  return $sensorInfo;
+}
+
+sub pingOscar {
+  my $retstatus;
+  my $mp = __PACKAGE__ . '::pingOscar: ';
+
+  return 1
+    unless $pobj->{HasOscar} && defined $oobj;
+
+  my ($status, $results) = $oobj->oexec(Cmd => 'Ping');
+  printf STDERR "$mp ping status = %d\n", $status
+    if $debug || ($status != 0);
+
+  my $success = $status == 1 && $results =~ m<\s+successful>;
+  $sensorData = &getSensorInfo()
+    unless ($success);
+
+  return $status == 1 && defined $sensorData;
+}
+
+# returns 1 on success, 0 otherwise
+
+use constant OSCAR_RESET_LIMIT => 10;
+use constant OSCAR_PING_LIMIT => 10;
+
+sub resetOscar {
+  my $mp = __PACKAGE__ . '::resetOscar: ';
+  my $status = 1;
+  my $iteration = shift;
+
+  if ($pobj->{HasOscar} && defined $oobj) {
+    my $resetOnFailure = $clArgs->get('resetOnFailure');
+    if ($resetOnFailure) {
+      printf STDERR "$mp Resetting oscar...\n";
+
+      for my $i (1..&OSCAR_RESET_LIMIT) {
+	my $results;
+	($status, $results) = $oobj->oexec(Cmd => 'Reset');
+	next unless defined $status && $status == 1;
+	if ($debug || $verbose) {
+	  print STDERR "$msgp output from Resetting Oscar:\n";
+	  printf "\t%s\n", join("\t\n", @{$results});
+	}
+	sleep 3;
+	$results = undef;
+	($status, $results) = $oobj->oexec(Cmd => 'Start');
+	next unless defined $status && $status == 1;
+	if ($debug || $verbose) {
+	  print STDERR "$msgp output from Resetting Oscar:\n";
+	  printf "\t%s\n", join("\t\n", @{$results});
+	}
+	last if $status == 1;
+      }
+      printf STDERR "$mp Oscar reset/start produced status %d after %d iterations, expected 1\n",
+	$status, &OSCAR_RESET_LIMIT
+	unless $status;
+    } else {
+      printf STDERR "$mp Pinging oscar...\n";
+      $status = &pingOscar();
+      unless ($status) {
+	printf STDERR "$mp ERROR, pinging Oscar produced unexpected results\n";
+
+	if ($clArgs->get('HWTest')) {
+
+	  my @HWTestStatus = { 
+			      'phase' => "TestFailed" ,
+			      'iter' => $iteration,
+			      'startTime' => $TimeStamp,
+			     };
+
+	  &TestStatusMessage(@HWTestStatus);
+	}
+      }
+    }
+
+    printf STDERR "$mp Oscar reset produced status %d\n", $status
+      unless ($status == 1 && $resetOnFailure);		# unless (success), effectively
+
+    for my $i (1..&OSCAR_PING_LIMIT) {
+      $status = &pingOscar();
+      last if $status;
+      printf STDERR "$mp %d - oscarctl ping  returned bad status %d\n", $i, $status;
+      sleep(2);
+    }
+  }
+      
+  return $status;
+}
+
+sub sensorStats {
+  my ($logfiles, $sensor) = (@_);
+
+  if ($sensor =~ m<accel|gyro|compass>) {
+    return &MotionSensors::sensorStats($clArgs, $logfiles->{$sensor}, $sensor);
+  } else {
+    return $pobj->{SensorMap}->{$sensor}->{SrelStats}->($clArgs, $logfiles->{$sensor}, $sensor);
+  }
+}
+
+sub updateStats {
+  my ($stats, $iteration, $logfiles, $oscarResets) = (@_);
+  my $status = 1;
+
+  my %percentage;
+
+  # our canonical DURATION is 10 seconds:  scale based on user-specified duration
+
+  my $scale = &DURATION / $clArgs->get('duration');
+
+  for my $sensor (@sensors) {
+
+    $stats->{$iteration}->{$sensor}->{Stats} = &sensorStats($logfiles, $sensor);
+    my $nlines = -f $logfiles->{$sensor} && defined $stats->{$iteration}->{$sensor}->{Stats}
+      ? $stats->{$iteration}->{$sensor}->{Stats}->{Readings} : 0;
+
+    # if we don't get at least 50% of the expected samples per second, consider it a failure
+
+    my $spsExpected = exists $pobj->{SensorMap}->{$sensor}->{Interval} &&
+      defined $pobj->{SensorMap}->{$sensor}->{Interval} &&
+      $pobj->{SensorMap}->{$sensor}->{Interval} =~ m<\d?\.?\d*>
+      ? 1 / $pobj->{SensorMap}->{$sensor}->{Interval}
+      : 1;
+    my $samplesExpected = $clArgs->get('duration') * $spsExpected;
+
+    $percentage{$sensor} = $stats->{$iteration}->{$sensor}->{Stats}->{Readings} / $samplesExpected;
+
+    $status = 0
+      unless $nlines > 0;
+#      if $percentage{$sensor} < 0.50;
+
+    $stats->{$iteration}->{$sensor}->{Lines} = $nlines;
+  }
+  $stats->{$iteration}->{Status} = $status;
+  $stats->{Passes}++
+    if ($status);
+
+  printf STDERR "%5d %s, %5d pass (%6.2lf%%), %5d fail, %5d oscar resets, %s %s",
+    $iteration, ($status ? 'Pass' : 'Fail'), $stats->{Passes}, (100 * $stats->{Passes} / $iteration),
+      $iteration - $stats->{Passes}, $oscarResets,
+	join(', ', map { sprintf "%s %6d (%6.2lf%%)", $_, $stats->{$iteration}->{$_}->{Lines},
+			   $percentage{$_} * 100 } (@sensors)), &srelGetTsMs()
+			     if $verbose;
+
+
+  return $status;
+}
+
+sub powerlog {
+  my ($sbd) = (@_);
+  my $mp = __PACKAGE__ . '::powerlog: ';
+
+  # defaults:          0               0             0         0     'unknown'
+  my @defaults = qw(0 0 0 0 unknown);
+  my @keys = qw(RawBatteryVoltage BatteryLevel BatteryTemp Current ChargingState);
+  my %map = (RawBatteryVoltage => 'Voltage',
+	     BatteryLevel => 'RawLevel',
+	     BatteryTemp => 'Temperature',
+	     Current => 'InstantAmperage',
+	     ChargingState => 'IsCharging',
+	    );
+
+  my $r = { map { $_ => -1 } @keys };
+  $r->{Discharging} = $sbd->{Discharging}
+    if exists $sbd->{Discharging} && defined $sbd->{Discharging};
+
+  my $h = &Utils::powerlog();
+
+  for my $key (keys %map) {
+    $r->{$key} = $h->{$map{$key}}
+      if exists $h->{$map{$key}} && defined $h->{$map{$key}};
+  }
+  # default:          '?'		# we don't really do any computation with this result, it's usually a boolean
+  if (exists $sbd->{Discharging} && defined $sbd->{Discharging}) {
+    push(@keys, 'Discharging');
+    push(@defaults, '?');
+  }
+
+  my $status = &Execer::execer('setbatt raw 2>&1',
+			       sub {
+				 my ($lineNo, $line) = (@_);
+				 $r->{RawBatteryVoltage} = $1
+				   if $line =~ m<raw\s+battery\s+voltage\:\s+(\d+)\s+mV>;
+				 return 0;
+			       });
+
+  # this will cause us to bounce out of discharging on next iteration
+
+  $sbd->{TimeStamp} = 0
+    if (exists $sbd->{Discharging} &&
+	defined $sbd->{Discharging} &&
+	$sbd->{Discharging} &&
+	exists $r->{BatteryLevel} &&
+	defined $r->{BatteryLevel} &&
+	$r->{BatteryLevel} <= &MIN_BATTERY_LEVEL);
+
+  return ([@keys], [ map { $r->{$_} } @keys ], [ @defaults ]);
+}
+
+use constant SENSOR_EVENTS => 0;
+use constant PLATFORM_POWER_STATE => 1;
+use constant PLATFORM_EVENTS => 2;
+use constant SENSOR_POWER_STATE => 3;
+
+sub unquote {
+  my ($thing) = (@_);
+  $thing =~ s<\"><>g;
+  return $thing;
+}
+
+sub dequote {
+  my @results = ();
+  for my $thing (@_) {
+    $thing = &unquote($thing);
+    push(@results, $thing);
+  }
+  return wantarray ? @results : $results[0];
+}
+
+sub ppsfile {
+  my ($fileIn) = (@_);
+  my $mp = __PACKAGE__ . '::ppsfile: ';
+  my $lfh;
+
+  my %data = ();
+
+  my $r = { State => 0, };	# looking for "=>","Oscar"
+
+  if (open($lfh, "<$fileIn")) {
+    my $val;
+    while (<$lfh>) {
+      my $line = $_;
+      last unless defined $line;
+      my $state = $r->{State};
+      if ($state == 0) {
+	if ($line =~ m<^"\=\>","Oscar"\s*$>) {
+	  printf STDERR "$mp transitioning to state 1 due to:  %s", $line if $debug;
+	  $r->{State}++;
+	}
+      } elsif ($state == 1) {
+	next if $line =~ m<^\s*$>;	# skip any blank line
+	if ($line =~ m<"\-\-\-\>","(.*)"$>) {
+	  $val = $1;
+	  $r->{State}++;
+
+	  push(@{$r->{Tier1}}, $val);
+	  $data{$val} = { };
+
+	} else {
+	  chomp $line;
+	  printf STDERR "$mp ERROR, state=%d, unexpected line:  '%s'\n", $state, $line
+	    if $debug;
+	}
+      } elsif ($r->{State} == 2) {
+	chomp $line;
+	my @fields = &dequote(split(/,/, $line));
+	$r->{State}++;
+	$data{$val}->{Fields} = [ @fields ];
+	printf STDERR "$mp Fields:   %s\n", join(',', map { sprintf "\"%s\"", $_ } @fields)
+	  if $debug;
+      } elsif ($r->{State} == 3) {
+	if ($line =~ m<^\s*$>) {
+	  $r->{State} = 1;
+	  printf STDERR "$mp transitioning from state 3 to state 1 due to blank line\n"
+	    if $debug;
+	  next;
+	}
+	chomp $line;
+	if ($line !~ m<,>) {
+	  printf STDERR "$mp ERROR, expected CSV, but got '%s'\n", $line;
+	} else {
+	  my @fields = &dequote(split(/,/, $line));
+	  push(@{$data{$val}->{Data}}, [@fields]);
+	}
+      }
+    }
+    close($lfh);
+  }
+  my @keys = ();
+  my @values = ();
+
+  my @things = grep { qr<$_> } qw<^Sensor\s+events$
+				  ^(Platform\s+power\s+state)$
+				  ^(Platform\s+events)$
+				  ^(Sensor\s+power\s+state)$>;
+
+  for my $idx (&SENSOR_EVENTS .. &SENSOR_POWER_STATE) {
+    my $re = $things[$idx];
+    for my $tier1key (@{$r->{Tier1}}) {
+      if ($tier1key =~ $re) {
+	if ($idx == &SENSOR_EVENTS) {
+	  for my $td (qw(Total Dropped)) {
+	    for my $sensor (@sensors) {
+	      my $regex = sprintf "%s\\s+Samples\:\\s+%s", $td, $sensor;
+	      my $heading = &dequote(sprintf "%s Samples: %s", $td, $sensor);
+	      for my $line (@{$data{'Sensor events'}->{Data}}) {
+		if ($line->[0] =~ m<$regex>i) {
+		  push(@keys, $heading);
+		  push(@values, $line->[1]);
+		}
+	      }
+	    }
+	  }
+	  last;
+	} elsif ($idx == &PLATFORM_POWER_STATE) {
+	  for my $td (qw(DSLEEP SLEEP RUN12M RUN100M)) {
+	    for my $line (@{$data{'Platform power state'}->{Data}}) {
+	      for my $lidx (0..1) {
+		my $string = &dequote($line->[$lidx]);
+		if ($string eq "$td") {
+		  push(@keys, sprintf "Platform %s", $td);
+		  push(@keys, sprintf "Platform %s TRANSITIONS", $td);
+		  push(@values, $line->[$lidx+1]);
+		  push(@values, $line->[$lidx+2]);
+		  last;
+		}
+	      }
+	    }
+	  }
+	  last;
+	} elsif ($idx == &PLATFORM_EVENTS) {
+#	  for my $td ('Idle time', 'Total time', 'Number of interrupts') {
+	    for my $line (@{$data{'Platform events'}->{Data}}) {
+	      my $heading = $line->[0];
+	      if ($line->[0] =~ m<time> && defined $line->[2]) {
+		$heading = &dequote(sprintf "%s %s", $heading, $line->[2]);
+	      }
+	      push(@keys, $heading);
+	      push(@values, $line->[1]);
+	    }
+#	  }
+	} elsif ($idx == &SENSOR_POWER_STATE) {
+	  my @headings = @{$data{'Sensor power state'}->{Fields}};
+	  shift(@headings);
+	  for my $sensor (@sensors) {
+	    for my $line (@{$data{'Sensor power state'}->{Data}}) {
+	      if ($line->[0] =~ m<$sensor>i) {
+		for my $h (@headings) {
+		  my $hd = &dequote(sprintf "%s %s", $sensor, $h);
+		  push(@keys, $hd);
+		}
+		my @line = @{$line};
+		shift(@line);
+		push(@values, @line);
+	      }
+	    }
+	  }
+	}
+      }
+    }
+  }
+
+  #				defaults are all zeros
+  return ([@keys], [@values], [ (0) x scalar(@keys) ]);
+}
+
+# ####
+# Main
+# ####
+
+# provide an escape mechanism for being invoked on a Mac host to see usage
+
+&printUsage(0)
+  if scalar(@ARGV) == 1 && $ARGV[0] =~ m<^\-h>;
+
+&registerOpts($clArgs);		# register options
+
+# we need to allocate the platform object to pass it clArgs before we process command line
+
+my $sn = &lockdownGet('SerialNumber') || 'unknown';
+my $hwm = &lockdownGet('HardwareModel') || 'unknown';
+$hwm =~ s<AP><>;
+$hwm =~ s<DEV><>;
+
+if ($debug) {
+  printf STDERR "SerialNumber:  '%s'\n", $sn;
+  printf STDERR "HardwareModel:  '%s'\n", $hwm;
+}
+
+&printUsage(1)
+  if $hwm =~ m<unknown>;	# we cannot load the platform object if we don't recognize the platform
+
+# load the platform-specific object
+# ---------------------------------
+
+my @places = (@INC, split(':', $ENV{PERL5LIB}));
+my $pkg = join('.', $hwm, 'pm');
+
+{
+  my $exists = 0;
+  for my $loc (@places) {
+    #  printf STDERR "checking %s\n", join('/', $loc, $pkg);
+    next unless -f join('/', $loc, $pkg);
+    $exists = 1;
+    last;
+  }
+  unless ($exists) {
+    printf STDERR "$msgp ERROR, cannot locate base object to load '%s'\n", $pkg;
+    exit(1);
+  }
+}
+
+require $pkg;
+$debug = grep { /^\-debug$/ } @ARGV;
+$verbose = grep { /^\-verbose$/ } @ARGV;
+$pobj = $hwm->new(Warnings => 0, Debug =>$debug, Verbose => $verbose, CLArgs => $clArgs);
+
+unless($clArgs->process([@ARGV])) { # process command-line
+  print STDERR "$msgp error processing command-line\n";
+  &printUsage(1);
+}
+
+if (scalar(@{$clArgs->Unknown}) > 0) {
+  my $errors = 0;
+  my @lengths = map { length($_) } @{$clArgs->Unknown};
+  if (&Statistics::max(@lengths) > 0) {
+    printf STDERR "$msgp ERROR, unrecognized tokens on command-line:  %s\n",
+      join(', ', map { sprintf "'%s'", $_ } @{$clArgs->Unknown});
+    $errors++;
+  }
+  &printUsage(1);
+}
+print STDERR "$0 args: ", join(" ", @ARGV), "\n";
+
+$oobj = Oscar->new(Debug => $debug)
+  if &Utils::existsAndExeLocal('oscarctl') && $pobj->{HasOscar};
+
+@sensors = keys %{$pobj->{SensorMap}};
+
+my $logfile = { map { $_ => &lfname($sn, $_) } (@sensors) };
+
+my $stats = { 'Passes' => 0,
+	    };
+my $oscarResets = 0;
+
+# this should be keyed by the response from:
+#	oscarctl sensorinfo pressure
+#  If it returns good status, you have phosphorous, otherwise you do not.
+# --but that assumes oscarctl works, which is not guaranteed even if it is present.
+
+if (defined $oobj) {
+  $sensorData = &getSensorInfo();
+  unless (defined $sensorData) {
+    printf STDERR "$msgp ERROR, failed to get list of sensors from Oscar\n";
+    exit(1);
+  }
+}
+
+$hasPhosphorous = &existsAndExeLocal('pressureTester') &&
+  $clArgs->get('pressure') &&
+  $pobj->{HasOscar} &&
+  exists $sensorData->{pressure} && defined $sensorData->{pressure} &&
+  exists $sensorData->{pressure}->{Device} && defined $sensorData->{pressure}->{Device};
+
+if ($hasPhosphorous) {
+  my ($status, $retval) = $oobj->oexec(Cmd => [ qw(SensorInfo pressure) ]);
+  if ($status == 1) {
+    printf STDERR "%s\n", join("\n", @{$retval})
+      if $debug || $verbose;
+  } else {
+    printf STDERR "$msgp ERROR, querying Oscar for 'SensorInfo pressure' returned status %d, expected 1\n", $status;
+  $hasPhosphorous = 0;
+  }
+}
+
+my $duration = $clArgs->get('duration');
+if ($duration < &MIN_DURATION) {
+  printf STDERR "$msgp ERROR, minimum duration is %d, you specified %d\n", &MIN_DURATION, $duration;
+  exit(1);
+}
+
+
+my $delay = $clArgs->get('delay');
+if (defined $delay && $delay > 0) {
+  printf STDERR "$msgp sleeping %d seconds\n", $delay;
+  sleep($delay);
+}
+
+my $of = \*STDOUT;
+my $ocsv = $clArgs->get('csv');
+if (defined $ocsv) {
+  my $swvers = &MotionSensors::getSwVers();
+  my @sdata = ();
+  if (defined $sensorData) {
+    for my $snsr (sort keys %{$sensorData}) {
+      push(@sdata, join('-', split(/\s+/, $sensorData->{$snsr}->{Device})))
+	if exists $sensorData->{$snsr}->{Device} && defined $sensorData->{$snsr}->{Device};
+    }
+  }
+  $ocsv = sprintf "%s_%s_%s_%s.csv", $hwm, $sn,
+    (defined $swvers &&
+     exists $swvers->{BuildVersion} &&
+     defined $swvers->{BuildVersion} ? join('_', $swvers->{BuildVersion}, $program, @sdata)
+     : join('_', $program, @sdata)),
+       &MotionSensors::epoch2canonical(time)
+	 if ($ocsv =~ m<serialnumber> || $ocsv =~ m<serialno>);
+  unless (open($of, ">$ocsv")) {
+    printf STDERR "$msgp ERROR, failed to open filed '%s' for write:  $!\n", $ocsv;
+    exit(1);
+  }
+}
+
+my @h = ('Iteration', 'TimeStamp', 'TimeStamp GMT', 'Pass/Fail', 'Oscar Resets');
+$srelKeys->{Prelude}->{Keys} = [ @h ];
+$srelKeys->{Prelude}->{Defaults} = [ qw(0 0 unknown unknown) ];	# don't ever see a need for these, however
+
+for my $sensor (@sensors) {
+  next
+    if $sensor =~ m<phosphorous> && (! $hasPhosphorous);
+
+  my $snsr = ucfirst $sensor;
+  my @skeys = ();
+
+  if ($sensor !~ m<accel|compass|gyro>) {
+    push(@skeys, @{$pobj->{SensorMap}->{$sensor}->{SrelHeadings}->()});
+  } else {
+    push(@skeys, sprintf "%s Readings", $snsr);
+    push(@skeys, map { sprintf "%s Interval %s", $snsr, $_ } qw(Max Mean Sigma));
+    for my $stat (qw(Min Max Mean Sigma)) {
+      push(@skeys, map { sprintf "%s %s %s", $snsr, $_, $stat } &AXES);
+    }
+#    push(@skeys, map { sprintf "%s %s Sigma", $snsr, $_ } &AXES);
+  }
+  $srelKeys->{Sensors}->{$sensor}->{Keys} = [ @skeys ];
+  $srelKeys->{Sensors}->{$sensor}->{Defaults} = [ (0) x scalar(@skeys) ];
+  push(@h, @skeys);
+#  printf STDERR "$msgp adding keys:  %s\n", join(", ", @skeys);
+}
+
+if ($clArgs->get('ps')) {
+  my $smp = SpawnMon->new(Command => 'powerstat',
+			  Duration => 1,
+			  LogFile => &POWERSTATLOG,
+			  Debug => 0,
+			  Fudge => 5);
+  if (defined $smp) {
+    waitpid($smp->{PID}, 0);
+    my ($keys, $values, $defaults) = &ppsfile(&POWERSTATLOG);
+    if (scalar(@{$keys}) > 0) {
+      $srelKeys->{powerstat}->{Keys} = $keys;
+      $srelKeys->{powerstat}->{Defaults} = $defaults;
+      for my $kindex (0..scalar(@{$keys})-1) {
+	$srelKeys->{powerstat}->{KVPairs}->{$keys->[$kindex]} = $defaults->[$kindex];
+      }
+      push(@h, @{$keys});
+    } else {
+      printf STDERR "$msgp ERROR, expected > 1 keys from powerstat, got 0\n";
+      exit(1);
+    }
+  } else {
+    printf STDERR "$msgp ERROR, failed to launch 'powerstat', exiting\n";
+    exit(1);
+  }
+}
+
+my $sbd = { };     # setbatt drain data
+my $drain = $clArgs->get('drain');
+
+if (defined $drain) {
+  if ($drain =~ m<^(\d+)$>) {
+    my $draintime = $1;
+    if ($draintime > 0) {
+      $sbd->{DrainTime} = $draintime;
+      $sbd->{TimeStamp} = &getTs();
+      printf STDERR "$msgp drain start at %d, drain time %d, kill after %d\n",
+	$sbd->{TimeStamp}, $sbd->{DrainTime}, $sbd->{TimeStamp} + $sbd->{DrainTime}
+	  if $debug || $verbose;
+      my $smo = SpawnMon->new(Command => 'setbatt drain 2>&1',
+			      Duration => $sbd->{DrainTime},
+			      LogFile => '/var/root/setbatt-log.txt',
+			      Debug => 0);
+      if (defined $smo) {
+	$sbd->{PID} = $smo->{PID};
+	printf STDERR "$msgp launched 'setbatt drain' as PID %d for %d seconds\n", $sbd->{PID}, $draintime
+	  if $debug || $verbose;
+
+	# if we are discharging, we need to check battery charge to
+	# prevent draining to battery-trap (stop discharging if SOC <= 5%)
+
+	$clArgs->store('pl', 1);
+	$sbd->{Discharging} = 1;
+	if ($clArgs->get('cpuvirus')) {
+	  $smo = SpawnMon->new(Command => &CPUVIRUS,
+			       Duration => $sbd->{DrainTime},
+			       LogFile => '/dev/null',
+			       Debug => 0);
+	  if (defined $smo) {
+	    $sbd->{ThermPID} = $smo->{PID};
+	    printf STDERR "$msgp launched thermal virus as PID %d\n", $sbd->{ThermPID};
+	  } else {
+	    printf STDERR "$msgp ERROR, failed to launch thermal virus\n";
+	    delete $sbd->{ThermPID} if exists $sbd->{ThermPID};
+	  }
+	}
+      } else {
+	undef $drain;
+      }
+    }
+  } else {
+    printf STDERR "$msgp ERROR, non-numeric value '%s' specified for -drain\n", $drain;
+    exit(1);
+  }
+}
+
+if ($clArgs->get('pl')) {
+  my ($keys, $values, $defaults) = &powerlog($sbd);
+  $srelKeys->{powerlog}->{Keys} = $keys;
+  unless (scalar(@{$keys})) {
+    printf STDERR "$msgp ERROR, no keys returned by 'powerlog', exiting\n";
+    exit(1);
+  }
+  $srelKeys->{powerlog}->{Defaults} = $defaults;
+  push(@h, @{$keys});
+}
+
+printf $of "%s\n", join(',', @h);
+
+my $cmdline = $clArgs->get('cmdline');
+
+for my $iteration (1..$clArgs->get('cycles')) {
+  printf STDERR "cmdline is '%s'\n", $cmdline
+    if defined $cmdline && $iteration == 1;
+
+  my $bogusStatus = &Execer::execer(sprintf("%s %d", $cmdline, $iteration),
+				    sub {
+				      my ($lineNo, $line) = (@_);
+				      print STDERR $line if $debug || $verbose;
+				      return 0;
+				    })
+    if defined $cmdline;
+
+  sleep($clArgs->get('sleep'))
+    if $iteration > 1 &&
+      $clArgs->get('sleep') > 0;
+
+  if (defined $drain &&
+      exists $sbd->{PID} &&
+      defined $sbd->{PID} &&
+      &getTs() >= $sbd->{TimeStamp} + $sbd->{DrainTime}) {
+
+    printf STDERR "$msgp time %d > %d\n", $sbd->{TimeStamp} + $sbd->{DrainTime}, &getTs()
+      if $debug || $verbose;
+
+    if ($sbd->{Discharging}) {
+      printf STDERR "$msgp killing PID %d (setbatt drain)\n", $sbd->{PID} if $debug || $verbose;
+      my $status = &Execer::execer('killall setbatt thermalCycloneSyntheticDutyCycle 2>&1',
+				   sub {
+				     my ($lineNo, $line) = (@_);
+				     print STDERR $line if $debug || $verbose;
+				     return 0;
+				   });
+      kill 9 => -$sbd->{PID};
+      waitpid($sbd->{PID}, 0);
+      if (exists $sbd->{ThermPID}) {
+	kill 9 => -$sbd->{ThermPID};
+	waitpid($sbd->{ThermPID}, 0);
+	delete $sbd->{ThermPID};
+      }
+    }
+
+    $sbd->{TimeStamp} = &getTs();			# update timestamp
+    $sbd->{Discharging} = 1 - $sbd->{Discharging};	# toggle
+
+    if ($sbd->{Discharging}) {
+
+      printf STDERR "$msgp drain start at %d, drain time %d, kill after %d\n",
+	$sbd->{TimeStamp}, $sbd->{DrainTime}, $sbd->{TimeStamp} + $sbd->{DrainTime}
+	  if $debug || $verbose;
+      my $smo = SpawnMon->new(Command => 'setbatt drain 2>&1',
+			      Duration => $sbd->{DrainTime},
+			      LogFile => '/var/root/setbatt-log.txt',
+			      Debug => 0);
+      if (defined $smo) {
+	$sbd->{PID} = $smo->{PID};
+	printf STDERR "$msgp launched 'setbatt drain' as PID %d\n", $sbd->{PID} if $debug || $verbose;
+	if ($clArgs->get('cpuvirus')) {
+	  my $cpupv;
+	  for my $test ($program, qw(pmubattl pmustress)) {
+	    $cpupv = exists $pobj->{Tests}->{$test}->{CPUStim}->{On}->[0] 
+	      if (exists $pobj->{Tests}->{$test}->{CPUStim}->{On}->[0] &&
+		  defined $pobj->{Tests}->{$test}->{CPUStim}->{On}->[0]);
+	  }
+
+	  $smo = defined $cpupv ? SpawnMon->new(Command => $cpupv,
+						Duration => $sbd->{DrainTime},
+						LogFile => '/dev/null',
+						Debug => 0)
+	    : undef;
+	  if (defined $smo) {
+	    $sbd->{ThermPID} = $smo->{PID};
+	    printf STDERR "$msgp launched thermal virus as PID %d\n", $sbd->{ThermPID};
+	  } else {
+	    printf STDERR "$msgp ERROR, failed to launch thermal virus %s\n",
+	      defined $cpupv ? $cpupv : '(undefined)';
+	    delete $sbd->{ThermPID} if exists $sbd->{ThermPID};
+	  }
+	}
+      } else {
+	printf STDERR "$msgp ERROR, failed to launch 'setbatt drain' in background at iteration %d\n",
+	  $iteration;
+	undef $drain;			# we won't try this again
+	$sbd->{Discharging} = 0;	# not discharging
+	delete $sbd->{PID};
+	# we'll just give up about discharging if we cannot launch 'setbatt drain'
+      }
+    } else {
+      my $status = &Execer::execer('setbatt on 2>&1',
+				   sub {
+				     my ($lineNo, $line) = (@_);
+				     print STDERR $line if $debug || $verbose;
+				     return 0;
+				   });
+      printf STDERR "$msgp ERROR, invoking 'setbatt on' returned status %d\n", $status
+	unless $status;
+    }
+  }
+      
+  my @spids = ( );
+
+  {
+    my $regex = sprintf "(?:%s)Tester", join('|', @sensors);
+    $regex = qr<$regex>;
+    my $status = &Execer::execer('ps auxww',
+				 sub {
+				   my ($lineNo, $line) = (@_);
+				   if ($line =~ $regex &&
+				       $line =~ m<root\s+(\d+)\s+.*>) {
+				     my $pid = $1;
+				     kill 9 => $pid;
+
+				     printf STDERR "$msgp ERROR, found pid %s, killing\n%s", $pid, $line;
+				   }
+				   return 0;
+				 });
+  }
+
+  for my $sensor (@sensors) {
+
+    # remove log file if it already exists
+    unlink($logfile->{$sensor})
+      if -f $logfile->{$sensor};
+
+    my $dur = $clArgs->get('duration');
+
+    my @commandOptions = ();
+
+    push(@commandOptions, sprintf "-interval %0.3lf", $pobj->{SensorMap}->{$sensor}->{Interval})
+      if exists $pobj->{SensorMap}->{$sensor}->{Interval} &&
+      defined $pobj->{SensorMap}->{$sensor}->{Interval};
+
+    push(@commandOptions, @{$pobj->{SensorMap}->{$sensor}->{CLArgs}})
+      if exists $pobj->{SensorMap}->{$sensor}->{CLArgs} &&
+      defined $pobj->{SensorMap}->{$sensor}->{CLArgs} &&
+      ref($pobj->{SensorMap}->{$sensor}->{CLArgs}) eq 'ARRAY';
+
+    my $cmd = $pobj->{SensorMap}->{$sensor}->{Tester};
+    if ($cmd =~ m<\;>) {
+      my @cmdParts = map { $_ =~ s<^\s+><> ; $_ } split(/;/, $cmd);
+      for my $index (0..scalar(@cmdParts)-2) {
+	printf STDERR "$msgp invoking:  %s\n", $cmdParts[$index]
+	  if $debug;
+	my $s = &Execer::execer($cmdParts[$index],
+				sub {
+				  my ($lineNo, $line) = (@_);
+				  printf STDERR "$msgp %s", $line
+				    if $debug;
+				  return 0;
+				});
+	printf STDERR "$msgp ERROR, command '%s' returned bad status %d, expected 1\n",
+	  $cmdParts[$index], $s
+	  unless $s == 1;
+      }
+      $cmd = $cmdParts[-1];
+    }
+    $cmd =~ s<^\s+><>;
+
+    printf STDERR "$msgp spawning '%s'\n", join(' ', $cmd, @commandOptions)
+      if $debug;
+
+    my $smo = SpawnMon->new(Command => $cmd,
+			    CommandOptions => [ @commandOptions ],
+			    Duration => $dur,
+			    LogFile => $logfile->{$sensor},
+			    Annotator => \&srelGetTsMs,
+			    Debug => 0);
+    if (defined $smo) {
+      push(@spids, $smo->{PID});
+      if ($clArgs->get('ps')) {
+	my $smp = SpawnMon->new(Command => 'powerstat',
+				Duration => $dur,
+				LogFile => &POWERSTATLOG,
+				Debug => 0,
+				Fudge => 5);
+	push(@spids, $smp->{PID})
+	  if defined $smp;
+      }
+    } else {
+      printf STDERR "ERROR:  failed to spawn command '%s'\n", sprintf("%sTester", $sensor);
+      for my $pid (@spids) {
+	printf STDERR "Waiting on PID %d\n", $pid
+	  if $clArgs->get('verbose');
+	waitpid($pid, 0);
+      }
+      exit(1);
+    }
+  }
+
+  for my $pid (@spids) {
+    printf STDERR "Waiting on PID %d\n", $pid
+      if $clArgs->get('verbose');
+    waitpid($pid, 0);
+  }
+  my $status = &updateStats($stats, $iteration, $logfile, $oscarResets);
+  unless ($status) {
+    my $status = &resetOscar($iteration);
+    unless ($status) {
+      printf STDERR "ERROR, resetOscar returned bad status %d\n", $status;
+      close($of)
+	if defined $ocsv;
+      if (defined $drain &&
+	  exists $sbd->{PID} &&
+	  defined $sbd->{PID}) {
+	my $killcpupv;
+	for my $test ($program, qw(pmubattl pmustress)) {
+	  $killcpupv = exists $pobj->{Tests}->{$test}->{CPUStim}->{Off}->[0] 
+	    if (exists $pobj->{Tests}->{$test}->{CPUStim}->{Off}->[0] &&
+		defined $pobj->{Tests}->{$test}->{CPUStim}->{Off}->[0]);
+	}
+	my $status;
+	$status = &Execer::execer($killcpupv . ' 2>&1',
+				  sub {
+				    my ($lineNo, $line) = (@_);
+				    print STDERR $line if $debug || $verbose;
+				    return 0;
+				  })
+	  if defined $killcpupv;
+	kill 9 => -$sbd->{PID};
+	waitpid($sbd->{PID}, 0);
+	if (exists $sbd->{ThermPID}) {
+	  kill 9 => -$sbd->{ThermPID};
+	  waitpid($sbd->{ThermPID}, 0);
+	}
+
+	$status = &Execer::execer('setbatt on 2>&1',
+				  sub {
+				    my ($lineNo, $line) = (@_);
+				    print STDERR $line if $debug || $verbose;
+				    return 0;
+				  });
+      }
+      exit(1);
+    }
+    $oscarResets++
+      if $clArgs->get('resetOnFailure');
+  }
+  my @results = ($iteration, &getTs(), &getGmtTs(), $stats->{$iteration}->{Status} ? 'Pass' : 'Fail', $oscarResets);
+
+  if ($clArgs->get('HWTest')) {
+
+    my @HWTestStatus = { 
+      'phase' => "Running OscarResets=$oscarResets" ,
+      'iter' => $iteration,
+      'startTime' => $TimeStamp,
+    };
+
+    &TestStatusMessage(@HWTestStatus);
+  }
+
+  for my $sensor (@sensors) {
+    if ($sensor =~ m<accel|compass|gyro>) {
+      push(@results, $stats->{$iteration}->{$sensor}->{Lines});
+      push(@results, map { $stats->{$iteration}->{$sensor}->{Stats}->{Interval}->{$_} } qw(Max Mean Sigma));
+      for my $stat (qw(Min Max Mean Sigma)) {
+	push(@results, map { $stats->{$iteration}->{$sensor}->{Stats}->{$_}->{$stat} } &AXES);
+      }
+#      push(@results, map { $stats->{$iteration}->{$sensor}->{Stats}->{$_}->{Sigma} } &AXES);
+    } else {
+      push(@results, @{$pobj->{SensorMap}->{$sensor}->{SrelStats2Out}->($stats->{$iteration}->{$sensor}->{Stats})});
+    }
+  }
+
+  if ($clArgs->get('ps')) {
+    my ($keys, $values) = &ppsfile(&POWERSTATLOG);
+    my %kv;
+    for my $kindex (0..scalar(@{$keys})-1) {
+      $kv{$keys->[$kindex]} = $values->[$kindex];
+    }
+    for my $k (@{$srelKeys->{powerstat}->{Keys}}) {
+      push(@results, exists $kv{$k} && defined $kv{$k} ? $kv{$k} : $srelKeys->{powerstat}->{KVPairs}->{$k});
+    }
+#    push(@results, scalar(@{$values}) ? @{$values} : @{$srelKeys->{powerstat}->{Defaults}});
+  }
+
+  if ($clArgs->get('pl')) {
+    my ($keys, $values) = &powerlog($sbd);
+    printf STDERR "$msgp powerlog returned:\n%s\n",
+      join("\n", map { sprintf "  %s:  %s", $keys->[$_], $values->[$_] } 0..scalar(@{$keys})-1)
+      if $debug;
+
+    push(@results, scalar(@{$values}) ? @{$values} : @{$srelKeys->{powerlog}->{Defaults}});
+  }
+
+  printf $of "%s\n", join(',', @results);
+}
+
+close($of)
+  if defined $ocsv;
+
+if (defined $drain &&
+    exists $sbd->{PID} &&
+    defined $sbd->{PID}) {
+  my $killcpupv;
+  for my $test ($program, qw(pmubattl pmustress)) {
+    $killcpupv = $pobj->{Tests}->{$test}->{CPUStim}->{Off}->[0] 
+      if (exists $pobj->{Tests}->{$test}->{CPUStim}->{Off}->[0] &&
+	  defined $pobj->{Tests}->{$test}->{CPUStim}->{Off}->[0]);
+  }
+  my $status;
+  $status = &Execer::execer($killcpupv . ' 2>&1',
+			    sub {
+			      my ($lineNo, $line) = (@_);
+			      print STDERR $line if $debug || $verbose;
+			      return 0;
+			    })
+    if defined $killcpupv;
+  kill 9 => -$sbd->{PID};
+  waitpid($sbd->{PID}, 0);
+  if (exists $sbd->{ThermPID}) {
+    kill 9 => -$sbd->{ThermPID};
+    waitpid($sbd->{ThermPID}, 0);
+  }
+
+  $status = &Execer::execer('setbatt on 2>&1',
+			    sub {
+			      my ($lineNo, $line) = (@_);
+			      print STDERR $line if $debug || $verbose;
+			      return 0;
+			    });
+}
+
+1;
+
+#$data::Dumper::Purity = 1;
+
+#print Dumper($stats);

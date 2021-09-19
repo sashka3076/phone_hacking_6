@@ -1,0 +1,729 @@
+#!/usr/bin/perl
+
+###########################################################################
+#CONFIDENTIAL - © Apple Computer, Inc.
+#
+#This unpublished work, created in 2014, contains Apple trade secrets and
+#confidential information.  You may not use, dislose, reproduce, modify, or
+#distribute this work, in whole or in part, without Apple's express written
+#consent in each instance.  Federal law provides severe civil and criminal
+#penalties for the unauthorized reproduction or distribution of copyrighted
+#works.
+###########################################################################
+
+use warnings;
+use strict;
+use 5.8.8;
+
+# WARNING:  The code below may cause problems if you are trying to run with Perl 5.8.8 on your Mac, but the path below points to modules compiled for Perl 5.16
+use constant PERL5LIB => ('/AppleInternal/Library/PerlModules', '/AppleInternal/Library/PerlModules/3rdParty' );
+
+# rdar://18442155
+use constant DEFAULTPATH => '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin';
+
+# This is a copy of the boot-args checking code in gen_iOSDevice, because we want to ensure that we can load unsigned Perl modules / dependencies called in other modules, before loading them.
+# TODO:  Once we are building our 3rd-party Perl modules on B&I servers, they will be signed, then we can remove this check. 
+sub FirstStageBootArgsCheck {
+    # Check boot-args
+    my $bootArgsRaw = "";
+    $bootArgsRaw = `/usr/sbin/nvram boot-args`;
+    if( not -e "/usr/local/bin/gestalt_query" ) {    # Ie, if we are a simulated iOS device, then use these dummy values
+      $bootArgsRaw = "boot-args	serial=3 cs_enforcement_disable=1 debug=0x144";
+    }
+
+    my %requiredBootArgs = ( serial => 3,  cs_enforcement_disable => 1, debug => qr<0x[\da-fA-F]*(1|3|5|7|9|B|b|D|d|F|f)(4|5|6|7|C|c|F|f)(4|5|7|E|e|F|f)> );
+    my %systemBootArgs;
+    while ( $bootArgsRaw =~ m/\s+(\w+)=(\w+)/g ) {
+      $systemBootArgs{$1} = $2;
+      # print "$1 : $2\n";
+    }
+
+    foreach my $key ( keys %requiredBootArgs )
+    {
+      if( not defined $systemBootArgs{$key} ) {
+        die "ERROR: Expected boot arg $key = " . $requiredBootArgs{$key} . " but it was not defined -- double check your boot-args!!";
+      }
+      unless( "$systemBootArgs{$key}" =~ $requiredBootArgs{$key}) {
+        if($key eq "debug") {
+          die "ERROR: For debug boot arg value, $systemBootArgs{$key}, certain bits are not set to properly match bits 0x14e or 0x144\nDouble-check your boot-args!!" ;        
+        }
+        else {
+          die "ERROR: Expected boot arg values $key = " . $requiredBootArgs{$key} . " but found value " .  $systemBootArgs{$key} . "\nDouble-check your boot-args!!" ;
+        }
+      }
+      # $self->{m_config}->LogText( "boot-args key: $key, value: $systemBootArgs{$key}\n");
+    } 
+    print( "1st stage Boot-args check successful\n" );   
+  }
+
+BEGIN {
+
+  print "Checking boot args...";
+  FirstStageBootArgsCheck();
+
+
+  use lib "/AppleInternal/Library/PerlModules/3rdParty/";     # To avoid conflict messages about Fatal.pm (there's also an older Fatal.pm shipped with base Perl 5.8.8)
+
+  if (exists $ENV{PERL5LIB} && defined $ENV{PERL5LIB}) {
+    for my $thing (&PERL5LIB) {
+      my @matches = grep { $thing eq $_ } split(/:/, $ENV{PERL5LIB});
+      unless (scalar(@matches) > 0) {
+	      $ENV{PERL5LIB} .= ':' . $thing;
+	      push(@INC, $thing);
+      }
+    }
+  } 
+  else {
+    $ENV{PERL5LIB} = join(':', &PERL5LIB);
+    push(@INC, &PERL5LIB);
+  }
+
+  my @pathIn = exists $ENV{PATH} && defined $ENV{PATH} ? split(/:/, $ENV{PATH}) : ();
+  for my $dpath (split(':', &DEFAULTPATH)) {
+    my @matches = grep { $dpath eq $_ } @pathIn;
+    unless (scalar(@matches) > 0) {
+      push(@pathIn, $dpath);
+    }
+  }
+  $ENV{PATH} = join(':', @pathIn);
+
+}
+
+use gen2_iOSDevice;
+use TestsAndSteps;
+#use DataSummarizer;
+
+use ClArgs;
+use ClArgsCb qw(Scalar Bool ToNextSw ToNextOpt);
+
+{
+  package SystemCoexSuite;
+  use Moose;
+  extends 'TestSuite';
+
+  our $VERSION = '1.3.$VERSION$';
+  
+  has 'm_records'     => ( is => 'rw', isa => 'ArrayRef[Datasource]');
+  has 'm_dut'         => ( is => 'rw', isa => 'Object');      # Constructor needs this, to access the device's specific aggressors + victims.
+    
+
+  sub GetFriendlyNameFromTuple {
+  	my ($self, $tuple) = @_;
+  	my @outputList = split( ',', $tuple );
+  	return $outputList[0];
+  }
+
+
+  sub BUILD {
+      my ($self) = @_;
+      TestConfig::LogTextStatic( "This is the constructor for " . ($self->meta->name) . "\n" );
+
+      $self->{m_device_attrs}->{'Test'} = 'Hello';
+
+      $self->AddTestStep( TestStep->new( 
+          'm_cmdTuple'    => 'hdqtool',
+          'm_startTime'   => 0,
+          'm_description' => 'compute GG power',
+          m_scheduleNextTestStepOnCompletion => 0,
+        ));
+
+      # If we should be getting data from the BLE Environmental Sensors board, add test steps to talk to RemoteSensors
+      if($self->{m_dut}{m_config}{m_clArgs}->get('environmentalSensors')) {
+        if(`which RemoteSensors` =~ /^$/ || `which RemoteSensorsReader` =~ /^$/ ) {
+          TestConfig::LogAndDie( "ERROR: It looks like you don't have RemoteSensors installed! I can't log environmental sensors without it." );
+        } else {
+          $self->AddTestStep(
+            TestStep->new(
+              'm_cmdTuple'                       => 'remoteTemperature',
+              'm_startTime'                      => 0,
+              'm_description'                    => 'listen for external temperature readings',
+              m_scheduleNextTestStepOnCompletion => 0,
+            )
+          );
+
+          $self->AddTestStep(
+            TestStep->new(
+              'm_cmdTuple'                       => 'remoteHumidity',
+              'm_startTime'                      => 0,
+              'm_description'                    => 'listen for external humidity readings',
+              m_scheduleNextTestStepOnCompletion => 0,
+            )
+          );
+        }
+      }
+
+      $self->AddTestStep( TestStep->new( 
+          'm_cmdTuple'    => 'charger,Off',
+          'm_startTime'   => 0,
+          'm_description' => 'turn off charger',
+          m_scheduleNextTestStepOnCompletion => 0,
+        ));
+
+      # Save aggressor's list to replace entry with expanded version (eg. baseband, cameras)
+
+      my @cachedAggressors = @{$self->{m_dut}->{m_aggressors}};		# original from iOSDevice
+      my @expandedAggressors = ();		# includes expansion of 'baseband'
+
+      # add victim setup Test Steps, if any
+
+      for my $victim (@{$self->{m_dut}->{m_victims}}) {
+	      $self->AddTestStep( TestStep->new(m_cmdTuple => $victim->{m_setupCmdTuple},
+					  'm_startTime'   => 0,
+					  'm_description' => $self->GetFriendlyNameFromTuple( $victim->{m_setupCmdTuple}),
+					  'm_scheduleNextTestStepOnCompletion' => 1,
+					  'm_runtimeSec' => TestStep::TESTSTEP_RUN_TO_COMPLETION))
+	      if defined $victim->{m_setupCmdTuple};
+      }
+
+      if( $self->{m_dut}{m_config}{m_clArgs}->get('countdownToStartTime') > 0 ) {
+        $self->AddTestStep( TestStep->new( 
+            'm_cmdTuple'    => 'delay',
+            'm_startTime'   => 0,
+            'm_runtimeSec'  => $self->{m_dut}{m_config}{m_clArgs}->get('countdownToStartTime'),
+            'm_description' => 'delay for ' . $self->{m_dut}{m_config}{m_clArgs}->get('countdownToStartTime') . " sec",
+            m_scheduleNextTestStepOnCompletion => 1,
+          ));
+      }
+
+      # For each victim, add a TestStep instance ((accelTest,Start) with m_opts=(Time=Indefinite)) to m_testSteps,
+
+      foreach my $curVictim ( @{$self->{m_dut}->{m_victims}} ) {
+      	$curVictim->{m_startTime} = 0;          	
+      	$curVictim->{m_description} = $self->GetFriendlyNameFromTuple($curVictim->{m_cmdTuple});
+      	
+      	$self->AddTestStep($curVictim);
+      }
+
+      # step through aggressors, adding TestSteps, expanding baseband/cameras as necessary
+
+      my $firstAggressor = 1;	
+      foreach my $curAggressor ( @{$self->{m_dut}->{m_aggressors}} ) {
+      		
+        if ($curAggressor->{m_cmdTuple} eq 'baseband') {
+          # Run the delete BB Logs command to remove the accumulated logs from previous aggressors.
+          $self->AddTestStep( TestStep->new('m_cmdTuple' => 'CheckBBCalData',
+               'm_startTime'   => 0,
+               'm_description' => "Checking BB Calibration Data",
+               'm_scheduleNextTestStepOnCompletion' => 1,
+               'm_runtimeSec' => TestStep::TESTSTEP_RUN_TO_COMPLETION));
+
+          # do setup cmds, if any
+          $self->AddTestStep( TestStep->new('m_cmdTuple'   => $curAggressor->{m_setupCmdTuple},
+                'm_startTime'   => 0,
+                'm_description' => $self->GetFriendlyNameFromTuple( $curAggressor->{m_setupCmdTuple}),
+                'm_scheduleNextTestStepOnCompletion' => 1,
+                'm_runtimeSec' => TestStep::TESTSTEP_RUN_TO_COMPLETION))
+          if (defined $curAggressor->{m_setupCmdTuple});
+
+          # expand from m_bb_commands
+          for my $bbcmd (@{$self->{m_dut}->{'m_device_attrs'}->{m_bb_commands}}) {
+            my $aggressor = Aggressor->new( 'm_cmdTuple' => $bbcmd, m_runToCompletion => 1  );
+
+            $aggressor->{m_description} = $self->GetFriendlyNameFromTuple( $aggressor->{m_cmdTuple}) . " on victims";
+
+            $aggressor->{m_startTime} = $self->{m_dut}{m_config}{m_clArgs}->get('baselineTime');
+            $firstAggressor = 0;
+            #if ( $aggressor->{m_runToCompletion} == 0 ) {
+            #  $aggressor->{m_runtimeSec} = $self->{m_dut}{m_config}{m_clArgs}->get('aggressorTime');
+            #} else {
+              $aggressor->{m_runtimeSec} = TestStep::TESTSTEP_RUN_TO_COMPLETION;
+              #}
+            $self->AddTestStep($aggressor);	# add TestStep for expanded baseband cmdlet
+            push(@expandedAggressors, $aggressor);
+
+            # Run the delete BB Logs command to remove the accumulated logs from previous aggressors.
+            #$self->AddTestStep( TestStep->new('m_cmdTuple' => 'DeleteBBLogs',
+            #     'm_startTime'   => 0,
+            #     'm_description' => "Deleting BB Logs",
+            #     'm_scheduleNextTestStepOnCompletion' => 1,
+            #     'm_runtimeSec' => TestStep::TESTSTEP_RUN_TO_COMPLETION));
+          }
+          # add TestStep for any cleanupCmdTuple's
+
+          if (defined $curAggressor->{m_cleanupCmdTuple}) {
+            $self->AddTestStep(TestStep->new('m_cmdTuple' => $curAggressor->{m_cleanupCmdTuple},
+                    'm_startTime' => 0,
+                    'm_description' => 'cleanup for ' . $curAggressor->{m_cleanupCmdTuple},
+                    m_scheduleNextTestStepOnCompletion => 1,
+                    'm_runtimeSec' => TestStep::TESTSTEP_RUN_TO_COMPLETION));
+          }
+
+        } elsif ($curAggressor->{m_cmdTuple} =~ m<^camera(\S+)>) {
+          my $cameraIndex = $1;
+          if ($cameraIndex =~ m<^(f|r)$>i) {
+              $cameraIndex = uc $1 eq 'F' ? 1 : 0;    # front camera is 1, rear camera is 0
+          }
+          # do setup cmds, if any
+          if (defined $curAggressor->{m_setupCmdTuple}) {
+            printf STDERR "Adding Setup Comamnds for $curAggressor->{m_cmdTuple}\n";
+            $self->AddTestStep( TestStep->new('m_cmdTuple'   => $curAggressor->{m_setupCmdTuple},
+                  'm_startTime'   => 0,
+                  'm_description' => $self->GetFriendlyNameFromTuple( $curAggressor->{m_setupCmdTuple}),
+                  'm_scheduleNextTestStepOnCompletion' => 1,
+                  'm_runtimeSec' => TestStep::TESTSTEP_RUN_TO_COMPLETION));
+          }
+
+          # expand from m_camera_commands
+          for my $camcmd (@{$self->{m_dut}->{'m_device_attrs'}->{m_camera_commands}->{$cameraIndex}}) {
+            my $aggressor = Aggressor->new( 'm_cmdTuple' => $camcmd, m_runToCompletion => 1 );
+
+            $aggressor->{m_description} = $self->GetFriendlyNameFromTuple( $aggressor->{m_cmdTuple}) . " on victims";
+
+            $aggressor->{m_startTime} = $self->{m_dut}{m_config}{m_clArgs}->get('baselineTime');
+            $firstAggressor = 0;
+            #if ( $aggressor->{m_runToCompletion} == 0 ) {
+            #  $aggressor->{m_runtimeSec} = $self->{m_dut}{m_config}{m_clArgs}->get('aggressorTime');
+            #} else {
+              $aggressor->{m_runtimeSec} = TestStep::TESTSTEP_RUN_TO_COMPLETION;
+              #}
+            $self->AddTestStep($aggressor);	# add TestStep for expanded baseband cmdlet
+            push(@expandedAggressors, $aggressor);
+          }
+          
+          if (defined $curAggressor->{m_cleanupCmdTuple}) {
+            printf STDERR "Adding Cleanup Comamnds for $curAggressor->{m_cmdTuple}\n";
+            $self->AddTestStep(TestStep->new('m_cmdTuple' => $curAggressor->{m_cleanupCmdTuple},
+                    'm_startTime' => 0,
+                    'm_description' => 'cleanup for ' . $curAggressor->{m_cleanupCmdTuple},
+                    m_scheduleNextTestStepOnCompletion => 1,
+                    'm_runtimeSec' => TestStep::TESTSTEP_RUN_TO_COMPLETION));
+          }
+        } else {
+          # do setup cmds, if any
+          $self->AddTestStep( TestStep->new('m_cmdTuple' => $curAggressor->{m_setupCmdTuple},
+                'm_startTime'   => 0,
+                'm_description' => $self->GetFriendlyNameFromTuple( $curAggressor->{m_setupCmdTuple}),
+                'm_scheduleNextTestStepOnCompletion' => 1,
+                'm_runtimeSec' => TestStep::TESTSTEP_RUN_TO_COMPLETION))
+          if (defined $curAggressor->{m_setupCmdTuple});
+
+          # We need to make a copy of this aggressor -- otherwise, we'll be referring to the same object, when we switch to the next victim.  Start times will be wrong.
+          push(@expandedAggressors, $curAggressor);
+
+          $curAggressor->{m_description} = $self->GetFriendlyNameFromTuple( $curAggressor->{m_cmdTuple}). " on " . "motion sensors";
+          $curAggressor->{m_startTime} = $self->{m_dut}{m_config}{m_clArgs}->get('baselineTime');
+
+          if ( $curAggressor->{m_runToCompletion} == 0 ) {
+            $curAggressor->{m_runtimeSec} = $self->{m_dut}{m_config}{m_clArgs}->get('aggressorTime');
+          } else {
+            $curAggressor->{m_runtimeSec} = TestStep::TESTSTEP_RUN_TO_COMPLETION;
+          }
+
+          # Special case for "charging" aggressor : first, kill the "charging,Off" cmdTuple, and re-enable it afterward
+          if( $curAggressor->{m_cmdTuple} eq "charging" ) {
+            $self->AddTestStep( TestStep->new(
+              'm_cmdTuple'  => "charger,Off",
+              'm_startTime' => $curAggressor->{m_startTime}, 
+              'm_description' => "__RESERVED__StopStep", #$TestSuite::STOPSTEP_KEYWORD,
+              m_scheduleNextTestStepOnCompletion => 1,
+                )
+            );
+            $curAggressor->{m_startTime} = 0;   
+            $self->AddTestStep($curAggressor);
+            $self->AddTestStep( TestStep->new( 
+                'm_cmdTuple'    => 'charger,Off',
+                'm_startTime'   => 0,
+                'm_description' => 'turn off charger',
+                m_scheduleNextTestStepOnCompletion => 0,
+              ));
+
+
+          } else {
+            $self->AddTestStep($curAggressor);
+          }
+
+          if (defined $curAggressor->{m_cleanupCmdTuple}) {
+            $self->AddTestStep(TestStep->new('m_cmdTuple' => $curAggressor->{m_cleanupCmdTuple},
+                    'm_startTime' => 0,
+                    'm_description' => 'cleanup for ' . $curAggressor->{m_cleanupCmdTuple},
+                    m_scheduleNextTestStepOnCompletion => 1,
+                    'm_runtimeSec' => TestStep::TESTSTEP_RUN_TO_COMPLETION));
+          }
+          $firstAggressor = 0;
+        }
+      }
+
+      $self->{m_dut}->{m_aggressors} = \@expandedAggressors;
+
+      foreach my $curVictim ( @{$self->{m_dut}->{m_victims}} ) {
+      	
+      	# Need to stop the Victim here.
+      	# This will enqueue a OnEvent_StopStep for the specified time, with wheel ID of the started task looked up by cmdTuple.
+      	# We signal the backend not to lookup the cmdTuple in the DUT by using the sentinel value placed in m_description.
+      	$self->AddTestStep( TestStep->new(
+      	   'm_cmdTuple'  => $curVictim->{m_cmdTuple},
+      	   'm_startTime' => 0, 
+      	   'm_description' => "__RESERVED__StopStep", #$TestSuite::STOPSTEP_KEYWORD,
+           m_scheduleNextTestStepOnCompletion => 1,
+      	    )
+      	);
+      }
+
+      # similarly for any victim cleanupCmdTuple's
+
+      for my $victim (@{$self->{m_dut}->{m_victims}}) {
+        $self->AddTestStep(TestStep->new(m_cmdTuple => $victim->{m_cleanupCmdTuple},
+                'm_startTime' => 0,
+                'm_description' => 'cleanup for ' . $victim->{m_cleanupCmdTuple},
+                m_scheduleNextTestStepOnCompletion => 1,
+                'm_runtimeSec' => TestStep::TESTSTEP_RUN_TO_COMPLETION))
+
+          if defined $victim->{m_cleanupCmdTuple};
+      }
+
+      $self->AddTestStep( TestStep->new(
+          'm_cmdTuple'  => 'hdqtool',
+          'm_startTime' => 0, 
+          'm_description' => "__RESERVED__StopStep", #$TestSuite::STOPSTEP_KEYWORD,
+          m_scheduleNextTestStepOnCompletion => 0,
+          )
+      );
+
+      if($self->{m_dut}{m_config}{m_clArgs}->get('environmentalSensors')) {
+        $self->AddTestStep(
+          TestStep->new(
+            'm_cmdTuple'                       => 'remoteTemperature',
+            'm_startTime'                      => 0,
+            'm_description'                    => "__RESERVED__StopStep",    #$TestSuite::STOPSTEP_KEYWORD,
+            m_scheduleNextTestStepOnCompletion => 0,
+          )
+        );
+        $self->AddTestStep(
+          TestStep->new(
+            'm_cmdTuple'                       => 'remoteHumidity',
+            'm_startTime'                      => 0,
+            'm_description'                    => "__RESERVED__StopStep",    #$TestSuite::STOPSTEP_KEYWORD,
+            m_scheduleNextTestStepOnCompletion => 0,
+          )
+        );
+      }
+
+      $self->AddTestStep( TestStep->new(
+          'm_cmdTuple'  => 'charger,Off',
+          'm_startTime' => 0,
+          'm_description' => "__RESERVED__StopStep", #$TestSuite::STOPSTEP_KEYWORD,
+          m_scheduleNextTestStepOnCompletion => 0,
+          )
+      );
+  }
+
+
+  sub PlotReports {
+
+    # Now when it is time to plot all our Datasources -- 
+    #   create a Comparison... bar chart comparing all the aggressor together by their sigma, for example.  Call Comparison.AddDatasource() on each datasource.
+    
+    #  Instantiate a visualization using the Comparison.  Call ExportToPDF().
+     
+
+  }
+
+  # Here we're implementing a base class method
+  sub OnCompletion {
+    my ($self) = @_;
+
+    TestConfig::LogTextStatic( "This is the " . $self->meta->name . " OnCompletion handler\n" );
+
+    $self->TestSuite::OnCompletion();
+  }
+
+  __PACKAGE__->meta->make_immutable;
+  no Moose;     # When I'm done using the Moose exports
+}
+
+
+
+
+  sub registerOpts {
+    my $clargs = shift;
+
+    # Note about the callback.  The provided API will be:
+    #  my ($ctx, $key, $arg, $value, $args) = @_;
+    #                  my $newValue = shift(@{$args});
+    #                  $ctx->store($key, $newValue);
+
+    #  OptionKeyword,        DefaultValue, CmdLineKeywordList,       Callback
+    for(['loglevel',		      0,  	['-loglevel'],		  \&Scalar	],
+        ['version',           $SystemCoexSuite::VERSION,	[qw(-v -version --version)],	sub { printf "%s\n", $SystemCoexSuite::VERSION; exit(0); }],     
+        ['outputdir',         'sysCoexReports', [qw(-outputdir)], \&Scalar ],
+        ['Usage',             undef,[qw(-h -help)],     sub { &printUsage(0); } ],
+        ['simulated',         0,    [qw(-simulated)],       \&Bool ],
+        ['deviceType',        'J123DEV',    [qw(-deviceType)],      \&Scalar ],
+        ['stopIfBattLow',     0,    [qw(-stopIfBattLow)],   \&Bool ],   # parameter for use at the factory 
+        ['leaveDisplayAlone', 0,    [qw(-leaveDisplayAlone)],   \&Bool ],   # parameter for use at the factory 
+        
+        ['aggressorTime',     15,	  ['-aggressorTime'],	\&Scalar	],
+        ['baselineTime',      15,   [qw(-baselineTime)],\&Scalar ],
+        ['countdownToStartTime',      0,   [qw(-countdownToStartTime)],\&Scalar ],
+        ['cycles',            1,    [qw(-cycles)],      \&Scalar ],
+        ['sampleEveryMin',    0,    [qw(-sampleEveryMin)],  \&Scalar  ],
+        
+        ['aggressors',        [],   [qw(-aggressors)],  \&ToNextOpt ],
+        ['victims',           [],   [qw(-victims)],     \&ToNextOpt  ],
+        
+        ['summarize',         undef,    [qw(-summarize)],   \&Scalar ],  
+        ['describe',          undef,    [qw(-describe)],   \&Scalar ],  
+        ['regenUnitPlots',    0,      [qw(-regenUnitPlots)],  \&Bool ],
+        ['regenPDCAfiles',    1,      [qw(-regenPDCAfiles)],  \&Bool ],
+        ['compare',           [],    [qw(-compare)],     \&ToNextOpt ],  # sub { print "-compare <fileglob> is not implemented yet\n"; exit(0); } ],
+
+        ['audiozoom',         [],     [qw(-audiozoom)],   \&ToNextOpt],
+
+        ['accelPeriod',       0.005,  [qw(-accelPeriod)],   \&Scalar ],
+        ['gyroPeriod',        0.005,  [qw(-gyroPeriod)],    \&Scalar ],
+        ['compassPeriod',     0.01,   [qw(-compassPeriod)], \&Scalar ],
+        ['pressurePeriod',    0.05,   [qw(-pressurePeriod)],\&Scalar ],
+        ['beepOnFinish',        0,    [qw(-beepOnFinish -beep)],   \&Bool ],
+        [ 'environmentalSensors', 0,  [qw(-environmentalSensors -envSense)], \&Bool ],
+
+        ['dbgGenSimFiles',        0,    [qw(-dbgGenSimFiles)],        \&Bool    ],
+        ['dbgSensorParsedValues', 0,    [qw(-sensorcsv -dbgSensorParsedValues)], \&Bool    ],
+        ['dbgKeepTmpFiles',       0,    [qw(-dbgKeepTmpFiles)],      \&Bool    ],
+        ['dbgSimdir',             '../simInput',  [qw(-dbgSimdir)],   \&Scalar ],
+      ) 
+      {
+        $clargs->add(@{$_});
+      }
+    return 1;
+  }
+
+sub printUsage {
+  my ($exitCode) = @_;
+  my ($pPath, $program) = $0 =~ m<^(.*/|)(.*),?(.*)$>;
+  print <<ENDSHERE;
+
+$program <args> [-h | -help |-h] 
+
+where <args> are any combination of:
+
+GENERAL OPTIONS  
+  -h | -help
+	  Prints this 'help' output and exits.
+  -version                : Print out version number and exit
+  -loglevel <x>           : NOT IMPLEMENTED YET -- Sets debug log level.   Set to 0 for NO output, 1 for standard level of output, 2 for debug level.
+  -outputdir <dir>        : Folder to store log files, .DAT files, and graphs in.  Default value is <current directory>/sysCoexReports. 
+                            Will be created if it does not exist.
+
+  -stopIfBattLow          : Quit if the device battery level is below a minimum (device-specific) threshold.
+
+  -leaveDisplayAlone      : Do not immediately turn off display and touch by default.
+
+  -beepOnFinish           : Play a beep when the test finishes for notification purposes.
+
+  -environmentalSensors   : Enable temperature and humidity logging from the BLE Environmental Sensor board. Note that this requires Bluetooth to be enabled, which may interfere with some types of tests.
+
+  -audiozoom <lowerFreqHz> <upperFreqHz>      
+                            This option can be used in conjunction with any of the test modes below.  Audio plots will zoom in on the specified frequencies, instead of using the typical 20 Hz - 20,000 Hz range.  
+
+
+TEST MODES
+  -simulated              : Include this parameter if you are not running on an iOS device
+  -deviceType <deviceType>   : Use specified device type (default: J123DEV), for test limits (while summarizing data), or for supported aggressors/victims (when simulating data collection).  
+  -cycles <n>             : Number of times to repeat the entire test.
+
+  -sampleEveryMin <min>        : intended for use in temp/humidity chamber testing.  Reduce data storage requirements by sampling victims at their nominal ODRs for 1 min every <min> minutes.
+
+  The default mode, if neither of the -summarize or -compare modes are given, is to run each aggressor in turn, while all of the specified victims are collecting data.
+  Other modes that may be used are:
+
+  -summarize "J123_*_blob.dat"        
+                    generate individual time-series and summary plots (including confidence intervals) for the specified group of .DAT files.        
+                    Note that the quotes are required.
+
+  -regenUnitPlots       : Used in conjunction with -summarize.  Generates individual unit statistics and plots.  
+  -regenPDCAfiles       : Used in conjunction with -summarize.  Generates individual unit PDCA upload data.  For factory use only.  
+
+  -compare   "J123_Proto1_*_build.dat" "J123_Proto2_*_build.dat" "J123_EVT_*_build.dat"
+          
+                    generate summary plots only, with confidence intervals, for the specified (2 or more) groups.  Each group can be a 'fileglob.'
+                    Note that the quotes are required for file globs.
+
+  -describe "J123_*_blob.dat"   : Print info about this DAT file and exit.
+    
+
+TEST VICTIMS AND AGGRESSORS
+  -aggressors a b c  
+    Available aggressors:   cpupv gpupv iorw audio mesa externalAggressor baseband ddr grapeLF grapeMF grapeHF audio_white cameraF cameraR charging 
+                            receiver backlight vibrator tapping display torch strobeR strobeF wifi 
+    NOTE: 'externalAggressor' means that stimulus may be provided by some program or process (eg thermal chamber) outside of our control.
+    NOTE: 'baseband' is available only on baseband-equipped units.
+
+  -victims d e f    
+    Available victims:      accel gyro compass pressure mesa_fbfd mesa_imaging grapeLF grapeMF grapeHF orb externalVictim 
+
+
+TEST LENGTH
+  -baselineTime <sec>     : Length of time to run the victims and collect baseline data for.   
+  -aggressorTime <sec>    : Length of time to run each configured aggressor for.  Is ignored for the audio aggressor.
+  -countdownToStartTime <sec> : Length of time to wait before starting baseline data collection.    Can be used to position the unit in a fixture, for example. 
+
+VICTIM SAMPLING RATES
+  -accelPeriod            : Time, in sec, between accel samples
+  -gyroPeriod             : Time, in sec, between gyro samples
+  -compassPeriod          : Time, in sec, between compass samples
+  -pressurePeriod         : Time, in sec, between pressure samples
+
+DEBUGGING OPTIONS
+  -dbgGenSimFiles         : Output the raw <sensorName>Tester output as received from STDOUT.
+  -dbgSensorParsedValues  : Output the parsed values (time, interval, temperature, X,Y,Z axis value) for supported sensors in CSV format. 
+  -dbgKeepTmpFiles        : Don't delete the temp files in (PWD)/tmpSysCoex when exiting          
+  -dbgSimdir              : Path to locate simulation files, without trailing slash '/'
+
+ENDSHERE
+  exit($exitCode);
+}
+    
+sub SysCoex_main() {
+  my $config = TestConfig->new( m_simulateDUT => 0 ); 
+  $config->ProcessCmdlineArgs(\&registerOpts);
+
+  # TODO: Check for command line incompatibilities, such as -summarize and -compare together.
+  if( $config->{m_simulateDUT} ) {
+    $ENV{PATH} .= ":" . $config->{m_clArgs}->get('dbgSimdir');
+    print("Simululated mode: adding " . $config->{m_clArgs}->get('dbgSimdir') . " to the PATH, to run simulated apps like h6isp\n");
+  }
+
+  # Probe for device, using iOSDevice singleton/standalone function
+  my $deviceType  = gen2_iOSDevice::IdentifyDeviceType($config->{m_simulateDUT}, $config->{m_clArgs}->get('deviceType'));
+  my $serial      = gen2_iOSDevice::GetSerial($config);
+
+  # Set up logging here
+  $config->OpenLogfile( $deviceType, $serial ); 
+  TestConfig::LogTextStatic( "SystemCoex v$SystemCoexSuite::VERSION\n" );
+  {
+    my @st = localtime(time);
+    my $startTimeString = sprintf "%04d-%02d-%02d %02d:%02d:%02d", 1900 + $st[5], 1 + $st[4], $st[3], (@st)[2, 1, 0];
+    print "\nsystemcoex starting up...\n";
+    TestConfig::LogTextStatic(  "Run StartTime: $startTimeString\n" );
+  }
+  TestConfig::LogTextStatic( "Command line arguments: @ARGV\n" );
+  TestConfig::LogTextStatic( "I am device type $deviceType\n" );
+
+  # Instantiate appropriate IOS Device object... load up the appropriate module... or a base IOSDevice if no module-specific file found
+  my $dut = gen2_iOSDevice->CreateDeviceObject( $deviceType, $serial, $config );
+  $dut->{m_device_attrs}->{cmdlineArgs} = @ARGV;   # Not exactly an attribute of the device, but we lack a place to store this.
+  
+  ##############
+  # COMPARE mode
+  ##############
+  if( @{$config->{m_clArgs}->get('compare')} > 0 ) {
+    print  join("\n", @{$config->{m_clArgs}->get('compare')});
+    my %allPiddlesByVictim    = ();
+    my %allAggressorsByVictim  = ();
+    my %allUnitsByVictim      = ();
+    my %allMetricsLimitsByVictim  = (); 
+    my @globnames             = ();
+    my @compareGlobs = @{$config->{m_clArgs}->get('compare')};
+      for my $args (@compareGlobs) {
+        my $argstring = join (' ', @{$args});
+        #print "my argstring is $argstring\n";
+        my @globs = split(' ', $argstring);   # tmp array to eliminate warning msg about 'Use of implicit split to @_ is deprecated'
+        if (scalar @globs > 1) {
+          my $globIdx = 1;
+          foreach my $compareGlob ( split(' ', $argstring) ) {
+              TestConfig::LogTextStatic( "processing fileglob $compareGlob\n" );
+              push(@globnames, $compareGlob);
+              my ($victimPiddleHash, $aggListByVictim, $victimUnitsHash, $allDatasourcesByVictim, $metricsLimitsByVictim) = $dut->ImportFromGlob($compareGlob);
+              # foreach my $victim ( keys %{$allDatasourcesByVictim} ) {
+              #  $dut->PlotAudioSummary($allDatasourcesByVictim->{$victim}, $victim, $compareGlob, $globIdx, $dut->{m_limits});
+              #}
+              
+              foreach my $victim( keys %{$victimPiddleHash} ) {
+                if( not defined $allPiddlesByVictim{$victim} ) {
+                  @{$allPiddlesByVictim{$victim}} = ();
+                  @{$allAggressorsByVictim{$victim}} = ();
+                }
+
+                push( @{$allPiddlesByVictim{$victim}},  $victimPiddleHash );
+                push( @{$allAggressorsByVictim{$victim}},$aggListByVictim->{$victim} );
+                @allMetricsLimitsByVictim{keys %{$metricsLimitsByVictim}} = values %{$metricsLimitsByVictim};
+                @allUnitsByVictim{keys %{$victimUnitsHash}} = values %{$victimUnitsHash};   
+              }
+              $globIdx++;
+          }
+          (my $victimPiddlesHash, my $victimAggIdxHash, my $victimUnitsHash2, my $plotPrefix) = 
+              $dut->PrepSummaryPiddleFromMultipleFileglobs( \%allPiddlesByVictim, \%allAggressorsByVictim, \%allUnitsByVictim );
+          $dut->PlotSummary( $victimPiddlesHash, $victimAggIdxHash, $victimUnitsHash2, $plotPrefix, 1, \@globnames, \%allMetricsLimitsByVictim );
+          $dut->OutputSummaryJSON( $victimPiddlesHash, $victimAggIdxHash, $victimUnitsHash2, $plotPrefix, 1, \@globnames, \%allMetricsLimitsByVictim );
+      }
+       else {
+      TestConfig::LogTextStatic( "ERROR: You must provide two or more fileglobs to use the -compare mode\n" );
+    }
+
+    }    
+      # Here, plot all of the victimPiddleHashes
+  }
+  elsif( defined $config->{m_clArgs}->get('describe')  ) {
+    my $importFile = $config->{m_clArgs}->get('describe');
+    TestConfig::LogTextStatic( "Describing file glob " . $importFile . "\n" );
+    $dut->DescribeGlob($importFile);
+
+  }
+  ##############
+  # SUMMARIZE mode 
+  ##############
+  elsif( defined $config->{m_clArgs}->get('summarize')  ) {
+    my $importFile = $config->{m_clArgs}->get('summarize');
+    TestConfig::LogTextStatic( "Summarizing from file glob " . $importFile . "\n" );
+    my ($victimPiddleHash, $aggListByVictim, $victimUnitsHash, $allDatasourcesByVictim, $metricsLimitsByVictim) = $dut->ImportFromGlob($importFile);
+
+
+    # For each victim
+    foreach my $victim ( keys %{$allDatasourcesByVictim} ) {
+      # TODO: Temporarily disabled
+      #$dut->PlotAudioSummary($allDatasourcesByVictim->{$victim}, $victim, $importFile, 1, $dut->{m_limits});
+
+      if( defined $allDatasourcesByVictim->{$victim}[0]->{m_longTermData} ) {
+        $dut->PlotLongTermData( $allDatasourcesByVictim->{$victim}, $importFile );
+      }
+    }
+
+    my ($victimPiddlesHash, $victimAggIdxHash, $victimUnitsHash2, $plotPrefix) = $dut->PrepSummaryPiddleFromSingleFileglob( $victimPiddleHash, $aggListByVictim, $victimUnitsHash, $metricsLimitsByVictim );
+    $dut->PlotSummary( $victimPiddlesHash, $victimAggIdxHash, $victimUnitsHash2, $plotPrefix, 1, undef, $metricsLimitsByVictim );
+    $dut->OutputSummaryJSON( $victimPiddlesHash, $victimAggIdxHash, $victimUnitsHash2, $plotPrefix, 1, undef, $metricsLimitsByVictim );
+    
+  }
+  ######################
+  # DATA COLLECTION mode
+  ######################
+  else {
+    my $suite = SystemCoexSuite->new( m_dut => $dut ); 
+    
+    print "Configured cycles: $config->{m_testCycles} \n";
+    my $runner = TestRunner->new();
+    $runner->RunSuite( $suite, $dut, $config );      # Note how we are treating it as a Singleton; this will startup the POE event queue (not that our users will be exposed to that...)
+    
+
+    $config->{m_testCycles}--;
+    while( $config->{m_testCycles} > 0 ) {
+      TestConfig::LogTextStatic( Time::HiRes::time() . ": Remaining cycles: $config->{m_testCycles}, sleeping for " .  $config->{m_clArgs}->get('sampleEveryMin') . " min\n"); 
+      sleep(  $config->{m_clArgs}->get('sampleEveryMin') * 60 );
+      $dut->PrepForNewCycle();
+      $suite->BUILD();
+      $runner->RunSuite( $suite, $dut, $config );
+      $config->{m_testCycles}--;
+    }
+
+    my $exportedFile = $dut->ExportToFile($suite);
+    if( $config->{m_clArgs}->get('sampleEveryMin') != 0 ) {
+      $dut->ProcessLongTermData( $suite->{m_datasources}, $dut->{m_device_attrs} );
+    } else {
+      $dut->GenPlotsFromDatasources($suite->{m_datasources}, $dut->{m_deviceType}, $dut->{m_serial}, $dut->{m_device_attrs}); 
+    }
+    $dut->ExportPDCAfile($suite->{m_datasources});
+
+  } 
+
+  {
+    my @et = localtime(time);
+    my $endTimeString = sprintf "%04d-%02d-%02d %02d:%02d:%02d", 1900 + $et[5], 1 + $et[4], $et[3], (@et)[2, 1, 0];
+    TestConfig::LogTextStatic( "systemcoex Run End Time: $endTimeString\n" );
+  }
+  TestConfig::LogTextStatic( "End of SysCoex_main()\n" );
+  return 0;
+}
+
+my $exitStatus = SysCoex_main();
+exit($exitStatus);
+
+1;        # any file/module that is included with 'use' or 'require' must return a 'true' value.

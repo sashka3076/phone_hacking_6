@@ -1,0 +1,9 @@
+#!/bin/bash
+
+if [ -z $DTRACE_LOOP_ITER_COUNT ]; then DTRACE_LOOP_ITER_COUNT=0; fi
+
+echo Starting iteration $DTRACE_LOOP_ITER_COUNT
+
+dtrace-wait "$@" | tee dtrace_loop_log_`date +%Y%m%d%H%M%S`_$DTRACE_LOOP_ITER_COUNT.log
+
+DTRACE_LOOP_ITER_COUNT=$((DTRACE_LOOP_ITER_COUNT+1)) exec $0 "$@"

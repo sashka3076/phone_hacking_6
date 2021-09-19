@@ -1,0 +1,7 @@
+#!/bin/sh
+
+# Zin actually now includes pgrep, so we don't need this anymore...
+#   ps -Ac | grep -w "$@" | awk '{ print $1 }'
+
+pgrep -x $*
+

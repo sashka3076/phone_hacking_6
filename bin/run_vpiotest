@@ -1,0 +1,156 @@
+#!/usr/bin/perl
+
+# Start from scratch
+$cmdStr = "caconfig -c";
+$result = `$cmdStr`;
+
+$versionStr = "";
+$useCaseStr = "FacePlantNarrowBand";
+$dlLatStr   = "";
+$ulLatStr   = "";
+$lengthStr  = "";
+$fevStr     = "";
+$sessionStr = "-M 1";
+$vpDebugStr = "";
+
+# Iterate over the command-line options
+for(my $i = 0; $i <= $#ARGV; $i++)
+{
+        my $arg = $ARGV[$i];
+	if ($arg =~ m/-vr/)
+        {
+                $versionStr = $ARGV[$i+1];
+                $i++;
+        }
+	elsif($arg =~ m/-u/)
+	{
+		$useCaseStr = $ARGV[$i+1];
+		$i++;
+	}
+	elsif($arg =~ m/-fz/)
+        {
+                $dlLatStr = $ARGV[$i+1];
+		$i++;
+		$ulLatStr = $ARGV[$i+1];
+                $i++;
+        }
+	elsif($arg =~ m/-l/)
+        {
+                $lengthStr = $ARGV[$i+1];
+                $i++;
+        }
+	elsif($arg =~ m/-i/)
+        {
+                $fevStr = $ARGV[$i+1];
+                $i++;
+        }
+	elsif($arg =~ m/-M/)
+        {
+                my $sessionVal = $ARGV[$i+1];
+                $i++;
+		if($sessionVal eq "2")
+		{
+			$sessionStr = "-M 2";
+		}
+        }
+	elsif($arg =~ m/-vp/)
+	{
+		my $logStr = $ARGV[$i+1];
+                $i++;
+		$vpDebugStr = "-vp 1 " . $logStr;
+	}
+	else
+	{
+		print "\nAllows for running vpiotest without needing to specify all the correct caconfig/vpiotest arguments\n";
+		print "Below are all of the optional arguments ...\n\n";
+		print "-u {FacePlantNarrowBand, FacePlantWideBand, FaceTimeSpeaker, FaceTimeHeadset} <--- Supported use cases\n";
+		print "-vr {1, 2} <--- Forcing VP's v1 or v2\n";
+		print "-fz X Y <---- Set the downlink latency X and uplink latency Y in milliseconds\n";
+		print "-i far_end_voice.wav <--- use this specified file for the FEV instead of the default\n";
+		print "-l X <--- run vpiotest for X seconds\n";
+		print "-M {1, 2} <--- set the audio session mode to kAudioSessionMode_VoiceChat/receiver (1) or kAudioSessionMode_VideoChat/speaker (2)";
+		print "-vp {1-7} <--- enable the VP logging, supported levels between 0 and 7\n\n";
+		print "Sample usage ...\n";
+		print "run_vpiotest -u FacePlantNarrowBand -i FarEndVoice.wav\n";
+		print "run_vpiotest -u FacePlantNarrowBand -l 20 -i FarEndVoice.wav -vr 1 -fz 16 16\n";
+		print "run_vpiotest -u FacePlantWideBand -l 20 -i FarEndVoice.wav -M 2 -fz 4 12\n";
+		die "\n";
+	}
+}
+
+# Build up the caconfig call
+if($versionStr || $useCaseStr || $dlLatStr || $vpDebugStr)
+{
+	$cmdStr = "caconfig";
+	if($versionStr)
+	{
+		$cmdStr = $cmdStr . " -vr $versionStr";
+	}
+	if($useCaseStr)
+	{
+		$cmdStr = $cmdStr . " -u $useCaseStr";
+	}
+	if($dlLatStr)
+	{
+		$cmdStr = $cmdStr . " -fz $dlLatStr $ulLatStr";
+	}
+	if($vpDebugStr)
+	{
+		$cmdStr = $cmdStr . " $vpDebugStr";
+	}
+	$cmdStr = $cmdStr . "\n";
+	print "\nExecuting " . $cmdStr . "\n";
+	$result = `$cmdStr`;
+	# Let the settings take effect and mediaserverd come back ...
+	print "\nWaiting for settings to take effect ...\n";
+	sleep(5);
+}
+
+# Now build the vpiotest call
+$cmdStr = "vpiotest";
+
+if($useCaseStr eq "FacePlantWideBand")
+{
+	$frameSize = 64;
+        if($dlLatStr)
+        {
+                $frameSize = $dlLatStr * 16000 / 1000;
+        }
+	$cmdStr = $cmdStr . " " . $sessionStr . " -d F32\@16000 -S 16000 -u FacePlant -U $frameSize";
+}
+elsif($useCaseStr eq "FaceTimeSpeaker")
+{
+	$frameSize = 480;
+        if($dlLatStr)
+        {
+                $frameSize = $dlLatStr * 24000 / 1000;
+        }
+	$cmdStr = $cmdStr . " " . $sessionStr . " -d F32\@24000 -S 24000 -u FaceTime -U $frameSize";
+}
+elsif($useCaseStr eq "FaceTimeHeadset")
+{
+	$frameSize = 480;
+        if($dlLatStr)
+        {
+                $frameSize = $dlLatStr * 24000 / 1000;
+        }
+        $cmdStr = $cmdStr . " " . $sessionStr . " -d F32\@24000 -S 24000 -u FaceTime -U $frameSize";
+}
+else
+{
+	$frameSize = 32;
+	if($dlLatStr)
+	{
+		$frameSize = $dlLatStr * 8000 / 1000;
+	}
+	$cmdStr = $cmdStr . " " . $sessionStr . " -d F32\@8000 -S 8000 -u FacePlant -U $frameSize";
+}
+
+if($lengthStr)
+{
+	$cmdStr = $cmdStr . " -l $lengthStr";
+}
+
+$cmdStr = $cmdStr . " $fevStr\n";
+print "Running this ... " . $cmdStr . "\n";
+$result = `$cmdStr`;

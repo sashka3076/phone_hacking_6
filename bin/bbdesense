@@ -1,0 +1,260 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use constant PERL5LIB => ('/var/root/Packages', '/AppleInternal/Library/PerlModules');
+use constant VERSION => 'deviceval-2.10.2';
+
+BEGIN {
+  if (exists $ENV{PERL5LIB} && defined $ENV{PERL5LIB}) {
+    for my $thing (&PERL5LIB) {
+      my @matches = grep { $thing eq $_ } split(/:/, $ENV{PERL5LIB});
+      unless (scalar(@matches) > 0) {
+	$ENV{PERL5LIB} .= $thing;
+	push(@INC, $thing);
+      }
+    }
+  } else {
+    $ENV{PERL5LIB} = join(':', &PERL5LIB);
+    push(@INC, &PERL5LIB);
+  }
+}
+
+use POSIX;
+use Time::Local;
+
+use Time::HiRes qw(usleep gettimeofday tv_interval);
+#use Errno qw(EAGAIN);
+
+use File::Copy qw(cp copy mv move);
+
+use ClArgs;
+use ClArgsCb qw(Scalar Aref Bool ToNextOpt);
+use Utils qw(rnd getTsMsString lockdownGet);
+#use SpawnMon;
+use Execer qw(execer);
+#use PowerCtrl;
+use BB;
+
+use constant DEFAULT_BB_TRANSMIT_TIME => "60";
+use constant DEFAULT_LOG_DIR => '/var/logs/Inferno/';
+use constant TXTECH => qw(GSM LTE);
+
+my ($pPath, $program) = $0 =~ m<^(.*/|)(.*),?(.*)$>;
+my $msgp = __PACKAGE__ . "::$program:";
+
+my $clArgs = ClArgs->new(Verbose => 0);
+my ($debug, $verbose) = (0, 0);
+my ($sn, $hwm);
+
+#***************************************************************************
+#
+#   Subroutine : registerOpts
+#       Author : Neil O'Sullivan
+#         Date : 05 Jul 2012
+#
+#  Description : register command-line options with callbacks
+#
+#***************************************************************************
+
+sub registerOpts {
+  my $clargs = shift;
+
+for (['Usage',                 0,	[qw(-h -help)],         sub { &printUsage(0); } ],
+     ['debug',                 0,	['-debug'],             sub { $debug = 1; }	],
+     ['time',                  0,	['-time'],              \&Scalar	],
+     ['sensor',                0,	['-sensor'],            \&Scalar	],
+     ['version',        &VERSION,	[qw(-v --version)],	sub { printf "%s\n", &VERSION;
+								      exit(0); }	],
+     ['verbose',	       1,	[qw(-verbose
+					    -bbverbose)],	\&Bool			],
+    ) {
+    $clargs->add(@{$_});
+  }
+  return 1;
+}
+
+#***************************************************************************
+#
+#   Subroutine : printUsage
+#       Author : Neil O'Sullivan
+#         Date : 05 Jul 2011
+#
+#  Description : Usage function.
+#
+#***************************************************************************
+
+sub printUsage {
+  my ($exitCode) = @_;
+
+  print <<ENDSHERE;
+
+$program <args> [-h | -help |-h] <file specs>
+
+where <args> are any combination of:
+
+	-h | -help
+	  Prints this 'help' output and exits.
+
+	-debug
+	  This specifies debug mode, generating verbose output.
+
+	-verbose | -noverbose
+	  turns on/off verbose mode.  Verbose mode is normally ON.
+
+$program cycles through the enabled baseband technologies and bands, turning them on and off, one at a time
+while logging sensor readings, thermistor and battery drain data for the duration of the test (60 seconds).
+It unloads CommCenter, power cycles baseband, load debug firmware to baseband, then waits a few seconds,
+all of which takes about 40 seconds to complete, then turns on transmission of the selected band for the
+remainder of the test, then turns off radio transmission, re-loads CommCenter and exits.
+
+ENDSHERE
+  exit($exitCode);
+}
+
+#***************************************************************************
+#
+#   Subroutine : myexec
+#       Author : Neil O'Sullivan
+#         Date : 05 Jul 2012
+#
+#  Description : This wrapper around Execer::exec() to optionally print
+#                command to STDERR before executing it.
+#
+#                Returns:  status from Execer::exec().
+#
+#***************************************************************************
+
+sub myexec {
+  my ($printIt, @args) = (@_);
+  my $ts = &Utils::getTsMsString();
+  chomp $ts;
+  printf STDERR "%s %s\n", $ts, $args[0] if $printIt;
+#  printf STDERR "%6d %s\n", timelocal(localtime) - $startTime, $args[0]
+#    if $printIt;
+  return &Execer::execer(@args);
+#  return 1;
+}
+
+# ####
+# main
+# ####
+
+&registerOpts($clArgs);
+
+my $errors = 0;
+
+unless ($clArgs->process([@ARGV])) { # process command-line
+  print STDERR "$msgp WARNING, error processing command-line\n";
+  $errors++;
+}
+
+if (scalar(@{$clArgs->Unknown}) > 0) {
+  my @unk = grep { $_ !~ m<^\s*$> } @{$clArgs->Unknown};
+  if (scalar(@unk) > 0) {
+    printf STDERR "$msgp ERROR, unrecognized tokens on command-line:  %s\n",
+      join(', ', map { sprintf "'%s'", $_ } @unk);
+    $errors++;
+  }
+}
+
+$hwm = &lockdownGet('HardwareModel');
+if (defined $hwm) {
+  $hwm =~ s<AP$><>;
+  $hwm =~ s<DEV$><>;
+} else {
+#  $hwm = 'P106';
+  $errors++;		# uncomment this and comment above before releasing into the wild
+  printf STDERR "$msgp ERROR, unknown HardwareModel\n";
+}
+
+exit(0)
+  if $hwm =~ m<P10[15]> || $hwm =~ m<J7[15]> || $hwm =~ m<J85>;
+
+
+#### Require hw-specific package
+require $hwm . '.pm';
+
+my $device = $hwm->new;
+
+$sn = &lockdownGet('SerialNumber');
+unless (defined $sn) {
+  printf STDERR "$msgp ERROR, failed to get Serial Number from device--cannot proceed\n";
+#  $sn = 'unknown';
+  $errors++;		# uncomment this and comment above before releasing into the wild
+}
+
+print STDOUT "$msgp $hwm $sn\n";
+
+unless (exists $device->{TX} &&
+	defined $device->{TX}) {
+  $errors++;
+  printf STDERR "$msgp ERROR, unrecognized hardware model '%s'\n", $hwm;
+}
+
+exit(1)
+  if $errors;
+
+for my $txtech (&TXTECH) {
+  printf STDERR "Tech: $txtech\n";
+  for my $band (@{$device->{TX}->{$txtech}->{Bands}}) {
+    printf STDERR "$msgp %s %s\n", $txtech, $band;
+    my $logdir = &DEFAULT_LOG_DIR . join('/', $program, $hwm, $txtech, $band, $sn);
+    unless (-d $logdir) {
+      my $status = &myexec(1, "mkdir -p $logdir",
+			   sub {
+			     my ($lineNo, $line) = (@_);
+			     print $line;
+			     return 0;
+			   });
+      printf STDERR "$msgp ERROR, mkdir returned bad status when making directory '%s':  %d/$!\n",
+	$logdir, $status
+	  unless $status;
+    }
+    my $time = &DEFAULT_BB_TRANSMIT_TIME;
+    $time = $clArgs->get('time') if(defined($clArgs->get('time') > 0) && ($clArgs->get('time') > 0));
+    my $sensor = "";
+    $sensor = "-sensor " . $clArgs->get('sensor') if defined($clArgs->get('sensor'));
+   
+    my $cmd = sprintf "desense -%s %s -sensor compass -sensor accel -sensor gyro -sensor pressure -duration ${time} -log%s%s",
+      (lc $txtech), $band, $clArgs->get('verbose') ? '' : ' -nobbverbose', $clArgs->get('debug') ? ' -debug' : '';
+    my $status = &myexec(1, $cmd,
+			 sub {
+			   my ($lineNo, $line) = (@_);
+			   print $line;
+			   return 0;
+			 });
+    unless ($status) {
+      printf STDERR "$msgp ERROR, '%s' returned bad status '%d' $!\n", $cmd, $status;
+    } else {
+      my $logsFound = 0;
+      for my $sensor (qw(accel compass gyro pressure)) {
+	my $logFile = join('_', $sensor, 'Tester.txt');
+	my $fqlogSrcFile = '/tmp/' . $logFile;
+	if (-f $fqlogSrcFile) {
+	  $logsFound++;
+	  $status = mv($fqlogSrcFile, $logdir);
+	  unless ($status) {
+	    printf STDERR "$msgp ERROR, failed to move file '%s' to '%s'\n", $fqlogSrcFile, $logdir;
+	  }
+	} else {
+	  printf STDERR "$msgp ERROR, missing source log file '%s'\n", $fqlogSrcFile;
+	}
+      }
+      printf STDERR "$msgp copied %d sensor log files to $logdir\n", $logsFound;
+      for my $dir (qw(desense tbb)) {
+	my $srcfspec = '/var/logs/Inferno/' . $dir . '/' . join('_', $sn, 'desense.csv');
+	if (-f $srcfspec) {
+	  $status = mv($srcfspec, $logdir);
+	  unless ($status) {
+	    printf STDERR "$msgp ERROR, failed to move file '%s' to '%s'\n", $srcfspec, $logdir;
+	  } else {
+	    printf STDERR "$msgp copied %s to %s\n", $srcfspec, $logdir;
+	  }
+	  last;
+	}
+      }
+    }
+  }
+}

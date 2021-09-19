@@ -1,0 +1,87 @@
+#!/bin/sh
+
+##############################
+# --- Process Arguments ---
+#
+
+### Default variables
+opt_filter=0; opt_pid=0; pid=0; opt_name=0; pname=".";
+opt_maximum=0;
+
+### Process options
+while getopts hmn:p: name
+do
+	case $name in
+	p)	opt_filter=1; opt_pid=1; pid=$OPTARG ;;
+	n)	opt_filter=1; opt_name=1; pname=$OPTARG ;;
+	m)	opt_maximum=1 ;;
+	h|?)	cat <<-END >&2
+		USAGE: mainthreadtrace [ -p pid | -n name ] [-m]
+		          -p pid           # examine this pid
+		          -n name          # examine this process name
+		          -m               # Show stack traces for longest calls
+		END
+		exit 1
+	esac
+done
+
+#################################
+# --- Main Program, DTrace ---
+#
+/usr/sbin/dtrace -n '
+ /*
+  * Command line arguments
+  */
+ inline int OPT_pid 	= '$opt_pid';
+ inline int OPT_name 	= '$opt_name';
+ inline int OPT_filter	= '$opt_filter';
+ inline int OPT_maximum	= '$opt_maximum';
+ inline int PID 	= '$pid';
+ inline string NAME 	= "'$pname'";
+
+ #pragma D option quiet
+
+ dtrace:::BEGIN
+ {
+	printf("Hit Ctrl-C to stop sampling...\n");
+ }
+
+ syscall:::entry
+ /(curthread->thread_tag & THREAD_TAG_MAINTHREAD) &&
+  ((! OPT_filter && execname != "dtrace") ||
+   (OPT_pid && pid == PID) ||
+   (OPT_name && execname == NAME))/
+ {
+	self->start = timestamp;
+	OPT_filter ?
+		(@counts[probefunc] = count()) :
+		(@counts[execname, probefunc] = count());
+ }
+
+ syscall:::return
+ /self->start/
+ {
+	OPT_filter ?
+		(@times[probefunc] = quantize(timestamp - self->start)) :
+		(@times[execname, probefunc] = quantize(timestamp - self->start));
+
+	OPT_maximum ? @maximums[execname, probefunc, ustack(40)] = max(timestamp - self->start) : 1;
+
+	self->start = 0;
+ }
+
+ dtrace:::END
+ {
+	trunc(@times, 10);
+	trunc(@counts, 5);
+	printf("Top 10 longest system calls:");
+	printa(@times);
+	printf("Number of invocations:");
+	printa(@counts);
+
+	OPT_maximum ? printf("Top 5 longest system calls by stack trace:") : 1;
+	OPT_maximum ? trunc(@maximums, 5) : 1;
+	OPT_maximum ? printa(@maximums) : 1;
+ }
+'
+

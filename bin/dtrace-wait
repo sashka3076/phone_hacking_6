@@ -1,0 +1,167 @@
+#!/usr/bin/perl -w
+use strict;
+
+# This script makes it easier to place dtrace probes on events that happen during application startup.
+
+=pod
+
+=head1 NAME
+
+dwait - Allow easy placement of dtrace probes on dyld before main() begins
+
+=head1 SYNOPSIS
+
+B<dwait> [I<-early>] I<execname> [I<dtrace_arguments>, ...]
+
+=head1 DESCRIPTION
+
+B<dwait> allows you to reliaibly and easily attach dtrace probes to a process early on
+in process startup.  You can choose between placing probes immediately following 
+proc:::exec-success (that is, before dyld begins executing), or before entry to 
+dyld::initializeMainExecutable(), (that is, before library initializers are called by dyld, 
+and also before the application's main()).  By default, probes are placed at the latter of
+these two points to allow you to make use of symbols within the application and its libraries.
+The first argument should be the execname of the process to wait for.  The process
+will be stopped immediately after proc:::exec-success fires, and then restarted once
+probes specified in subsequent options have been placed.
+
+=head1 AUTHOR
+
+Ben Weintraub - weintraub@apple.com
+
+=head1 OPTIONS
+
+=over 4
+
+=item I<-early>
+
+If this option is given, probes specified in I<dtrace_arguments> will be placed very 
+early on in process startup, before dyld begins executing.  Use this if you want to place
+probes within dyld itself that will fire before main().  Note that because dyld has not yet 
+run to map in the application or its dylibs, only dyld symbols will be available with this option.
+
+=item I<-quiet>
+
+If this option is given, dtrace-wait will not print the dtrace invocations as it makes them.
+
+=item I<execname>
+
+The execname of the process to wait for.  The next time a process with this execname
+launches, it will be stopped for probe placement before the kernel hands off to dyld.
+
+=item I<dtrace_arguments>
+
+Any further arguments are passed directly to the second invocation of B<dtrace>.
+Usually this will be additional probes to place with the B<-n> option.
+
+=back
+
+=cut
+
+my $dtrace = '/usr/sbin/dtrace';
+my $execname = undef;
+
+# By default allow probes outside of dyld
+my $early_probes = 0;
+my $quiet = 0;
+
+my $arg = undef;
+while (($arg = shift(@ARGV))) {
+    if ($arg eq "-early") {
+        $early_probes = 1;
+    } elsif ($arg eq "-quiet") {
+        $quiet = 1;
+    } else {
+        $execname = $arg;
+        last;
+    }
+}
+die usage() unless $execname;
+my $max_execname = 15; # execnames > 15 chars don't work correctly
+if (length($execname) > $max_execname) {
+    $execname = substr($execname, 0, $max_execname);
+    print "Note: truncated execname to '$execname' to fit within $max_execname character limit\n" unless $quiet;
+}
+
+my $early_status = $early_probes ? "enabled" : "disabled";
+
+# Wait for dtrace to finish loading before printing the banner
+sub USR1_handler {
+    print "Waiting for process '$execname', early probe placement $early_status\n";
+}
+$SIG{'USR1'} = 'USR1_handler';
+
+# Check for first time initialization, which can be slow
+my $dtrace_initialized = system("zprint | grep -q fasttrap");
+if ($dtrace_initialized != 0) {
+	print "dtrace is doing first time initialization... this may take some time\n"
+}
+
+my $dtrace_probe = <<END;
+BEGIN
+{
+    system("kill -USR1 $$");
+}
+proc:::exec-success / execname=="$execname" /
+{
+    stop();
+    printf("%d", pid);
+    exit(0);
+}
+END
+my @dtrace_cmd = ($dtrace, '-q', '-w', '-n', $dtrace_probe);
+my @lines = safe_backticks(@dtrace_cmd);
+my $pid = shift @lines;
+$pid =~ s/\s*$//;
+
+print "Got pid $pid\n";
+
+# This probe will resume the target process when it fires at the very beginning of the script
+my $begin_resume_probe = "BEGIN { pidresume($pid); }";
+
+if (!$early_probes) {
+    # Stop the process again after symbols have been loaded but before main()
+    # to allow placement of pid provider probes outside of dyld.
+    # I picked initializeMainExecutable because it's after symbols are there,
+    # but should allow us to catch library initializers.
+    $dtrace_probe = <<END;
+    $begin_resume_probe
+    pid$pid:dyld:*initializeMainExecutable*:entry { stop(); exit(0); }
+END
+    @dtrace_cmd = ($dtrace, '-q', '-w', '-p', $pid, '-n', $dtrace_probe);
+    safe_backticks(@dtrace_cmd);
+}
+
+# Now exec() dtrace with the user-provided probes, plus one BEGIN probe to resume the target
+$dtrace_probe = $begin_resume_probe;
+@dtrace_cmd = ($dtrace, '-w', '-p', $pid, '-n', $dtrace_probe);
+push(@dtrace_cmd, @ARGV);
+print(join(' ', @dtrace_cmd)."\n") unless $quiet;
+exec(@dtrace_cmd);
+
+# Takes an array to be passed to exec, then does a fork + exec
+# and captures STDOUT, passing back an array of lines from STDOUT.
+# Taken from 'perldoc perlsec' under 'Cleaning up your path'
+# This skirts the issue of escaping shell metacharacters by not using a shell
+sub safe_backticks
+{
+    my ($pid, @lines);
+    die "Can't fork: $!" unless defined($pid = open(KID, "-|"));
+    if ($pid) {
+        @lines = <KID>;
+        close KID;
+    } else {
+        exec @_ or die "can't exec $_[0]: $!";
+    }
+    return @lines;
+}
+
+sub usage
+{
+    print STDERR "Usage: dwait.pl [<options>] <exec name> [<dtrace args>, ...]\n";
+    print STDERR "Any arguments after <exec name> will be passed directly to dtrace.\n";
+    print STDERR "Valid options:\n";
+    print STDERR "  -quiet   Be quiet(-ish).  Only print the 'Waiting for...' and 'Got pid ...' lines.\n";
+    print STDERR "  -early   Place probes immediately after proc:::exec-success.\n";
+    print STDERR "           Useful only for placing probes within dyld itself.\n";
+}

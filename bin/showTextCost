@@ -1,0 +1,78 @@
+#!/bin/sh
+# showTextCost
+# PerformanceTools
+#
+# DTrace script to show text rendering slow path callers in dtrace.
+# The original probes were lifted from the file UIFoundation/render-cost.d
+#
+# showTextCost was heavily inspired by the timeEvents script.
+# Copyright 2013 Apple Inc. All rights reserved.
+
+#
+# NOTE: Need to set "dtrace_dof_mode=1" in boot-args to enable.
+#
+
+me=`basename $0`
+
+bootargs=`nvram boot-args | grep "dtrace_dof_mode=1"`
+if [[ -z ${bootargs} ]]; then
+        echo "ERROR: Need to set "dtrace_dof_mode=1" in boot-args for this script to work"
+        exit 1
+fi
+
+if (($# == 0)); then
+	echo "usage: $me ProcessName <additional args to dtrace>"
+	exit 1
+fi
+
+shift $(($OPTIND-1))
+
+if (($# < 1)); then
+	echo "Please specify a process name to time events." >&2
+	exit 1
+fi
+
+pname="$1"
+pid=`pgrep -x ""$pname""`
+
+
+### Define Probes
+
+probes='
+UIFoundation$target:::render-cost
+/arg0 > 0/
+{
+	printf("\n\tcost: %s, \"%s\"\n", (arg0 == 0 ? "Faster" : (arg0 == 1 ? "Fast" : (arg0 == 2 ? "Slow" : (arg0 == 3 ? "Slower" : (arg0 == 4 ? "Slowest" : "Doom"))))), copyinstr(arg1));
+	ustack();
+	@dist = lquantize(arg0,0,4,1);
+}
+
+UIFoundation$target:::render-cost
+/arg0 == 0/
+{
+	@dist = lquantize(arg0,0,4,1);
+}
+'
+
+dtrace='
+#pragma D option quiet
+BEGIN
+{
+	printf("Ready.\n");
+}
+'$probes'
+END
+{
+	printf("Done.\n");
+}
+'
+
+
+### Run DTrace
+
+echo "Starting up dtrace..."
+if ((${#pid} > 0)); then
+	dtrace -p $pid -n "$dtrace" $3
+else
+	dtrace-wait -quiet "$pname" -n "$dtrace" $3
+fi

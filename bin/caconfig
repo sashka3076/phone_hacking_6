@@ -1,0 +1,858 @@
+#!/usr/bin/perl
+
+################################################################################################
+# This script is used to set up an iOS device with system defaults (in the VAD, CoreAudio, 
+# GameKit and VideoConference domains) that have values appropriate for particular use case 
+# tests such as FacePlant, FaceTime, etc. 
+#
+# The script may also be used for certain ancillary purposes such as reading the current state 
+# of these defaults, clearing these defaults and enabling Voice Processor logging. 
+#
+# Running the script without any arguments provides detailed usage information.
+################################################################################################
+
+use strict;
+use warnings;
+import string;
+   
+# command line args usage and validation    
+sub printcommandlinehelpstr();
+sub checkcommandlineargs();
+sub checkusecasestring();
+sub checklatencypresetstring();
+sub checkheadsetstring();
+sub handleU();
+sub handleLP();
+sub handleC();
+sub handleH($);
+sub handleR();
+sub handleVP($$);
+sub handleVPVersions($);
+
+# handle individual defaults supported by caconfig
+sub handleLS();
+sub handleDisableEANC($);
+
+# system defaults related
+sub readcurrentsystemdefaults();
+sub deletecurrentsystemdefaults();
+sub setsystemdefaults();
+sub setvpdefaults($$);
+sub setlatencydefaults($$);
+sub setframesizedefaults($$);
+sub kam();
+
+sub getmictrimscmd();
+sub uint2int($$);
+sub getvpversion();
+sub clearlatencydefaults();
+
+################################################################################################
+
+use vars qw($model $defaultsdomainvad @defaultsvad @defaultsvad_fp_values @defaultsvad_fp_n94_values
+			$defaultsdomaincoreaudio @defaultscoreaudio @defaultscoreaudio_fp_nb_values @defaultscoreaudio_fp_wb_values 
+            $defaultsdomaingktalk @defaultsgktalk @defaultsgktalk_ft_values @defaultsgktalk_fp_nb_values @defaultsgktalk_fp_wb_values
+			$defaultsdomainvideoconf @defaultsvideoconf @defaultsvideoconf_ft_values @defaultsvideoconf_fp_nb_values @defaultsvideoconf_fp_wb_values @defaultsvideoconf_fp_wb_thru_ft_values
+			@defaultsdomainarray
+            $headsetstr_b15 $headsetstr_b60f $headsetstr_b149 $headsetstr_b60g $headsetstr_a36 $headsetstr_b18 $headsetstr_b126
+            @headsetarray
+			$usecasestr_FacePlantNB $usecasestr_FacePlantWB $usecasestr_FacePlantReceiverWBThruFaceTime
+			@usecasearray $usecasestr @individualdefaults $headsetstr
+            $latencypresetstr_4and12 $latencypresetstr_6and12 $latencypresetstr_8and16 $latencypresetstr_12and12 $latencypresetstr_16and16
+            @latencypresetarray $latencypresetstr);
+
+
+#-------------------
+
+my $model = `sysctl -n hw.model`; chomp($model);
+my $defaultsdomainvad = "com.apple.audio.virtualaudio";
+my @defaultsvad = ("DisableInputProcessing", "DisableOutputProcessing", "DisableCodecWindFilter", "BuiltInMicSelection", "FacePlantMode","CodecInputGain", "UseReceiverInVideoChat");
+my @defaultsvad_fp_n94_values = ("1", "1", "1", "3", "-", "-", "-");
+my @defaultsvad_fp_values = ("1", "1", "1", "7", "-", "-", "-");
+my @defaultsvad_force_receiver = ("-", "-", "-", "-", "-", "-", "1");
+
+#-------------------
+
+my $defaultsdomaincoreaudio = "com.apple.coreaudio";
+my @defaultscoreaudio = ("aqme_fakefaceplant", "faceplanter_framesize_ms", "faceplanter_samplerate", "vp_mic_trim_gains", "vp_preprocessing_input_gain","vp_preprocessing_input_trims","vp_enable_debug_features", "vp_console_msgs", "vp_mbdp_blocksize_ms_override");
+my @defaultscoreaudio_fp_nb_values = ("1", "12", "8000", "-", "-", "-", "-", "-","12");
+my @defaultscoreaudio_fp_wb_values = ("1", "12", "16000", "-", "-","-", "-", "-","12");
+
+#-------------------
+
+my $defaultsdomaingktalk = "com.apple.GKTalk.dev";
+my @defaultsgktalk = ("forceAudioSampleRate", "forceAudioBufferFrames");
+my @defaultsgktalk_ft_values = ("-float 24000.0", "-int 480");
+my @defaultsgktalk_fp_nb_values = ("-float 8000.0", "-int 32");
+my @defaultsgktalk_fp_wb_values = ("-float 16000.0", "-int 64");
+
+#-------------------
+
+my $defaultsdomainvideoconf = "com.apple.VideoConference";
+my @defaultsvideoconf = ("forceAudioSampleRate", "forceAudioBufferFrames", "forceAudioPayload", "voiceProcessingQuality", "forceAACELDFrames", "forceAACELDBitrate", "forceAudioCategoryVideoConference");
+my @defaultsvideoconf_ft_values = ("-float 24000.0", "-int 480", "105", "-int 127", "-int 480", "-int 32000", "YES");
+my @defaultsvideoconf_fp_nb_values = ("-float 8000.0", "-int 32", "0", "-int 127", "-", "-", "-");
+my @defaultsvideoconf_fp_wb_values = ("-float 16000.0", "-int 64", "9", "-int 127", "-", "-", "-");
+my @defaultsvideoconf_fp_wb_thru_ft_values = ("-float 16000.0", "-int 192", "-", "-int 127", "-", "-", "-"); #don't force payload
+
+@defaultsdomainarray = ($defaultsdomainvad, $defaultsdomaincoreaudio, $defaultsdomaingktalk, $defaultsdomainvideoconf);
+
+#-------------------
+my $usecasestr_FacePlantNB = "FacePlantNarrowBand";
+my $usecasestr_FacePlantWB = "FacePlantWideBand";
+my $usecasestr_FacePlantWBThruFaceTime = "FacePlantWideBandThruFaceTime";
+my $usecasestr_FacePlantReceiverWBThruFaceTime = "FacePlantReceiverWideBandThruFaceTime";
+my $usecasestr_N48Speaker = "N48Speaker";
+@usecasearray = ($usecasestr_FacePlantNB, $usecasestr_FacePlantWB, $usecasestr_FacePlantWBThruFaceTime, $usecasestr_FacePlantReceiverWBThruFaceTime, $usecasestr_N48Speaker);
+
+#-------------------
+my $latencypresetstr_4and12 = "4msIO12msVPUplink";
+my $latencypresetstr_6and12 = "6msIO12msVPUplink";
+my $latencypresetstr_8and16 = "8msIO16msVPUplink";
+my $latencypresetstr_12and12 = "12msIO12msVPUplink";
+my $latencypresetstr_16and16 = "16msIO16msVPUplink";
+@latencypresetarray = ($latencypresetstr_4and12, $latencypresetstr_6and12, $latencypresetstr_8and16, $latencypresetstr_12and12, $latencypresetstr_16and16);
+
+#-------------------
+
+my $headsetstr_b15   = "b15";
+my $headsetstr_b60f  = "b60f";
+my $headsetstr_b149  = "b149";
+my $headsetstr_b60g  = "b60g";
+my $headsetstr_a36   = "a36";
+my $headsetstr_b18   = "b18";
+my $headsetstr_b126  = "b126";
+@headsetarray = ($headsetstr_b15, $headsetstr_b60f, $headsetstr_b149, $headsetstr_b60g, $headsetstr_a36, $headsetstr_b18, $headsetstr_b126);
+
+my @individualdefaults = ("DisableEANC");
+
+checkcommandlineargs();
+
+my $usecasestr = $ARGV[1];
+my $latencypresetstr = $ARGV[1];
+my $headsetstr = $ARGV[1];
+
+for(my $i = 0; $i <= $#ARGV; $i++)
+{
+	my $arg = $ARGV[$i];
+	if ($arg =~ m/-u/)
+	{
+		$usecasestr = $ARGV[$i+1];
+		$i++;
+		checkusecasestring();
+		handleU();
+        kam();
+        handleR();
+	}
+    if ($arg =~ m/-lp/)
+	{
+		$latencypresetstr = $ARGV[$i+1];
+		$i++;
+		checklatencypresetstring();
+		handleLP();
+        kam();
+        handleR();
+	}
+	elsif ($arg =~ m/-r/)
+	{
+        handleR();
+	}
+    elsif ($arg =~ m/-k/)
+	{
+        kam();
+	}
+	elsif ($arg =~ m/-c/)
+	{
+		handleC();
+        kam();
+        handleR();
+	}
+    elsif ($arg =~ m/-H/)
+	{
+        $headsetstr =  $ARGV[$i+1];
+		$i++;
+		checkheadsetstring();
+        handleH($headsetstr);
+        kam();
+        handleR();
+    }
+    elsif ($arg =~ m/-fz/)
+	{
+		my $iolatency = 0;
+		my $vpepiolatency = 0;
+        
+		if ($#ARGV >= $i+1)
+		{
+			$iolatency = $ARGV[$i+1];
+            $i++;
+		}
+		if ($#ARGV >= $i+1)
+		{
+			$vpepiolatency = $ARGV[$i+1];
+			$i++;
+		}
+
+        clearlatencydefaults();
+        setlatencydefaults($iolatency, $vpepiolatency);
+        kam();
+        handleR();
+	}
+    # handle individual defaults defined in @individualdefaults
+    elsif ($arg =~ m/-ls/)
+    {
+        handleLS();
+    }
+    # force vp version
+    elsif ($arg =~ m/-vr/)
+    {
+        my $version = 1;
+		if ($#ARGV >= $i+1)
+		{
+			$version = $ARGV[$i+1];
+            $i++;
+		}
+        handleVPVersions($version);
+        kam();
+        handleR();
+    }
+    elsif ($arg =~ m/-DisableEANC/)
+    {
+        my $disableEANC = 0;
+		if ($#ARGV >= $i+1)
+		{
+			$disableEANC = $ARGV[$i+1];
+		}
+        
+        if ($disableEANC >= 1)
+        {
+            $disableEANC = 1;
+        }
+        
+        handleDisableEANC($disableEANC);
+        kam();
+        handleR();
+    } elsif ($arg =~ m/-vp/)
+	{
+		my $enabledebugfeature = 0;
+		my $consolemsgslevel = 0;
+        
+		if ($#ARGV >= $i+1)
+		{
+			$enabledebugfeature = $ARGV[$i+1];
+			$i++;
+		}
+		if ($#ARGV >= $i+1)
+		{
+			$consolemsgslevel = $ARGV[$i+1];
+			$i++;
+		}
+
+		handleVP($enabledebugfeature, $consolemsgslevel);
+        kam();
+        handleR();
+	}
+
+
+}
+
+################################################################################################
+################################################################################################
+################################################################################################
+################################################################################################
+################################################################################################
+################################################################################################
+################################################################################################
+
+################################################################################################
+## Command-line validation
+################################################################################################
+
+sub printcommandlinehelpstr()
+{
+	print "\nUsage:\n",
+		"caconfig options\n\n",
+		"General options:\n",
+		"{-u } usecase\n",
+        "\tIMPORTANT:PLEASE DO caconfig -c PRIOR TO ANY USECASE CHANGES\n",
+		"\tconfigure the device for a particular use case\n",
+		"\tpossible values are:\n",
+        "\t   N48Speaker\n",
+        "\t     [Please run this cmd before using vpiotest on N48 in speaker route!!]\n",
+		"\t   FacePlantNarrowBand\n",
+		"\t   FacePlantWideBand\n",
+        "\t   FacePlantWideBandThruFaceTime\n",    
+        "\t   FacePlantReceiverWideBandThruFaceTime\n",
+        "\t   Note: On N48, FacePlantNarrowBand, FacePlantWideBand, and FacePlantWideBandThruFaceTime only work correctly for speaker route. You may get the wrong hardware mics for other routes.\n",
+        "{-lp } latency presets\n",
+        "\tconfigure the processing latency\n",
+        "\tpossible configuration (presets) are:\n",
+        "\t   4msIO12msVPUplink\n",
+        "\t   6msIO12msVPUplink\n",
+        "\t   8msIO16msVPUplink\n",
+        "\t   12msIO12msVPUplink\n",
+        "\t   16msIO16msVPUplink\n",
+		"{ -vp } <vp_enable_debug_features - 1> <vp_console_msgs-level>\n",
+        "\tenable vp debug feature and set the VP's console msgs level\n",
+        "{ -fz } <system IO and vp downlink frame size in ms> <vp uplink frame size in ms>\n",
+        "\tforce faceplant and vp processing latency \n",
+		"{ -r }\n",
+		"\tread current values of the VAD, CoreAudio, GameKit and VideoConference system defaults used by the VP\n",
+        "{ -k }  kill mediaserverd\n",
+		"{ -c }\n",
+		"\tclear/delete the VAD, CoreAudio, GameKit and VideoConference system defaults used by the VP\n",
+		"{ -h }\n",
+		"{ -H } headeset\n",
+        "\t Configure headset to use with device. \n",
+        "\t possible values are: \n",
+        "\t   b15\n",
+        "\t   b60f\n",
+        "\t   b149\n",
+        "\t   b60g\n",
+        "\t   a36\n",
+        "\t   b18\n",
+        "\t   b126\n",
+        "{ -ls } List the individual defaults supported by caconfig, then copy the defaults you would like to set as the input argument of caconfig, followed by the value \n",
+        "{ -vr }  force vp version \n",
+        "\tpossible values are:\n",
+        "\t   1\n",
+        "\t   2\n",
+        "\t   clear (use system default vp version)\n",
+		"\nEXAMPLES: \n",
+        "caconfig -r (to read current VAD, CoreAudio, GameKit and VideoConference system defaults)\n",
+        "caconfig -c (to clear the VAD, CoreAudio, GameKit and VideoConference system defaults used by the VP) \n",
+		"caconfig -u FacePlantNarrowBand (to configure the system with defaults appropriate for narrow band telephony)\n",
+        "caconfig -vr 1 (to force vp version to v1) \n",
+        "caconfig -fz 4 12 (to set faceplanter and drc frame size to 4ms, and vp uplink frame size to 12ms) \n",
+		"\n\n";
+}
+
+sub checkcommandlineargs()
+{
+	my $numargs = $#ARGV;
+	if (($numargs == -1) || ($numargs >= 0 && $ARGV[0] =~ m/-h/)) 
+	{ 
+		printcommandlinehelpstr();
+		die "\n";
+	}
+}
+
+sub checkheadsetstring()
+{
+	my $foundMatch = 0;
+	foreach my $str(@headsetarray)
+	{
+        
+		if ($headsetstr =~ m/^$str$/)
+		{
+			$foundMatch = 1;
+		}
+	}
+	if ($foundMatch eq 0)
+	{
+		printcommandlinehelpstr();
+		die "\n";
+	}
+}
+
+sub checkusecasestring()
+{
+	my $foundMatch = 0;
+	my $isFP = 0;
+	
+	foreach my $str(@usecasearray)
+	{
+		if ($usecasestr =~ m/^$str$/)
+		{
+			$foundMatch = 1;
+			if ($usecasestr =~ m/^$usecasestr_FacePlantNB$/ || $usecasestr =~ m/^$usecasestr_FacePlantWB$/ || $usecasestr =~ m/^$usecasestr_FacePlantWBThruFaceTime$/ || $usecasestr =~ m/^$usecasestr_FacePlantReceiverWBThruFaceTime$/)
+			{
+				$isFP = 1;
+			}
+		}
+	}
+	if ($foundMatch eq 0)
+	{
+		printcommandlinehelpstr();
+		die "\n";
+	}
+	
+	if ($isFP eq 1 )
+	{
+		# die if not N94/N41/N51/N48/N56/N61/N66/N71
+		if ($model !~ m/^N94/ && $model !~ m/^N41/ && $model !~ m/^N42/ && $model !~ m/^N51/ && $model !~ m/^N53/ && $model !~ m/^N48/ && $model !~ m/^N49/ && $model !~ m/^N56/ && $model !~ m/^N61/ && $model !~ m/^N71/ && $model !~ m/^N66/)
+		{
+			#print "ERROR: FacePlant is not supported on this hardware (".$model."). Configuration change aborted.\n";
+			die "ERROR: FacePlant is not supported on this hardware (".$model."). Configuration change aborted.\n";
+		}
+	}
+}
+
+sub checklatencypresetstring()
+{
+	my $foundMatch = 0;
+	foreach my $str(@latencypresetarray)
+	{
+        
+		if ($latencypresetstr =~ m/^$str$/)
+		{
+			$foundMatch = 1;
+		}
+	}
+	if ($foundMatch eq 0)
+	{
+		printcommandlinehelpstr();
+		die "\n";
+	}
+}
+
+################################################################################################
+# Modes
+################################################################################################
+
+sub handleU()
+{
+	print "\n###################################################################\n";
+	print "##### Your device will be configured for "."$ARGV[1]"."\n";
+	print "###################################################################\n\n";
+	
+	print "\n===================================================================\n";
+	print "Current system defaults:\n";
+	readcurrentsystemdefaults();
+	
+	print "\n===================================================================\n";
+	print "Deleting current system latency defaults:\n";
+	clearlatencydefaults();
+	
+	print "\n===================================================================\n";
+	print "Setting new system defaults:\n";
+	setsystemdefaults();
+}
+
+sub handleLP()
+{
+	print "Seting Lantency Preset:\n";
+    
+    my $lantencyIO_ms = 0;
+    my $lantencyVPUPlink_ms = 0;
+    
+    if ($latencypresetstr =~ m/^$latencypresetstr_4and12$/)
+    {
+        $lantencyIO_ms = 4;
+        $lantencyVPUPlink_ms = 12;
+    }
+    elsif ($latencypresetstr =~ m/^$latencypresetstr_6and12$/)
+    {
+        $lantencyIO_ms = 6;
+        $lantencyVPUPlink_ms = 12;
+    }
+    elsif ($latencypresetstr =~ m/^$latencypresetstr_8and16$/)
+    {
+        $lantencyIO_ms = 8;
+        $lantencyVPUPlink_ms = 16;
+    }
+    elsif ($latencypresetstr =~ m/^$latencypresetstr_12and12$/)
+    {
+        $lantencyIO_ms = 12;
+        $lantencyVPUPlink_ms = 12;
+    }
+    elsif ($latencypresetstr =~ m/^$latencypresetstr_16and16$/)
+    {
+        $lantencyIO_ms = 16;
+        $lantencyVPUPlink_ms = 16;
+    }
+
+	setlatencydefaults($lantencyIO_ms, $lantencyVPUPlink_ms);
+}
+
+sub handleR()
+{
+	print "Current system defaults:\n";
+	readcurrentsystemdefaults();
+}
+
+sub handleLS()
+{
+	print "List individual defaults can be set through caconfig:\n";
+	listalldefaults();
+}
+
+sub handleH($)
+{
+    my $cmdStr = "defaults write ".$defaultsdomainvad." HeadsetOverride ".$_[0]."\n";
+    print $cmdStr;
+	my $result = `$cmdStr`;
+}
+
+sub handleC()
+{
+	print "Clearing system defaults\n";
+	deletecurrentsystemdefaults();
+}
+
+sub handleVP($$)
+{
+	print "Setting VP defaults\n";
+	setvpdefaults($_[0], $_[1]);
+}
+
+sub handleVPVersions($)
+{
+    my $stringC = 'clear';
+    if($_[0] eq $stringC)
+    {
+        my $cmdStr = "defaults delete ".$defaultsdomaincoreaudio." vp_force_version \n";
+        my $result = `$cmdStr`;
+    } else
+    {
+        my $cmdStr = "defaults write ".$defaultsdomaincoreaudio." vp_force_version ".$_[0]."\n";
+        my $result = `$cmdStr`;        
+    }
+}
+
+sub handleDisableEANC($)
+{
+    if ($_[0] eq 0){
+        print "enalbing EANC\n";
+    } else {
+        print "disabling EANC\n"
+    }
+    
+    my $cmdStr = "defaults write ".$defaultsdomainvad." DisableEANC ".$_[0]."\n";
+	my $result = `$cmdStr`;
+    
+}
+
+################################################################################################
+# Defaults read and write
+################################################################################################
+
+sub readcurrentsystemdefaults()
+{
+	my $cmdStr;
+
+	foreach my $domain(@defaultsdomainarray)
+	{
+		my $cmdStr = "defaults read ".$domain."\n"; 
+		print $cmdStr;
+		my $result =`$cmdStr`;
+		print "$result\n";
+	}
+}
+sub listalldefaults()
+{
+    foreach my $item(@individualdefaults)
+    {
+        print $item;
+        print "\n";
+    }
+    
+}
+sub deletecurrentsystemdefaults()
+{
+	my $default;
+	my $cmdStr;
+	my $result;
+
+    $cmdStr = "defaults delete ". $defaultsdomainvad. "\n";
+    $result = `$cmdStr`;
+    $cmdStr = "defaults delete ". $defaultsdomaincoreaudio. "\n";
+    $result = `$cmdStr`;
+    $cmdStr = "defaults delete ". $defaultsdomaingktalk. "\n";
+    $result = `$cmdStr`;
+    $cmdStr = "defaults delete ". $defaultsdomainvideoconf. "\n";
+    $result = `$cmdStr`;
+}
+
+sub setsystemdefaults()
+{
+	my $cmdStr;
+	my $result;
+	my $set_mic_trim_gains = 1;
+	my $set_fp_nb = 0;
+	my $set_fp_wb = 0;
+	my $set_fp_wb_thru_ft = 0;
+    my $set_force_receiver = 0;
+    my $set_n48_speaker = 0;
+	
+	if ($usecasestr =~ m/^$usecasestr_FacePlantNB$/)
+	{
+		$set_fp_nb = 1;
+	}
+	elsif ($usecasestr =~ m/^$usecasestr_FacePlantWB$/)
+	{
+		$set_fp_wb = 1;
+	}
+    elsif ($usecasestr =~ m/^$usecasestr_FacePlantWBThruFaceTime$/)
+	{
+		$set_fp_wb_thru_ft = 1;
+	}
+    elsif ($usecasestr =~ m/^$usecasestr_FacePlantReceiverWBThruFaceTime$/)
+	{
+		$set_fp_wb_thru_ft = 1;
+        $set_force_receiver = 1;
+	}
+ 	elsif ($usecasestr =~ m/^$usecasestr_N48Speaker$/)
+	{
+		$set_n48_speaker = 1;
+	}
+    
+	if ($set_mic_trim_gains eq 1)
+	{
+		# For all use cases, on N41/N48/N51/N61/N56/N66/N71, account for the mic trim gains via VP defaults write
+		if ($model =~ m/^N41/ || $model =~ m/^N42/ || $model =~ m/^N51/ || $model =~ m/^N53/ || $model =~ m/^N48/ || $model =~ m/^N49/
+            || $model =~ m/^N56/ || $model =~ m/^N61/ || $model =~ m/^N71/ || $model =~ m/^N66/)
+		{
+			my($trimsCmdStr) = &getmictrimscmd();
+			#print $trimsCmdStr;
+			$result = `$trimsCmdStr`;
+		}
+	}
+			
+	if ($set_fp_nb eq 1 || $set_fp_wb eq 1 || $set_fp_wb_thru_ft eq 1)
+	{
+	    for my $index (0 .. $#defaultsvad)
+		{
+			if ($model =~ m/^N94/)
+			{
+				if ($defaultsvad_fp_n94_values[$index] !~ m/^-$/)
+				{
+					$cmdStr	= "defaults write ". $defaultsdomainvad. " " . $defaultsvad[$index]. " " . $defaultsvad_fp_n94_values[$index]. "\n";
+					$result = `$cmdStr`;
+				}
+			}
+			else
+			{
+				if ($defaultsvad_fp_values[$index] !~ m/^-$/)
+				{
+					$cmdStr	= "defaults write ". $defaultsdomainvad. " " . $defaultsvad[$index]. " " . $defaultsvad_fp_values[$index]. "\n";
+					$result = `$cmdStr`;
+				}
+			}
+		}
+        
+        #due to codec constraint, on N48/N49, vp can only get 2 mic channels. the default below will select the correct mics (back, front) for speaker route only: <rdar://problem/13891477>
+        if ($model =~ m/^N48/ || $model =~ m/^N49/)
+        {
+            $cmdStr	= "defaults write com.apple.audio.virtualaudio BuiltInMicSelection 6\n";
+            $result = `$cmdStr`;
+        }
+	}
+	
+    if($set_force_receiver eq 1)
+    {
+        $cmdStr	= "defaults write com.apple.audio.virtualaudio UseReceiverInVideoChat 1\n";
+        $result = `$cmdStr`;
+        #due to codec constraint, on N48/N49, vp can only get 2 mic channels. the default below will select the correct mics (bottoms, back) for receiver route only: <rdar://problem/13891477>
+        if ($model =~ m/^N48/ || $model =~ m/^N49/)
+        {
+            $cmdStr	= "defaults write com.apple.audio.virtualaudio BuiltInMicSelection 3\n";
+            $result = `$cmdStr`;
+        }
+    }
+    
+	if ($set_fp_nb eq 1)
+	{
+	    for my $index (0 .. $#defaultscoreaudio)
+		{
+			if ($defaultscoreaudio_fp_nb_values[$index] !~ m/^-$/)
+			{
+				$cmdStr	= "defaults write ". $defaultsdomaincoreaudio. " " . $defaultscoreaudio[$index]. " " . $defaultscoreaudio_fp_nb_values[$index]."\n";
+				$result = `$cmdStr`;
+			}
+		}
+
+		for my $index (0 .. $#defaultsgktalk)
+		{
+			if ($defaultsgktalk_fp_nb_values[$index] !~ m/^-$/)
+			{
+				$cmdStr	= "defaults write ". $defaultsdomaingktalk. " " . $defaultsgktalk[$index]. " " . $defaultsgktalk_fp_nb_values[$index]."\n";
+				$result = `$cmdStr`;
+			}
+		}
+	
+		for my $index (0 .. $#defaultsvideoconf)
+		{
+			if ($defaultsvideoconf_fp_nb_values[$index] !~ m/^-$/)
+			{
+				$cmdStr	= "defaults write ". $defaultsdomainvideoconf. " " . $defaultsvideoconf[$index]. " " . $defaultsvideoconf_fp_nb_values[$index]."\n";
+				$result = `$cmdStr`;
+			}
+		}
+	}
+	
+	if ($set_fp_wb eq 1 || $set_fp_wb_thru_ft eq 1)
+	{
+	    for my $index (0 .. $#defaultscoreaudio)
+		{
+			if ($defaultscoreaudio_fp_wb_values[$index] !~ m/^-$/)
+			{
+				$cmdStr	= "defaults write ". $defaultsdomaincoreaudio. " " . $defaultscoreaudio[$index]. " " . $defaultscoreaudio_fp_wb_values[$index]."\n";
+				$result = `$cmdStr`;
+			}
+		}
+
+		for my $index (0 .. $#defaultsgktalk)
+		{
+			if ($defaultsgktalk_fp_wb_values[$index] !~ m/^-$/)
+			{
+				$cmdStr	= "defaults write ". $defaultsdomaingktalk. " " . $defaultsgktalk[$index]. " " . $defaultsgktalk_fp_wb_values[$index]."\n";
+				$result = `$cmdStr`;
+			}
+		}
+
+		for my $index (0 .. $#defaultsvideoconf)
+		{
+            if ($set_fp_wb eq 1)
+            {
+                if ($defaultsvideoconf_fp_wb_values[$index] !~ m/^-$/)
+                {
+                    $cmdStr	= "defaults write ". $defaultsdomainvideoconf. " " . $defaultsvideoconf[$index]. " " . $defaultsvideoconf_fp_wb_values[$index]."\n";
+                    $result = `$cmdStr`;
+                }
+            }elsif ($set_fp_wb_thru_ft eq 1)
+            {
+                if ($defaultsvideoconf_fp_wb_thru_ft_values[$index] !~ m/^-$/)
+                {
+                    $cmdStr	= "defaults write ". $defaultsdomainvideoconf. " " . $defaultsvideoconf[$index]. " " . $defaultsvideoconf_fp_wb_thru_ft_values[$index]."\n";
+                    $result = `$cmdStr`;
+                }
+            }
+		}
+	}
+    
+    # for FacePlantWBThruFaceTime, an additional defaults for AUVoiceIO to set client block size to 480 is needed
+    if($set_fp_wb_thru_ft eq 1)
+    {
+        $cmdStr = "defaults write ".$defaultsdomaincoreaudio." rmio_fakefaceplant 1\n";
+        $result = `$cmdStr`;
+    }
+	 
+    #due to codec constraint, on N48/N49, vp can only get 2 mic channels. the default below will select the correct mics (back, front) for speaker route only: <rdar://problem/13891477>
+    if ($set_n48_speaker eq 1 && ($model =~ m/^N48/ || $model =~ m/^N49/))
+    {
+        $cmdStr	= "defaults write com.apple.audio.virtualaudio BuiltInMicSelection 6\n";
+        $result = `$cmdStr`;
+    }
+}
+
+sub setvpdefaults($$)
+{
+  	my $cmdStr = "defaults write ".$defaultsdomaincoreaudio." vp_enable_debug_features ".$_[0]."\n";
+	my $result = `$cmdStr`;
+  
+    $cmdStr = "defaults write ".$defaultsdomaincoreaudio." vp_console_msgs ".$_[1]."\n";
+	$result = `$cmdStr`;
+}
+
+sub setlatencydefaults($$)
+{
+    my $cmdStr = "defaults write ".$defaultsdomaincoreaudio." vp_enable_debug_features YES \n";
+	my $result = `$cmdStr`;
+    
+    $cmdStr = "defaults write ".$defaultsdomaincoreaudio." faceplanter_framesize_ms ".$_[0]."\n";
+	$result = `$cmdStr`;
+    
+	$cmdStr = "defaults write ".$defaultsdomaincoreaudio." vp_mbdp_blocksize_ms_override ".$_[0]."\n";
+	$result = `$cmdStr`;
+    
+    $cmdStr = "defaults write ".$defaultsdomaincoreaudio." vp_epio_blksz_ms ".$_[1]."\n";
+	$result = `$cmdStr`;
+
+}
+
+sub setframesizedefaults($$)
+{
+    my $cmdStr = "defaults write ".$defaultsdomaincoreaudio." vp_enable_debug_features YES \n";
+	my $result = `$cmdStr`;
+
+    $cmdStr = "defaults write ".$defaultsdomaincoreaudio." faceplanter_framesize ".$_[0]."\n";
+    $result = `$cmdStr`;
+        
+	$cmdStr = "defaults write ".$defaultsdomaincoreaudio." vp_mbdp_blocksize_override ".$_[0]."\n";
+	$result = `$cmdStr`;
+
+    $cmdStr = "defaults write ".$defaultsdomaincoreaudio." vp_epio_blksz ".$_[1]."\n";
+	$result = `$cmdStr`;
+}
+
+sub kam()
+{
+	my $cmdStr = "killall mediaserverd\n";
+	print $cmdStr;
+	my $result = `$cmdStr`;
+	print $result;
+}
+
+sub getmictrimscmd()
+{
+	# Typical memdump string looks like this:
+	# $s = " ATSc: [HEX] 07 00 00 00 FA FF 00 00 FC FF 00 00 00 00 00 00 00 00 00 00";
+
+	my $s = `memdump -r -a syscfg -k ATSc`;
+	# print $s . "\n";
+	
+	my @parts = split /\s+/, $s;
+    my $m1val = 0;
+    my $m2val = 0;
+    my $m3val = 0;
+
+    if($parts[3])
+    {
+        $m1val = (hex $parts[4] . $parts[3]);
+        $m1val = uint2int($m1val,16) * 0.1;
+        
+        $m2val = (hex $parts[8] . $parts[7]);
+        $m2val = uint2int($m2val,16) * 0.1;
+        
+        $m3val = (hex $parts[12] . $parts[11]);
+        $m3val = uint2int($m3val,16) * 0.1;
+
+    }
+    else
+    {
+        $m1val = 0;
+        $m2val = 0;
+        $m3val = 0;
+        print "Warning:This device's mic trim has not been programmed! Please Program your device! All the mic trim gains are set to 0\n";
+    }
+
+	my @args = ("defaults write com.apple.coreaudio vp_mic_trim_gains -array -float ",
+		$m1val, " -float ", $m2val, " -float ", $m3val);
+	my $cmdStr = join("", @args);
+	my $result = `$cmdStr`;
+	return $result;
+}
+
+sub uint2int($$)
+{
+	my $uintval = $_[0];
+	my $nbits = $_[1];
+	my $val;
+	$val =  ($uintval < 1<<($nbits-1)) ? $uintval : ($uintval - (1<<$nbits));
+	return $val
+}
+
+sub clearlatencydefaults()
+{
+    
+    my $cmdStr = "defaults delete ".$defaultsdomaincoreaudio." faceplanter_framesize\n";
+	my $result = `$cmdStr`;
+
+    $cmdStr = "defaults delete ".$defaultsdomaincoreaudio." vp_mbdp_blocksize_override\n";
+    $result = `$cmdStr`;
+
+    $cmdStr = "defaults delete ".$defaultsdomaincoreaudio." vp_epio_blksz\n";
+	$result = `$cmdStr`;
+    $cmdStr = "defaults delete ".$defaultsdomaincoreaudio." faceplanter_framesize_ms\n";
+	$result = `$cmdStr`;
+    
+	$cmdStr = "defaults delete ".$defaultsdomaincoreaudio." vp_mbdp_blocksize_ms_override\n";
+	$result = `$cmdStr`;
+    
+    $cmdStr = "defaults delete ".$defaultsdomaincoreaudio." vp_epio_blksz_ms\n";
+	$result = `$cmdStr`;
+
+}
+################################################################################################
+################################################################################################
+

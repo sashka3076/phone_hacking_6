@@ -1,0 +1,748 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use 5.8.8;
+
+use constant PERL5LIB => ('/tools/local/Packages', '/AppleInternal/Library/PerlModules', '/AppleInternal/Library/PerlModules/3rdParty');
+use constant DEFAULTPATH => '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/Developer/usr/bin:/tools/local/bin';
+
+BEGIN {
+  if (not exists $ENV{GNUPLOT_BINARY} or not defined $ENV{GNUPLOT_BINARY}) {
+    $ENV{GNUPLOT_BINARY}  = "/usr/local/bin/gnuplot";
+  } 
+
+  if (not exists $ENV{GNUPLOT_PS_DIR} or not defined $ENV{GNUPLOT_PS_DIR}) {
+    $ENV{GNUPLOT_PS_DIR}  = "/usr/local/share/gnuplot/4.6/PostScript";
+  } 
+  if (not exists $ENV{GDFONTPATH} or not defined $ENV{GDFONTPATH}) {
+    $ENV{GDFONTPATH}  = "/System/Library/Fonts/Core";
+  } 
+  if (not exists $ENV{GNUPLOT_DEFAULT_GDFONT} or not defined $ENV{GNUPLOT_DEFAULT_GDFONT}) {
+    $ENV{GNUPLOT_DEFAULT_GDFONT}  = "/System/Library/Fonts/Core/Arial.ttf";
+  } 
+
+ use lib "/AppleInternal/Library/PerlModules/3rdParty/";     # To avoid conflict messages about Fatal.pm (there's also an older Fatal.pm shipped with base Perl 5.8.8)
+
+  if (exists $ENV{PERL5LIB} && defined $ENV{PERL5LIB}) {
+    for my $thing (&PERL5LIB) {
+      my @matches = grep { $thing eq $_ } split(/:/, $ENV{PERL5LIB});
+      unless (scalar(@matches) > 0) {
+	      $ENV{PERL5LIB} .= ':' . $thing;
+	      push(@INC, $thing);
+      }
+    }
+  } 
+  else {
+    $ENV{PERL5LIB} = join(':', &PERL5LIB);
+    push(@INC, &PERL5LIB);
+  }
+
+  my @pathIn = exists $ENV{PATH} && defined $ENV{PATH} ? split(/:/, $ENV{PATH}) : ();
+  for my $dpath (split(':', &DEFAULTPATH)) {
+    my @matches = grep { $dpath eq $_ } @pathIn;
+    unless (scalar(@matches) > 0) {
+      push(@pathIn, $dpath);
+    }
+  }
+  $ENV{PATH} = join(':', @pathIn);
+
+  require 'PDL.pm';
+  require 'PDL/Core.pm';
+  require 'PDL/LiteF.pm';
+  require 'PDL/NiceSlice.pm';
+  require 'PDL/Graphics/Gnuplot.pm';
+  require 'PDL/Ufunc.pm';
+  require 'PDL/Stats/Basic.pm';
+  require 'Moose.pm';
+  require 'POE.pm';
+}
+
+use POSIX;
+use Execer;
+use ClArgs;
+use ClArgsCb qw(Scalar Aref Bool);
+
+use Utils qw(lockdownGet);
+use sigtrap qw(die INT QUIT TTOU);
+use Time::HiRes qw(usleep gettimeofday tv_interval);
+use Time::Local;
+use constant HALF => 0.50000000000008;
+use constant NUM_FRAMES_TO_CAPTURE => 5;
+#For Mac Terminal Recommend Using Below Options, PNG Not Supported
+use constant DEFAULT_MAC_PLOT_FMT => 'svg';
+use constant DEFAULT_MAC_TERM_FONT => "";
+use constant DEFAULT_MAC_PLOT_SIZE => '1024,768 fixed';
+#For iOS Use PNG Terminal
+use constant DEFAULT_iOS_PLOT_FMT => "png";
+use constant DEFAULT_iOS_TERM_FONT => "font \"/System/Library/Fonts/Core/Arial.ttf,12\"";
+use constant DEFAULT_iOS_PLOT_SIZE => '1024,768';
+use constant DEFAULT_ORB_RMS_MAG_PLOT_PREFIX => 'mttParser_rms_gnuplot';
+use constant DEFAULT_ORB_MIN_MAG_PLOT_PREFIX => 'mttParser_min_gnuplot';
+use constant DEFAULT_ORB_MAX_MAG_PLOT_PREFIX => 'mttParser_max_gnuplot';
+use constant MAMBA_VOLTAGE => 2.775;
+use constant INTEGRATION_CAP_SIZE => 40;
+use constant SAMPLE_AND_HOLD_GAIN => 4;
+use constant NUM_CYCLES => 2;
+use constant EXCITATION_VOLTAGE => 5;
+
+use constant DEFAULT_GRAPH_OUT_SUFFIX => "graph";
+use Statistics;
+
+use constant AXIS_OFFSET              => 20;
+use constant MAX_ORB_OFFSET_VALUE     => 5;
+use constant ORB_WINDOW_SIZE          => 60;
+use constant ORB_MAG_COLOR_PALETTE    => "rgbformulae 33,13,10";
+use constant SERIAL_NUMBER            => 'SN';    # build matrix keyword/column heading
+use constant ORB_DATA_FILE_X_Y_COLS   => '1:3';
+use constant ORB_RMS_MAGNITUDE_COLUMN => ':4';
+use constant ORB_RMS_MAG_LABEL_COLUMN => ':yticlabels(2)';
+
+# Global declarations and command-line parsing.
+# Real code lies below subroutine definitions.
+# ---------------------------------------------
+my ($pPath, $program) = $0 =~ m<^(.*/|)(.*),?(.*)$>;
+my $msgp = __PACKAGE__ . "::$program:";
+my $gGnuplotInstalled = (-e "/usr/local/bin/gnuplot");
+my $gGestaltQueryExists = (-e "/usr/local/bin/gestalt_query");
+
+my $gSerialNumber = &lockdownGet('SerialNumber') if $gGestaltQueryExists;
+my $gHWModel = &lockdownGet('HardwareModel') if $gGestaltQueryExists;
+
+my $clArgs = ClArgs->new(Verbose => 0);
+my ($debug, $verbose) = (0, 0);
+
+#***************************************************************************
+#
+#   Subroutine : printUsage
+#       Author : Brian Mariner
+#         Date : 04 Dec 2014
+#
+#  Description : Print the help for the script.
+#
+#***************************************************************************
+
+sub printUsage {
+  my ($exitCode) = @_;
+  my $defaultFrames = &NUM_FRAMES_TO_CAPTURE;
+  
+  print <<ENDSHERE;
+
+$program [-r <rows> -c <cols>] [-sr <# rows to skip> ] [-f <# frames to capture> ]
+
+    -h | -help
+        Print usage information.
+
+    -r | -rows
+        How many rows to capture within a frame.
+
+    -c | -cols
+        How mnay columns to capture within a frame.
+
+    -sr | -skiprows <integer>
+        Skip the initial specified number of rows of each frame.
+
+    -f | -frames <integer> [Default is $defaultFrames]
+        The number of frames to capture from MultiTouchTester in prettyimages mode.
+        
+    -data <filename>
+        Pass in a text file with MTT output.
+        
+    -simulate 
+        Use a canned file for MTT output from orb_sim.txt
+        
+    -dumpframes
+        Output all the frames that were properly parsed in.
+      
+$program parses data from MultiTouchTester
+
+ENDSHERE
+  exit($exitCode);
+}
+
+#***************************************************************************
+#
+#   Subroutine : registerOpts
+#       Author : Neil O'Sullivan
+#         Date : 06 Dec 2012
+#
+#  Description : register command-line options with callbacks
+#
+#***************************************************************************
+
+sub registerOpts {
+  my $clargs = shift;
+
+  for(['usage',     undef,      [qw(-h -help)],         sub { printUsage(0); }  ],
+      ['debug',         0,      ['-debug'],             sub { $debug = 1; }     ],
+      ['verbose',       0,      ['-verbose'],           sub { $verbose = 1; }   ],
+      ['keepp',         0,      [qw(-keepp)],          \&Bool                   ],
+      ['simulate',      0,      [qw(-sim -simulate)],  \&Bool                   ],
+      ['plot',          0,      [qw(-plot -p)],        \&Bool                   ],
+      ['processData',   0,      [qw(-process)],        \&Bool                   ],
+      ['dumpOrbFrames', 0,      [qw(-dumpframes -d)],  \&Bool                   ],
+      ['mttOutFile',undef,      [qw(-mttDataFile -data)],  \&Scalar             ],
+      ['frames',    undef,      [qw(-frames -f)],     \&Scalar                  ],
+      ['rows',    undef,        [qw(-rows -r)],       \&Scalar                  ],
+      ['cols',    undef,        [qw(-cols -c)],       \&Scalar                  ],
+      ['dir',     "./",         [qw(-out -o -outdir)],\&Scalar                  ],
+      ['tag',     undef,           [qw(-tag -t)],        \&Scalar                  ],
+      ['skipRows',  0,          [qw(-skiprows -sr)],  \&Scalar                  ],
+     ) {
+    $clargs->add(@{$_});
+  }
+  1;
+}
+
+sub genPlotHeader {
+  my ($rows, $cols) = @_;
+  my $colorPaletteSetting = "";
+  my $colorBoxString = ""; 
+  my $xLabel = '"Column Value" font ",10.0"';
+  my $yLabel = '"Row Value" font ",10.0"';
+  my $y2Label = "\n" . 'set y2label "Right Side of Unit" font ",7.0"';
+  my $cbLabel = "\nset cblabel " . '"Orb Magnitude RMS Value" font ",9.0"';
+
+  #
+  # Use default option for Deltas
+  #
+  my $cbRangeMax =  &MAX_ORB_OFFSET_VALUE;
+  $colorPaletteSetting = "\nset palette " . &ORB_MAG_COLOR_PALETTE;
+  $colorBoxString = "\nset cbrange [ 0 : $cbRangeMax ]${cbLabel}"; 
+
+  # Note that y coordinates are the negative of what the fixture's coordinates are.
+  # Hence the reason we have min and max flipped (-) here -- they're negative for gnuplot
+  # and positive for the fixture.
+  
+  my $yRangeMin = 0;
+  my $yRangeMax = $rows+1;
+  my $xRangeMin =  0;
+  my $xRangeMax =  $cols+1;
+  my $yRangeString =  "";
+  my $setGridString = "";
+  my $setXrangeString = "\nset xrange  [ $xRangeMin : $xRangeMax ]";
+  my $termType = &DEFAULT_MAC_PLOT_FMT;
+  my $termFont = &DEFAULT_MAC_TERM_FONT;
+  my $termSize = &DEFAULT_MAC_PLOT_SIZE;
+  if($gGestaltQueryExists) {
+    # Means chances are we're on an iOS Device -- if it doesn't SVG still works anyway
+    $termType = &DEFAULT_iOS_PLOT_FMT;
+    $termFont = &DEFAULT_iOS_TERM_FONT;
+    $termSize = &DEFAULT_iOS_PLOT_SIZE;
+  }
+  my $template = <<"TEMPLATE";
+unset multiplot                        # disable any previous multiplot settings
+unset log                              # remove any log-scaling    
+unset label                            # remove any previous labels
+unset key
+set tmargin 5.0
+set lmargin 5.0
+set rmargin 5.0
+set bmargin 2.0
+set term $termType $termFont size $termSize
+set termoption enhanced
+set xlabel $xLabel
+set ylabel $yLabel
+set xtics border in scale 0,0 nomirror offset character 0, 0, 0
+set xtics norangelimit font ",10.0"
+set ytics border nomirror font ",10.0"
+set xrange  [ $xRangeMin : $xRangeMax ]
+set yrange  [ $yRangeMin : $yRangeMax ]
+set y2label "Right Side of Unit" font ",10.0"
+set pointsize 1.50
+TEMPLATE
+
+  return $template . $setXrangeString . $setGridString . $y2Label . $yRangeString . $colorPaletteSetting . $colorBoxString;
+
+}
+
+sub genPlotFile {
+  my ($header, $minMaxRMSLabel, $dataFileName, $aggressorName, $numFrames) = @_;
+
+  my $plotFileText = $header;
+  my $plotColumns = ORB_DATA_FILE_X_Y_COLS;
+  my $vectorCol = ORB_RMS_MAGNITUDE_COLUMN;
+  my $xTicYticLabels = ORB_RMS_MAG_LABEL_COLUMN;
+
+  my $setTitle = "";
+  $setTitle = "$gHWModel $gSerialNumber" if $gGestaltQueryExists;
+  $setTitle = "\nset title \" Orb Magnitude $minMaxRMSLabel Value over $numFrames Frames";
+  $setTitle .= " with $aggressorName Aggressor" if defined($aggressorName);
+  $setTitle .= "\"";
+  $plotFileText .= $setTitle . " font \",14.0\"";
+  $plotFileText .= "\nplot ";
+
+  my $index = 0;
+  my $splitoptstr = "";
+  my $linecolor = " palette";
+  my $graphStylePointOrLines = "with points${linecolor} pointtype 7";
+  $plotFileText .= "\"${dataFileName}\" using ${plotColumns}${vectorCol}${xTicYticLabels} $graphStylePointOrLines";
+  $plotFileText .= ", \\\n     \"${dataFileName}\" using ${plotColumns}${vectorCol} notitle with labels offset 0., -1.0 font \",12.0\"";
+  $plotFileText .= "\n";
+
+  return $plotFileText;
+}
+
+sub runGnuPlot {
+  my ($fname, $tagname, $plotFormat, $out_dir, $out_prefix, $out_suffix) = @_;
+
+  return unless $gGnuplotInstalled;
+  my $graphName = "${out_dir}${out_prefix}_${tagname}_${out_suffix}";
+  my $cmd = "gnuplot ${fname} > ${graphName}.${plotFormat}";
+  &execer($cmd, sub { return 0; });
+  printf "Graph output to: ${graphName}.${plotFormat}\n";
+}
+
+sub graphUnit {
+  my ($datFileName, $plotFileName, $minMaxRMSLabel, $outformat, $frames, $rows, $cols, $graphFilePrefix, $graphFileSuffix, $identifier) = @_;
+
+  open(my $fh, ">$plotFileName") or do {
+	printf STDERR "$msgp ERROR failed to open file '%s' for write:  $!\n", $plotFileName;
+	exit(1);
+  };
+  print $fh &genPlotFile(&genPlotHeader($rows, $cols),
+                         $minMaxRMSLabel,
+						 $datFileName,
+						 $identifier,
+						 $frames
+  );
+  close($fh);
+
+  my $outDir = $clArgs->get('dir');
+  $outDir .= '/' unless ($outDir =~ qr<^.*\/$>);
+  my $identifierString = "[${frames}-frames]";
+  $identifierString = "${identifier}_" . $identifierString if defined($identifier);
+  &runGnuPlot($plotFileName, $identifierString, $outformat, $outDir, $graphFilePrefix, $graphFileSuffix);
+  
+  unless($clArgs->get('keepp')) {
+    my $cmd = "rm $datFileName $plotFileName";
+    &execer($cmd, sub { return 0; });  
+  }
+}
+
+sub getStdDevValuesOfFrames {
+  my ($frameSet) = (@_);
+  
+  my $framesAsPDL = PDL->topdl($frameSet);
+  my $stddev2d = &PDL::Stats::Basic::stdv($framesAsPDL->xchg(0,2));
+  return $stddev2d->xchg(0,1);
+}
+
+
+
+sub getMinMaxValuesOfFrames {
+  my ($frameSet) = (@_);
+  
+  my $framesAsPDL = PDL->topdl($frameSet);
+  my $min2d = &PDL::Ufunc::minimum($framesAsPDL->xchg(0,2));
+  my $max2d = &PDL::Ufunc::maximum($framesAsPDL->xchg(0,2));
+
+  return ($min2d->xchg(0,1), $max2d->xchg(0,1))
+}
+
+sub getRMSValueOfFrames {
+  my ($frameList, $numFrames) = (@_);
+
+  printf "Dumping frames: $frameList->[0]\n\n" if $debug;
+  my $framePDL = $frameList->[0] ** 2;
+
+  # Sum of Frames, start with 0th element and then add indices 1 through n - 1
+  for (my $i = 1; $i < scalar(@{$frameList}); $i++) {
+    printf "$frameList->[$i]\n\n" if $debug;
+    $framePDL = $framePDL + ($frameList->[$i] ** 2);
+  }
+
+  $framePDL = $framePDL / $numFrames;
+  $framePDL = sqrt $framePDL;
+  
+  return $framePDL;
+}
+
+sub genGnuPlotDat {
+  my ($framePDL, $datFile) = (@_);
+  
+  my $r = $framePDL->getdim(1);
+  my $c = $framePDL->getdim(0);
+  my @x = ();
+  my @y = ();
+  my @mag = ();
+  my $fh;
+  
+  if(defined($datFile)) {
+    open($fh, ">$datFile") or do {
+      printf STDERR "$msgp ERROR failed to open file '%s' for write:  $!\n", "$datFile";
+      exit(1);
+    };
+  }
+  
+  printf "Output RMS matrix has $r rows and $c cols\n\nPrinting DAT style gnuplot Data:\n" if $debug;
+  printf $fh "#X\tYLabel\tY\tOrbValue\n";
+  for (my $i = 0;$i <= $c-1;$i++) {
+    for(my $j = 0;$j <= $r-1;$j++) {
+      my $xLabel = $i + 1;
+      my $convertedToX = $i + 1;
+      my $yLabel = $j + 1;
+      my $convertedToY = $r - $j;
+      printf $fh "$convertedToX\t$yLabel\t$convertedToY\t%0.2f\n", $framePDL->at($i, $j) if defined($datFile); 
+      push(@x, $convertedToX);
+      push(@y, $convertedToY);
+      push(@mag, sprintf("%.2f", $framePDL->at($i, $j)));
+    }
+  }
+
+  my $x = PDL->topdl(@x);
+  my $y = PDL->topdl(@y);
+  my $mag = PDL->topdl(@mag);
+  return ($x, $y, $mag);
+}
+
+  sub OrbFrameListRMSValueOfFrames {
+    my ($frameList, $numFrames) = (@_);
+
+    printf "Dumping frames: $frameList->[0]\n\n" if $debug;
+    my $framePDL = $frameList->[0] ** 2;
+
+    # Sum of Frames, start with 0th element and then add indices 1 through n - 1
+    for (my $i = 1; $i < scalar(@{$frameList}); $i++) {
+      printf "$frameList->[$i]\n\n" if $debug;
+      $framePDL = $framePDL + ($frameList->[$i] ** 2);
+    }
+
+    $framePDL = $framePDL / $numFrames;
+    $framePDL = sqrt $framePDL;
+  
+    return $framePDL;
+  }
+
+  sub OrbFrameListStdDevValuesOfFrames {
+    my ($frameSet) = (@_);
+  
+    my $framesAsPDL = PDL->topdl($frameSet);
+    my $stddev2d = &PDL::Stats::Basic::stdv($framesAsPDL->xchg(0,2));
+    return $stddev2d->xchg(0,1);
+  }
+
+  sub OrbFrameListMaxValuesOfFrames {
+    my ($frameSet) = (@_);
+  
+    my $framesAsPDL = PDL->topdl($frameSet);
+    my $max2d = &PDL::Ufunc::maximum($framesAsPDL->xchg(0,2));
+
+    return $max2d->xchg(0,1);
+  }
+
+  sub OrbFrameListValueRangeOfFrames {
+    my ($frameSet) = (@_);
+  
+    my $framesAsPDL = PDL->topdl($frameSet);
+    my $min2d = &PDL::Ufunc::minimum($framesAsPDL->xchg(0,2));
+    my $max2d = &PDL::Ufunc::maximum($framesAsPDL->xchg(0,2));
+    my $range2d = $max2d - $min2d;
+    my $absRange2D = $range2d->abs();
+
+    return $absRange2D->xchg(0,1);
+  }
+
+  sub OrbFrameListMinValuesOfFrames {
+    my ($frameSet) = (@_);
+  
+    my $framesAsPDL = PDL->topdl($frameSet);
+    my $min2d = &PDL::Ufunc::minimum($framesAsPDL->xchg(0,2));
+
+    return $min2d->xchg(0,1);
+  }
+
+  sub OrbOutputParser {
+    my ($lineNo, $outputLine, $dataHash, $dut) = @_;
+
+    my $numberRegExp = qr<(\-?\d+)[\s\t]+>;
+    my @firstRow = $outputLine =~ qr<\*\*\*\s+Recognized\s+\(([0-9a-f]+x[0-9a-f]+)\)\s+family\*\*\*\s+\((\d+)\s+cols\s+X\s+(\d+)\s+rows\)>;
+    my @newFrameDelim = $outputLine =~ qr<Frame\s+\((0x[0-9a-fA-F]+)\)\:\s+Frame\s+#\s+\d+\s+\@\s+0x[0-9a-fA-F]+\s+image\-options\:\s+0x[0-9a-fA-F]+\s+detection\:\s+0x[0-9a-fA-F]+.*>;
+    my $firmwareRev = $firstRow[0];
+    my $rowsToSkip = $dut->{m_tmpOutputParserData}->{rowsToSkip};
+    my $rowsToRead = $dut->{m_tmpOutputParserData}->{rowsToRead};
+    my $colsToRead = $dut->{m_tmpOutputParserData}->{colsToRead};
+  
+    if(@newFrameDelim) {
+      $dut->{m_tmpOutputParserData}->{skippingRows} = 0;
+      #print "Matched new frame message\n" if $debug;
+      return 0;
+    }
+    #printf "Skipping rows: $dut->{m_tmpOutputParserData}->{skippingRows}\n" if $debug;
+  
+  
+    if(@firstRow) {
+        $dut->{m_tmpOutputParserData}->{numCols} = $firstRow[1]; 
+        $dut->{m_tmpOutputParserData}->{numRows} = $firstRow[2];
+        printf "Crashpad has $dut->{m_tmpOutputParserData}->{numCols} Columns and $dut->{m_tmpOutputParserData}->{numRows} Rows\n";
+        printf STDERR "Error, did not parse a valid number of columns\n" unless $dut->{m_tmpOutputParserData}->{numCols} > 0;
+        return 0;
+    }
+    
+    my $fullRegExp = "";
+    for(my $i = 0; $i < $colsToRead; $i++) {
+      $fullRegExp = qr<$fullRegExp$numberRegExp>;
+    }
+
+    if(my @matches = $outputLine =~ $fullRegExp) {  
+      my $count = scalar(@matches);
+  
+      if($count && !$dut->{m_tmpOutputParserData}->{skippingRows}) {
+        $dut->{m_tmpOutputParserData}->{currentRow} += 1;
+      
+        if(($dut->{m_tmpOutputParserData}->{currentRow} > $rowsToSkip) && !$dut->{m_tmpOutputParserData}->{skippingRows}) {
+          printf "Saving row $dut->{m_tmpOutputParserData}->{currentRow}: @matches\n" if $debug;
+          push(@{$dut->{m_tmpOutputParserData}->{rows}}, \@matches)
+        }
+        
+        if($dut->{m_tmpOutputParserData}->{currentRow} == $rowsToRead) {
+          my ($datasource) = $dataHash;
+
+          # TODO: Get temperature from temp sensor closest to Grape
+          #die "ERROR, you need to define mesaTempSenseId in your Device Object" if not defined $dut->{m_device_attrs}{mesaTempSenseId};
+          #my $sensorTemp = GetTempAtLocation($dut, $dut->{m_device_attrs}{mesaTempSenseId});   
+          #print $fd Time::HiRes::time() . ",$sensorTemp,\n";
+
+          my $totalRowsRead = $rowsToRead - $rowsToSkip;
+          printf "Matched specified number of rows ($totalRowsRead) and cols ($colsToRead); one full frame saved.  Waiting for new frame...\n" if $debug;
+          my $dataVector = PDL->topdl(@{$dut->{m_tmpOutputParserData}->{rows}});
+          push(@{$datasource->{m_pdlArrays}->{orbCounts}}, $dataVector);
+          $dut->{m_tmpOutputParserData}->{numFrames} += 1;
+          $dut->{m_tmpOutputParserData}->{skippingRows} = 1;
+          printf "\n\n$dataVector\n\n" if $debug;
+          my @newArray = ();
+          @{$dut->{m_tmpOutputParserData}->{rows}} = @newArray;
+          $dut->{m_tmpOutputParserData}->{currentRow} = 0;
+          if($dut->{m_tmpOutputParserData}->{expectedNumFrames} == $dut->{m_tmpOutputParserData}->{numFrames}) {
+            # Return 1 and stop parsing data -- we've found the expected number of frames.
+            return 1;
+          }
+        }
+        return 0;
+      }
+    }
+    else {
+      # No matches for line
+      return 0;
+    }
+  }
+
+ sub ConvertOrbCountsTofF {
+   my ($pdl) = @_;
+   
+   my $numeratorConst = MAMBA_VOLTAGE*INTEGRATION_CAP_SIZE*1000;
+   my $denominatorConst = SAMPLE_AND_HOLD_GAIN*NUM_CYCLES*EXCITATION_VOLTAGE*2^16;
+   
+   $pdl = $pdl * $numeratorConst / $denominatorConst;
+ }
+ 
+ sub OrbProcessRawFrameData {
+   my ($datasource) = @_;
+  
+   my @curFrameList = ();
+   my $windowSizeCntr = 0;
+   
+   # For Every 100 stored MultiTouchTester Frames, create a Std Dev, Min, Max and RMS frame and store it.
+   for my $curFrame (@{$datasource->{m_pdlArrays}->{orbCounts}}) {
+     $windowSizeCntr++;
+     push(@curFrameList, &ConvertOrbCountsTofF($curFrame));
+     if($windowSizeCntr == ORB_WINDOW_SIZE) {
+       my $stdDevFrame = &OrbFrameListStdDevValuesOfFrames(\@curFrameList);
+       push(@{$datasource->{m_pdlArrays}->{orbStdDev}}, $stdDevFrame);
+       my $minFrame = &OrbFrameListMinValuesOfFrames(\@curFrameList);
+       push(@{$datasource->{m_pdlArrays}->{orbMinCounts}}, $minFrame);
+       my $maxFrame = &OrbFrameListMaxValuesOfFrames(\@curFrameList);
+       push(@{$datasource->{m_pdlArrays}->{orbMaxCounts}}, $maxFrame);
+       my $rangeFrame = &OrbFrameListValueRangeOfFrames(\@curFrameList);
+       push(@{$datasource->{m_pdlArrays}->{orbRangeCounts}}, $rangeFrame);
+       @curFrameList = ();
+       $windowSizeCntr = 0;
+     } 
+   }
+ }
+ 
+sub DecodeMTTRegions {
+  my ($lineno, $outputLine, $hasDoppler, $hasOrb) = @_;
+  
+  use constant NUM_SENSOR_REGION_REGISTERS => 7;
+
+  if ($outputLine =~ qr<Error.*>) {
+    printf "Error parsing mttreport output.  Screen is off?\n";
+    return 1;
+  }
+  # Ignore good status message for now.
+  if ($outputLine =~ qr<GET.*>) {
+    return 0;
+  }
+  
+  my $numRegions = 0;
+  my $dopplerExists = 0;
+  my $orbExists = 0;
+  my $numSensorRegionRegExp = qr<([0-9A-F]{2})>;
+  my $numRegs = NUM_SENSOR_REGION_REGISTERS;
+  my $sensorRegionRegExp = qr<([0-9A-F]{2})\s([0-9A-F]{2})\s([0-9A-F]{2})\s([0-9A-F]{2})\s([0-9A-F]{2})\s([0-9A-F]{2})\s([0-9A-F]{2})>;
+
+  my @regionMatches = $outputLine =~ $numSensorRegionRegExp;
+  if(@regionMatches) {
+    $numRegions = hex($regionMatches[0]);
+    printf "Found $numRegions regions.\n" if $debug;
+  }
+  else {
+    printf "Could not find regions count.\n";
+  }
+
+  my $fullSensorRegionRegExp = "$numSensorRegionRegExp";
+
+  for (my $i = 0; $i < $numRegions; $i++) {
+    $fullSensorRegionRegExp = "$fullSensorRegionRegExp\\s$sensorRegionRegExp";
+  }
+  printf "Regular expression to parse entire string: $fullSensorRegionRegExp \n" if $debug;
+  
+  my @matches = $outputLine =~ $fullSensorRegionRegExp;
+  
+  unless(@matches) {
+    printf "No match on doppler data with line $outputLine\n";
+    return 0;
+  }
+  my $regionsHex = shift @matches; #Discard number of sensor regions
+  
+  # Iterate through and decode regions from MTReport 0xd0 register read
+  for (my $i = 0; $i < $numRegions;$i++) {
+    my $sensorRegionType = hex(shift @matches);
+    my $startRow = hex(shift @matches);
+    my $rows = hex(shift @matches);
+    my $row_skip = hex(shift @matches);
+    my $startCol = hex(shift @matches);
+    my $cols = hex(shift @matches);
+    my $hwcolOffset = hex(shift @matches);
+    if ($sensorRegionType == 3) {
+      printf "Doppler Region Found.\nRegion Type: $sensorRegionType Start Row: $startRow Rows: $rows Row Skip: $row_skip Start Col: $startCol Cols: $cols\n" if $debug;
+      $dopplerExists = 1;
+      $$hasDoppler = $dopplerExists;
+    }
+    if ($sensorRegionType == 2) {
+      printf "Orb Region Found.\nRegion Type: $sensorRegionType Start Row: $startRow Rows: $rows Row Skip: $row_skip Start Col: $startCol Cols: $cols\n" if $debug;
+      $orbExists = 1;
+      $$hasOrb = $orbExists;
+    }
+  }
+  
+  return 0;
+}
+ 
+ 
+sub mttParseFunc {}
+
+&registerOpts($clArgs);         # register options
+my $errors = 0;
+
+unless($clArgs->process([@ARGV])) {     # process command-line
+  print STDERR "$msgp WARNING, error processing command-line\n";
+  $errors++;
+}
+
+if (@{$clArgs->Unknown}) {
+  print STDERR "$msgp  ERROR, Unknown command line arguments given.\n";
+  $errors++;
+}
+
+my $storedOrbDataHash = {
+                m_pdlArrays => {
+                            orbCounts => [],
+                            orbStdDev => [],
+                            orbMinCounts => [],
+                            orbMaxCounts => [],
+                            orbRangeCounts => [],
+                            },
+    };
+
+my $tempData = {
+        m_tmpOutputParserData => { 
+                currentRow => 0,
+                numCols => 0,
+                numRows => 0,
+                numFrames => 0,
+                skippingRows => 0,
+                colsToRead => $clArgs->get('cols'),
+                rowsToRead => $clArgs->get('rows'),
+                rowsToSkip => $clArgs->get('skipRows'),
+                expectedNumFrames => $clArgs->get('frames'),
+                rows => [],
+        },
+    };
+
+my $gHasDopplerRegion = 0;
+my $gHasOrbRegion = 0;
+
+&Execer::execer("mtreport -noformat get 0xd0", \&DecodeMTTRegions, \$gHasDopplerRegion, \$gHasOrbRegion);
+
+unless ($gHasOrbRegion) {
+  printf "Orb region not found. Is the display still enabled? Does this product support orb? Exiting.\n";
+  exit(0);
+}
+
+#Dummy Data Command instead of the real one
+if($clArgs->get('mttOutFile')) { #    my ($lineNo, $outputLine, $dataHash, $dut) = @_;
+  &Execer::execer("cat " . $clArgs->get('mttOutFile'), \&OrbOutputParser, $storedOrbDataHash, $tempData);
+}
+elsif($clArgs->get('simulate')) {
+  &Execer::execer("cat orb_sim.txt", \&OrbOutputParser, \&OrbOutputParser, $storedOrbDataHash, $tempData);
+}
+else {
+  &Execer::execer("defaults write com.apple.SwitchBoard ignoreDisplayTimeout -bool YES", sub { return 0; }) if $gGestaltQueryExists;  
+  &Execer::execer("powerswitch lcd on touch on; setbright 0; sleep 0.5; MultitouchTester -reboot1; sleep 0.5; mtreport hset a8 00; mtreport hset f3 0a; mtreport hset 41 41; mtreport hset be c1; mtreport hset 3b a5;", 
+                  sub { return 0; });
+  &Execer::execer("MultitouchTester -prettyimages 2>&1", \&OrbOutputParser, $storedOrbDataHash, $tempData);
+  &Execer::execer("powerswitch lcd off touch off; MultitouchTester -reboot1; sleep 0.5; powerswitch lcd on touch on;", sub { return 0; }) if $gGestaltQueryExists;
+}
+&Execer::execer("defaults delete com.apple.SwitchBoard ignoreDisplayTimeout", sub { return 0; }) if $gGestaltQueryExists;
+
+if($clArgs->get('processData')) {
+  &OrbProcessRawFrameData($storedOrbDataHash);
+  my $gStdDevPDL = PDL->topdl($storedOrbDataHash->{m_pdlArrays}->{orbStdDev});
+  my $gMaxPDL = PDL->topdl($storedOrbDataHash->{m_pdlArrays}->{orbMaxCounts});
+  my $gMinPDL = PDL->topdl($storedOrbDataHash->{m_pdlArrays}->{orbMinCounts});
+  my $rangePDL = PDL->topdl($storedOrbDataHash->{m_pdlArrays}->{orbRangeCounts});
+  printf "Orb Processed StdDev Data\n$gStdDevPDL\n";
+  printf "Orb Processed Max Data\n$gMaxPDL\n";
+  printf "Orb Processed Min Data\n$gMinPDL\n";
+  printf "Orb Processed Range Data\n$rangePDL\n";
+
+  exit(0);
+}
+
+my $sumframePdl2D = &OrbFrameListRMSValueOfFrames($storedOrbDataHash->{m_pdlArrays}->{orbCounts}, $tempData->{m_tmpOutputParserData}->{numFrames});
+my $minFrame2d = &OrbFrameListMinValuesOfFrames($storedOrbDataHash->{m_pdlArrays}->{orbCounts});
+my $maxFrame2d = &OrbFrameListMaxValuesOfFrames($storedOrbDataHash->{m_pdlArrays}->{orbCounts});
+my $gAllFramesAsPDL = PDL->topdl($storedOrbDataHash->{m_pdlArrays}->{orbCounts});
+my $standardDevPDL = &OrbFrameListStdDevValuesOfFrames($storedOrbDataHash->{m_pdlArrays}->{orbCounts});
+
+printf "$msgp Finished capturing %d frames.\n$gAllFramesAsPDL\n", $tempData->{m_tmpOutputParserData}->{numFrames} if $clArgs->get('dumpOrbFrames');
+printf "$msgp RMS Orb Magnitude Matrix [$tempData->{m_tmpOutputParserData}->{numFrames} Frames]: $sumframePdl2D\n\n";
+printf "$msgp StdDev Orb Magnitude Matrix [$tempData->{m_tmpOutputParserData}->{numFrames} Frames]: $standardDevPDL\n\n";
+printf "$msgp Max Orb Magnitude Matrix [$tempData->{m_tmpOutputParserData}->{numFrames} Frames]: $maxFrame2d\n\n";
+printf "$msgp Min Orb Magnitude Matrix [$tempData->{m_tmpOutputParserData}->{numFrames} Frames]: $minFrame2d\n\n";
+
+if($clArgs->get('plot')) {
+  my $readInRows = $sumframePdl2D->getdim(1);
+  my $readInCols = $sumframePdl2D->getdim(0);
+  my $outformat = &DEFAULT_MAC_PLOT_FMT;
+  $outformat = &DEFAULT_iOS_PLOT_FMT if $gGestaltQueryExists;
+  my $outDir = $clArgs->get('dir');
+  $outDir .= '/' unless ($outDir =~ qr<^.*\/$>);
+    
+  my $datFileName = $outDir . &DEFAULT_ORB_RMS_MAG_PLOT_PREFIX . ".dat";
+  my $plotFileName = $outDir . &DEFAULT_ORB_RMS_MAG_PLOT_PREFIX . ".p";
+  my ($xPdl, $yPdl, $magPdl) = &genGnuPlotDat($sumframePdl2D, $datFileName);
+  &graphUnit($datFileName, $plotFileName, "RMS", $outformat, $tempData->{m_tmpOutputParserData}->{numFrames}, $readInRows, $readInCols, $gHWModel . "_" . $gSerialNumber . "_" . &DEFAULT_ORB_RMS_MAG_PLOT_PREFIX, "graph", $clArgs->get('tag'));
+    
+  $datFileName = $outDir . &DEFAULT_ORB_MIN_MAG_PLOT_PREFIX . ".dat";
+  $plotFileName = $outDir . &DEFAULT_ORB_MIN_MAG_PLOT_PREFIX . ".p";
+  my ($xMaxPdl, $yMaxPdl, $magMaxPdl) = &genGnuPlotDat($minFrame2d, $datFileName);
+  &graphUnit($datFileName, $plotFileName, "Minimum", $outformat, $tempData->{m_tmpOutputParserData}->{numFrames}, $readInRows, $readInCols, $gHWModel . "_" . $gSerialNumber . "_" . &DEFAULT_ORB_MIN_MAG_PLOT_PREFIX, "graph", $clArgs->get('tag'));
+
+  $datFileName = $outDir . &DEFAULT_ORB_MAX_MAG_PLOT_PREFIX . ".dat";
+  $plotFileName = $outDir . &DEFAULT_ORB_MAX_MAG_PLOT_PREFIX . ".p";
+  my ($xMinPdl, $yMinPdl, $magMinPdl) = &genGnuPlotDat($maxFrame2d, $datFileName);  
+  &graphUnit($datFileName, $plotFileName, "Maximum", $outformat, $tempData->{m_tmpOutputParserData}->{numFrames}, $readInRows, $readInCols, $gHWModel . "_" . $gSerialNumber . "_" . &DEFAULT_ORB_MAX_MAG_PLOT_PREFIX, "graph", $clArgs->get('tag'));
+}

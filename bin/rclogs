@@ -1,0 +1,84 @@
+#!/bin/sh
+#
+#  Copyright © 2015 Apple Inc. All rights reserved.
+
+LOGFILE=/tmp/rclogs.txt
+
+LC_FILTER="" # all categories
+
+LC_ON_LEVEL="${LC_FILTER}:level=all"
+LC_ON_FLAGS="${LC_FILTER}:flags=time;program;pid;category;level;prefix"
+LC_ON_OUTPUT="${LC_FILTER}:output=file;path=$LOGFILE"
+LC_ON="${LC_ON_LEVEL},${LC_ON_FLAGS},${LC_ON_OUTPUT}"
+
+LC_OFF_LEVEL="${LC_FILTER}:level=error"
+LC_OFF_FLAGS="${LC_FILTER}:flags=none"
+LC_OFF_OUTPUT="${LC_FILTER}:output=syslog"
+LC_OFF="${LC_OFF_LEVEL},${LC_OFF_FLAGS},${LC_OFF_OUTPUT}"
+
+PROG=`basename $0`
+
+# from sysexits(3)
+EX_OK=0
+EX_USAGE=64
+
+stderr() {
+    echo "$*" 1>&2
+}
+
+exitusage() {
+    stderr "usage: $PROG on|off|stat|view|dump|watch"
+    exit $EX_USAGE
+}
+
+logcontrol() {
+    cecutil logging "$@"
+}
+
+status() {
+    logcontrol
+}
+
+view() {
+    less "$LOGFILE"
+}
+
+dump() {
+    cat "$LOGFILE"
+}
+
+watch() {
+    stderr "Watching ${LOGFILE}. Press ^C (Control-C) to stop."
+    tail -f "$LOGFILE"
+}
+
+enable() {
+    if logcontrol '+' && logcontrol "+${LC_ON}"; then
+        stderr "CoreRC logging to ${LOGFILE} enabled.  This setting will persist until disabled with \`$PROG off\`."
+    fi
+}
+
+disable() {
+    if logcontrol '+' && logcontrol "?${LC_OFF}"; then
+        stderr "Removing ${LOGFILE}"
+        rm -rf "$LOGFILE"
+
+        stderr "CoreRC logging disabled."
+    fi
+}
+
+if [ $# -ne 1 ]; then
+    exitusage
+fi
+
+case $1 in
+    on)     enable      ;;
+    off)    disable     ;;
+    stat)   status      ;;
+    view)   view        ;;
+    dump)   dump        ;;
+    watch)  watch       ;;
+    *)      exitusage   ;;
+esac
+
+exit $EX_OK

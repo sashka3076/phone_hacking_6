@@ -1,0 +1,64 @@
+#!/bin/sh
+# Sandbox workaround. The next line runs in bash and not in Tcl: \
+    exec /usr/local/rocket/bin/tclsh-unsupported "$0" "$@"
+
+# RocketMain.tcl
+# RocketDesense
+#
+# Created by Gary Chung on 10/2/13.
+# Copyright 2013 Apple Inc.. All rights reserved.
+#
+# This is the entry point for Rocket Desense.
+#
+# This script defines the default package search paths. The special
+# "--tcl" switch is supported for Tcl-only mode.
+
+# Add the standard Rocket Desense library locations to ::auto_path
+lappend ::auto_path "/System/Library/Rocket"
+if [info exists ::env(ROCKETLIB)] { lappend ::auto_path $::env(ROCKETLIB) }
+
+# Start up Rocket Desense (unless the "--tcl" switch was used).
+if {[lindex $::argv 0] ne "--tcl"} {
+    # Run a startup script *before* loading the Rocket package if it exists.
+    if {[file exists ~/.rocket_startup]} {
+        if {[catch {source ~/.rocket_startup} err]} { puts stderr $err }
+    }
+    set ::env(ELTCL_HISTORY) [file join $::env(HOME) .rocket_history]
+    package require Rocket
+    rocket::startup
+} else {
+    set ::argv [lrange $::argv 1 end]
+    set ::argc [llength $::argv]
+}
+
+# Either jump into interactive mode or run a script.
+set ::tcl_interactive [expr {[llength $::argv] == 0}]
+
+if {$::tcl_interactive} {
+    package require eltclsh
+
+    if {[catch {package present Rocket}] == 0} {
+        set ::tcl_rcFileName ~/.rocketrc
+        set ::el::prompt1 {string range "rocket> " 0 end}
+        set ::el::prompt2 {list}
+        # what about history file?
+    } else {
+        set ::tcl_rcFileName ~/.tclshrc
+        set ::el::prompt1 {string range "% " 0 end}
+        set ::el::prompt2 {list}
+    }
+
+    set ::argv0 [info nameofexecutable]
+    info script ""
+
+    if {[file exists $::tcl_rcFileName]} {
+        if {[catch {source $::tcl_rcFileName} err]} { puts stderr $err }
+    }
+
+    interactive
+} else {
+    set ::argv [lassign $::argv ::argv0]
+    set ::argc [llength $::argv]
+    source $::argv0
+}
+

@@ -1,0 +1,104 @@
+#!/bin/sh
+
+MAILAPP=/usr/local/bin/mailto
+EMAILADDR=netdiag@spg-mac-bld4.apple.com
+
+LOGDIR="$HOME/Library/Logs/NetDiags"
+if [ ! -d "$LOGDIR" ]
+then
+	mkdir -p "$LOGDIR"
+fi
+
+LOGFNAME=netdiags.`date "+%d-%m-%y.%H_%M_%S"`
+LOGFILE="$LOGDIR/$LOGFNAME"
+
+run_and_log()
+{
+	echo Running: \"$*\" >> "$LOGFILE"
+	echo >> "$LOGFILE"
+	$* >> "$LOGFILE" 2>&1
+	echo >> "$LOGFILE"
+}
+
+echo "--------------------- NetDiags ---------------------"
+
+echo "Output File:      " $LOGFILE
+touch $LOGFILE
+
+run_and_log uname -a
+
+OPMODE=`/usr/local/bin/apple80211 -opmode`
+POWER=`/usr/local/bin/apple80211 -power`
+
+if [[ "$OPMODE" = *ap* ]]
+then
+    echo "Software AP enabled!"
+    
+	echo "`/usr/local/bin/apple80211 ap0 -ssid`"
+	run_and_log /usr/local/bin/apple80211 ap0 -ssid
+	
+	echo "`/usr/local/bin/apple80211 ap0 -channel`"
+	run_and_log /usr/local/bin/apple80211 ap0 -channel
+
+	echo "`/usr/local/bin/apple80211 ap0 -stalist`"
+   	run_and_log /usr/local/bin/apple80211 ap0 --stalist
+
+else
+	if [[ "$POWER" = *on* ]]
+	then
+		echo "WIFI IP Addr:     " `ifconfig en0 inet | grep inet | awk '{print $2}' | tail -n1`
+		run_and_log ifconfig -a
+
+		echo "Current Network:  " `/usr/local/bin/apple80211 -ssid | awk '{print $3}'`
+		run_and_log /usr/local/bin/apple80211 -ssid
+
+		echo "Current Rate:     " `/usr/local/bin/apple80211 -rate | awk '{print $2} {print $3}'`
+		run_and_log /usr/local/bin/apple80211 -rate
+
+		echo "Current BSSID:    " `/usr/local/bin/apple80211 -bssid | awk '{print $3}'`
+		run_and_log /usr/local/bin/apple80211 -bssid
+
+		echo "Current RSSI:     " `/usr/local/bin/apple80211 -rssi | awk '{print $2}'`
+		run_and_log /usr/local/bin/apple80211 -rssi
+
+		echo "Current Channel:  " `/usr/local/bin/apple80211 -ieee_curchannel | awk '{print $1,$2,$3,$4,$5,$6}'`
+		run_and_log /usr/local/bin/apple80211 -ieee_curchannel
+
+		echo "Auth Type:        " `/usr/local/bin/apple80211 -authtype | awk '{print $2,$3,$4,$5,$6,$7}'`
+		run_and_log /usr/local/bin/apple80211 -authtype
+
+		echo "\nPinging www.apple.com >>\n" `ping -c 4 www.apple.com|awk 'NR > 1 && NR < 6'` 
+		export gateway=`/usr/sbin/netstat -f inet -nr | /usr/bin/grep default | /usr/bin/grep en0 | /usr/bin/awk '{print $2}'`
+	     	echo "\nPinging Gateway >>\n" `ping -c 4 $gateway |awk 'NR > 1 && NR < 6'`
+
+	else
+		echo "Power is OFF"
+		run_and_log /usr/local/bin/apple80211 -power
+	fi
+fi
+
+if [[ "$POWER" = *on* ]]
+then
+    run_and_log	/usr/local/bin/apple80211 -scan
+fi
+
+run_and_log netstat -rn
+
+run_and_log kextstat
+
+#
+# run_and_log cat /dev/klog
+#
+
+run_and_log ps -rax
+
+if [ -x /usr/local/bin/iperf ]
+then
+	run_and_log /usr/local/bin/iperf -c pttest.apple.com -p 7979
+fi
+
+if [ -x $MAILAPP ]
+then
+	$MAILAPP $EMAILADDR $LOGFILE
+fi
+
